@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "common",
+    "uefi",
+    "arm64-bare",
+    "disk-image",
+]

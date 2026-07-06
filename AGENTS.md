@@ -1,0 +1,191 @@
+# Strapper Hybrid BIOS/UEFI Bootloader
+
+## Overview
+
+Produces a single `bootloader.combined` disk image bootable under legacy BIOS and x86_64 UEFI, plus standalone ARM64 EFI and ARM64 bare-metal binaries. All variants scan storage devices and print media info.
+
+## Layout (bootloader.combined, 64 MB disk image)
+
+| LBA | Offset   | Content                                                             |
+| --- | -------- | ------------------------------------------------------------------- |
+| 0   | `0x000`  | MBR (`bios.bin`, 512 bytes) with partition table at `0x1BE`         |
+| 1–7 | `0x200`  | Stage-2 (`stage2.bin`, up to 3584 bytes), loaded by MBR to `0x1000` |
+| 8+  | `0x1000` | FAT32 ESP containing `EFI/BOOT/BOOTX64.EFI`                         |
+
+## Directory Structure
+
+```
+.
+├── Cargo.toml              # Workspace root (4 member crates)
+├── Makefile                # Build orchestration (make all, make run-*)
+├── AGENTS.md               # This file
+├── bios/                   # Retained C/NASM sources
+│   ├── mbr.asm             # 16-bit MBR stage-1
+│   ├── stage2.c            # 16-bit stage-2 scanner
+│   ├── div64.c             # 64-bit division helpers for -m16
+│   ├── print.c / print.h   # Shared formatting (putc callback, hex, dec)
+│   └── scan.c / scan.h     # Shared scan loop (calls arch detect_device)
+├── common/                 # Rust no_std library
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs
+│       ├── print.rs        # Callback-based print (putc/puts/print_hex/print_dec)
+│       └── scan.rs         # Generic device-scan loop
+├── uefi/                   # Rust UEFI binary (x86_64 + ARM64)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs         # efi_main entry point
+│       ├── efi.rs          # Hand-typed EFI types, GUIDs, Boot Services offsets
+│       └── scan.rs         # UEFI device scan (LocateHandleBuffer + OpenProtocol)
+├── arm64-bare/             # Rust ARM64 bare-metal binary (no firmware)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs         # Entry (global_asm! start), UART init, PCI scan
+│       ├── pci.rs          # PCI ECAM walk, BAR sizing/enable, AHCI probe
+│       └── uart.rs         # PL011 UART driver
+└── disk-image/             # Rust CLI tool (disk image combiner)
+    ├── Cargo.toml
+    └── src/
+        └── main.rs         # Assembles MBR + stage2 + FAT32 → combined image
+```
+
+## Files
+
+### `uefi/src/efi.rs` — EFI type definitions
+
+- All types hand-written (no `uefi` crate dependency).
+- `extern "efiapi"` calling convention is the EFI ABI on both x86_64 and ARM64.
+- Function pointers that dereference raw pointers (e.g. `output_string`) must be `unsafe extern "efiapi" fn(...)`, NOT `extern "efiapi" fn(...)`. Using safe `extern "efiapi" fn` causes "unnecessary `unsafe` block" warnings when wrapping calls.
+- **Boot Services function offsets** (hardcoded, from GNU-EFI / EDK2 headers):
+  - `0x48` — `FreePool`
+  - `0x118` — `OpenProtocol`
+  - `0x138` — `LocateHandleBuffer`
+- GUIDs must be `static` (not `const`) to guarantee stable address semantics when taking references.
+- `UINTN` = `u64` on both x86_64 and ARM64 (LP64).
+
+### `uefi/src/main.rs` — UEFI entry point
+
+- `efi_main` is `extern "efiapi" fn(image_handle, system_table) -> !`.
+- Calls `scan_storage_devices` which never returns (infinite loop at end).
+
+### `uefi/src/scan.rs` — UEFI storage scan
+
+- Function pointers read from Boot Services table via `read_boot_svc_fn::<T>(gbs, offset)` which casts an arbitrary offset to the target function type.
+- `w16(con_out, s)` — converts `&str` to a null-terminated `[u16; 256]` and calls `OutputString`. The null terminator must be written explicitly at `buf[len]`; the buffer is NOT null-initialized because we only zero the first `len+1` entries via the write loop.
+- `put_dec(con_out, val)` — converts `u64` to decimal digits using two temporary `[u16; 24]` arrays. Digits are written reversed into `rev[]`, then copied forward into `buf[]` starting at index 0 with an explicit null terminator `buf[j] = 0`. **Must null-terminate**: passing a mid-array pointer without a trailing null causes `OutputString` to read past the end of the buffer into stack garbage.
+- `LocateHandleBuffer` with search type `2` (`ByProtocol`) enumerates all handles supporting `EFI_BLOCK_IO_PROTOCOL`.
+- Each handle is opened with `OpenProtocol` for both Block IO and Device Path protocols using `EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL` (`0x00000001`).
+- `EFI_DEVICE_PATH_PROTOCOL` type/subtype gives a hint about the device; the first node's type/subtype is read, not the full path.
+- The handle buffer is freed with `FreePool` after enumeration.
+
+### `arm64-bare/src/main.rs` — ARM64 bare-metal entry
+
+- Entry point via `global_asm!`: sets stack pointer, zeroes BSS, calls `rust_main`.
+- UART output via MMIO PL011 at `0x09000000` (QEMU virt machine).
+- PCI ECAM at `0x4010_0000_00` (QEMU virt v11+).
+- Load address: `0x4020_0000` (above DTB at `0x4000_0000`).
+
+### `arm64-bare/src/pci.rs` — PCI/AHCI probe
+
+- Walks PCI bus 0, enumerates all devices.
+- For each mass-storage class device, calls `enable_bars` (BAR sizing via all-1s write, MMIO from `0x3E00_0000`) and `probe_ahci`.
+- `probe_ahci` enables HBA (`GHC.AE`, bit 31 of ABAR+0x04), reads CAP/PI/SSTS to detect attached drives.
+- `pci_read_config` / `pci_write_config`: MMIO ECAM access via pointer dereference.
+
+### `common/src/print.rs` — Shared formatting
+
+- Callback-based: `print_init(putc_fn)` sets the output function.
+- `print_hex(val, nibbles)` — prints hex, no leading zeros except for `0`.
+- `print_dec(val)` — converts `u64` to decimal using a right-to-left buffer.
+- All functions call the `putc` callback for each character.
+
+### `common/src/scan.rs` — Shared device scan loop
+
+- Generic loop: for `index` in `0..MAX_DEVICES`, calls an arch-specific `detect_device` callback, prints results.
+- Architecture-specific detection is provided by `detect_device` via a function pointer or trait (not yet implemented — the current C stage2 and Rust UEFI/ARM64 targets each handle scanning independently).
+
+### `disk-image/src/main.rs` — Disk image builder
+
+- Takes `bios.bin` + `stage2.bin` + `strapper.efi` → `bootloader.combined`.
+- Calls `mkfs.fat -F32`, `mmd`, `mcopy` (mtools) externally via `std::process::Command`.
+- Writes MBR partition entry (type `0x0C` FAT32 LBA) at offset `0x1BE`.
+- Partition table entry format (16 bytes): `<status><chs_start[3]><type><chs_end[3]><lba_start[4]><sector_count[4]>`.
+
+### `Makefile` — Build orchestration
+
+- Top-level targets: `all`, `bios`, `uefi`, `arm64`, `bare-arm64`, `combined`, `run-*`, `clean`.
+- Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
+- BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
+- mtools (`mmd`, `mcopy`) and `mkfs.fat` must be on `$PATH` for `make combined`.
+
+## Key Gotchas
+
+### Rust-specific
+
+1. **EFI function pointer safety**: UEFI protocol function pointers that dereference raw pointers must be typed as `unsafe extern "efiapi" fn(...)`. Marking them safe triggers "unnecessary `unsafe` block" when wrapping the call.
+2. **Null-terminate u16 arrays for OutputString**: `SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString` reads until a `0x0000` word. Always write an explicit `buf[j] = 0` after the last character. Passing a pointer into the middle of an array without a trailing null reads past the buffer into stack garbage.
+3. **GUIDs must be `static`**, not `const`. Taking a reference to a `const` generates a new temporary each time, producing non-identical addresses. EFI runtime code compares GUID pointer addresses.
+4. **`extern "efiapi"` is portable**: Both x86_64 and ARM64 UEFI use the same `extern "efiapi"` calling convention in Rust. No `ms_abi` distinction needed (unlike C where `__attribute__((ms_abi))` is required on x86_64).
+5. **`/NODEFAULTLIB` on x86_64-unknown-uefi**: Without `RUSTFLAGS="-C link-args=/NODEFAULTLIB"`, the linker pulls in CRT startup which conflicts with the UEFI environment. ARM64 doesn't need this.
+6. **`panic = "abort"`**: UEFI and bare-metal targets must set `panic = "abort"` in `Cargo.toml` (in `[profile.release]` or `[profile.dev]`). Panic unwinding is not supported.
+7. **`aarch64-unknown-none` requires `global_asm!` entry**: There's no CRT; use `core::arch::global_asm!` to define the `_start` symbol that sets SP and clears BSS before calling Rust code.
+
+### Original strapper (C/NASM) still relevant
+
+8. **"MZ" corrupts DL**: The MBR's first 2 bytes are `0x4D 0x5A`, which execute as `dec bp; pop dx`. The `pop dx` overwrites the boot-drive value in DL. Always set DL explicitly before INT 13h calls.
+9. **512-byte MBR limit**: The MBR is strictly 512 bytes (including `0xAA55` at `0x1FE`). All real logic goes in `stage2.bin`.
+10. **`.comment` section causes OVMF Load Error**: Removed from stage2 with `objcopy -R .comment`. When producing PE/COFF from Rust UEFI targets, the linker may still add metadata sections; ensure they're stripped.
+11. **QEMU virt ECAM moved to 64-bit address**: PCIe ECAM is at `0x4010_0000_0000` (QEMU virt v11+), not `0x3F00_0000`. Hardcoded in `arm64-bare/src/pci.rs`.
+12. **PCI BARs unassigned without firmware**: On bare-metal, BARs read as 0. Must implement BAR sizing (write-all-1s) and resource allocation from PCI MMIO window (`0x1000_0000–0x3EFF_FFFF` on virt).
+13. **AHCI requires HBA enable before port access**: Set GHC.AE (bit 31 of ABAR+0x04) before reading CAP, PI, SSTS.
+14. **QEMU DTB at 0x4000_0000**: Load bare-metal binaries at `0x4020_0000` or higher to avoid overlap. Set in linker script / start.S.
+15. **`llvm-objcopy` for ARM64 ELF→binary**: Host `objcopy` cannot handle ARM64 ELF. Use `llvm-objcopy -O binary`.
+16. **`lld` required for ARM64 linking**: Host `ld` lacks `aarch64linux` emulation. Use `-fuse-ld=lld` with clang or `lld-link` for UEFI.
+
+### Disk-image
+
+17. **mtools required**: `mkfs.fat`, `mmd`, `mcopy` must be installed for FAT32 ESP creation. The Rust `disk-image` crate shells out to these tools.
+18. **Partition table format**: 16-byte entry at offset `0x1BE`: `u8 status`, `[u8; 3] chs_start`, `u8 type`, `[u8; 3] chs_end`, `u32 lba_start`, `u32 sector_count`. All little-endian.
+19. **Disk image size**: The MBR + stage2 occupy LBA 0–7. The FAT32 partition starts at LBA 8. Align the partition to a sector boundary.
+
+### BIOS stage2 (C, retained as-is)
+
+20. **INT 13h register preservation**: `INT 13h` can clobber registers. Use C local variables instead of relying on register values across calls.
+21. **DPB buffer size**: Must be set to `30` (`0x001E`) in the first word before AH=48h.
+22. **Global data in `.data` for `--oformat=binary`**: Accessed globals must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Both `dpb_buf` and `g_putc` use `__attribute__((section(".data")))`.
+23. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
+24. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
+
+## Makefile Targets
+
+```bash
+make all                         # Build everything
+make bios                        # Build MBR + stage2 (C/NASM)
+make uefi                        # Build Rust UEFI binary (x86_64 + ARM64)
+make arm64                       # Alias for uefi (ARM64 UEFI)
+make bare-arm64                  # Build Rust ARM64 bare-metal
+make combined                    # Build disk image (requires mtools)
+make run-bios                    # BIOS mode via SeaBIOS (serial output)
+make run-uefi                    # x86_64 UEFI from combined disk image
+make run-uefi-arm64              # ARM64 UEFI from FAT directory
+make run-uefi-fat                # x86_64 UEFI from standalone .efi
+make run-bare-arm64              # ARM64 bare-metal + AHCI drive
+make clean                       # Clean all artifacts
+```
+
+## Targets
+
+| Target                          | Arch   | Firmware          | Binary                           |
+| ------------------------------- | ------ | ----------------- | -------------------------------- |
+| `x86_64-unknown-uefi`           | x86_64 | UEFI              | `bin/strapper.efi`               |
+| `aarch64-unknown-uefi`          | ARM64  | UEFI              | `bin/strapper_arm64.efi`         |
+| `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/strapper_arm64_bare.elf`    |
+| `x86_64-linux-gnu` (disk-image) | Host   | —                 | `target/debug/disk-image`        |
+| `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
+
+## Tools Required
+
+- **Rust**: `rustc`, `cargo` with targets `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
+- **BIOS (C/NASM)**: `gcc`, `ld` (`-m elf_i386`), `nasm`, `objcopy`
+- **Common**: `mkfs.fat`, `mmd`, `mcopy` (dosfstools + mtools)
+- **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `/usr/share/edk2/aarch64/QEMU_EFI.fd`)

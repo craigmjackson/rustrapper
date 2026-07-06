@@ -1,0 +1,9 @@
+target/
+bin/
+build/
+EFI/
+test.img
+*.o
+*.obj
+*.elf
+*.bin
