@@ -1,8 +1,8 @@
-# Strapper Hybrid BIOS/UEFI Bootloader
+# Rustrapper Hybrid BIOS/UEFI Bootloader
 
 ## Overview
 
-Produces a single `bootloader.combined` disk image bootable under legacy BIOS and x86_64 UEFI, plus standalone ARM64 EFI and ARM64 bare-metal binaries. All variants scan storage devices and print media info.
+Produces a single `bootloader.combined` disk image bootable under legacy BIOS and x86_64 UEFI, plus standalone ARM64 EFI and ARM64 bare-metal binaries. All variants scan storage devices and print media info; UEFI variants also scan network adapters and run DHCP.
 
 ## Layout (bootloader.combined, 64 MB disk image)
 
@@ -36,7 +36,8 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 │   └── src/
 │       ├── main.rs         # efi_main entry point
 │       ├── efi.rs          # Hand-typed EFI types, GUIDs, Boot Services offsets
-│       └── scan.rs         # UEFI device scan (LocateHandleBuffer + OpenProtocol)
+│       ├── scan.rs         # UEFI device scan (LocateHandleBuffer + OpenProtocol)
+│       └── net.rs          # DHCP, SNP send/receive, IP/ARP parsing
 ├── arm64-bare/             # Rust ARM64 bare-metal binary (no firmware)
 │   ├── Cargo.toml
 │   └── src/
@@ -78,6 +79,16 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 - `EFI_DEVICE_PATH_PROTOCOL` type/subtype gives a hint about the device; the first node's type/subtype is read, not the full path.
 - The handle buffer is freed with `FreePool` after enumeration.
 
+### `uefi/src/net.rs` — UEFI network scan and DHCP
+
+- `print_network_info` uses `LocateHandleBuffer` with `SNP_GUID` to find NICs, opens via `OpenProtocol` with `EFI_OPEN_PROTOCOL_GET_PROTOCOL` (`0x00000002`).
+- SNP driver start: accepts both `EFI_SUCCESS`, `EFI_ALREADY_STARTED`, and the ARM64 firmware's error-bit-encoded variant (`0x8000000000000014`). ARM64 virtio SNP returns the latter.
+- SNP initialize: failure is non-fatal. ARM64 virtio SNP returns `EFI_UNSUPPORTED` (with error bit).
+- `dhcp_run` sends a single DHCPDISCOVER and waits for an OFFER — the ARM64 virtio SNP only supports one transmit per session (no buffer recycling without `Initialize`). x86_64 e1000 works normally with full DISCOVER→OFFER→REQUEST→ACK.
+- `send_udp_dhcp` builds Ethernet/IP/UDP/DHCP frame from scratch and calls `SNP.Transmit`.
+- `try_receive` calls `SNP.Receive` with non-null `SrcAddr`, `DestAddr`, and `Protocol` output pointers; some firmware requires them.
+- `parse_dhcp_response` validates IP/UDP headers, DHCP magic cookie, transaction ID, MAC match, and extracts IP/subnet/gateway from DHCP options.
+
 ### `arm64-bare/src/main.rs` — ARM64 bare-metal entry
 
 - Entry point via `global_asm!`: sets stack pointer, zeroes BSS, calls `rust_main`.
@@ -106,7 +117,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 ### `disk-image/src/main.rs` — Disk image builder
 
-- Takes `bios.bin` + `stage2.bin` + `strapper.efi` → `bootloader.combined`.
+- Takes `bios.bin` + `stage2.bin` + `rustrapper.efi` → `bootloader.combined`.
 - Calls `mkfs.fat -F32`, `mmd`, `mcopy` (mtools) externally via `std::process::Command`.
 - Writes MBR partition entry (type `0x0C` FAT32 LBA) at offset `0x1BE`.
 - Partition table entry format (16 bytes): `<status><chs_start[3]><type><chs_end[3]><lba_start[4]><sector_count[4]>`.
@@ -130,31 +141,36 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 6. **`panic = "abort"`**: UEFI and bare-metal targets must set `panic = "abort"` in `Cargo.toml` (in `[profile.release]` or `[profile.dev]`). Panic unwinding is not supported.
 7. **`aarch64-unknown-none` requires `global_asm!` entry**: There's no CRT; use `core::arch::global_asm!` to define the `_start` symbol that sets SP and clears BSS before calling Rust code.
 
-### Original strapper (C/NASM) still relevant
+### Original project (C/NASM) still relevant
 
 8. **"MZ" corrupts DL**: The MBR's first 2 bytes are `0x4D 0x5A`, which execute as `dec bp; pop dx`. The `pop dx` overwrites the boot-drive value in DL. Always set DL explicitly before INT 13h calls.
 9. **512-byte MBR limit**: The MBR is strictly 512 bytes (including `0xAA55` at `0x1FE`). All real logic goes in `stage2.bin`.
-10. **`.comment` section causes OVMF Load Error**: Removed from stage2 with `objcopy -R .comment`. When producing PE/COFF from Rust UEFI targets, the linker may still add metadata sections; ensure they're stripped.
-11. **QEMU virt ECAM moved to 64-bit address**: PCIe ECAM is at `0x4010_0000_0000` (QEMU virt v11+), not `0x3F00_0000`. Hardcoded in `arm64-bare/src/pci.rs`.
-12. **PCI BARs unassigned without firmware**: On bare-metal, BARs read as 0. Must implement BAR sizing (write-all-1s) and resource allocation from PCI MMIO window (`0x1000_0000–0x3EFF_FFFF` on virt).
-13. **AHCI requires HBA enable before port access**: Set GHC.AE (bit 31 of ABAR+0x04) before reading CAP, PI, SSTS.
-14. **QEMU DTB at 0x4000_0000**: Load bare-metal binaries at `0x4020_0000` or higher to avoid overlap. Set in linker script / start.S.
-15. **`llvm-objcopy` for ARM64 ELF→binary**: Host `objcopy` cannot handle ARM64 ELF. Use `llvm-objcopy -O binary`.
-16. **`lld` required for ARM64 linking**: Host `ld` lacks `aarch64linux` emulation. Use `-fuse-ld=lld` with clang or `lld-link` for UEFI.
+10. **ARM64 UEFI SNP single-transmit limit**: The ARM64 virtio SNP driver only supports one `Transmit` per session because `Initialize` returns `EFI_UNSUPPORTED` (no buffer recycling). Send DHCPDISCOVER and accept the OFFER as final — do not attempt REQUEST/ACK. x86_64 e1000 supports the full handshake.
+11. **ARM64 EDK2 error bit**: ARM64 firmware encodes EFI errors with bit 63 set (`0x8000000000000014` for `EFI_ALREADY_STARTED`). Always check both the plain constant and the error-bit variant when comparing status codes on ARM64.
+12. **`virtio-net-pci` is the only ARM64 SNP NIC**: QEMU `qemu-system-aarch64` EDK2 firmware only detects SNP via `virtio-net-pci`. All other models (e1000, e1000e, rtl8139, etc.) return "No network adapters found".
+13. **`EFI_OPEN_PROTOCOL_GET_PROTOCOL`**: Use `0x00000002` instead of `BY_HANDLE_PROTOCOL` (`0x00000001`) for SNP on ARM64 to avoid agent handle tracking issues.
+14. **Non-null SNP.Receive pointers**: Some firmware (ARM64) requires `SrcAddr`, `DestAddr`, and `Protocol` to be non-null output pointers. Passing `null` causes `EFI_INVALID_PARAMETER`.
+15. **`.comment` section causes OVMF Load Error**: Removed from stage2 with `objcopy -R .comment`. When producing PE/COFF from Rust UEFI targets, the linker may still add metadata sections; ensure they're stripped.
+16. **QEMU virt ECAM moved to 64-bit address**: PCIe ECAM is at `0x4010_0000_0000` (QEMU virt v11+), not `0x3F00_0000`. Hardcoded in `arm64-bare/src/pci.rs`.
+17. **PCI BARs unassigned without firmware**: On bare-metal, BARs read as 0. Must implement BAR sizing (write-all-1s) and resource allocation from PCI MMIO window (`0x1000_0000–0x3EFF_FFFF` on virt).
+18. **AHCI requires HBA enable before port access**: Set GHC.AE (bit 31 of ABAR+0x04) before reading CAP, PI, SSTS.
+19. **QEMU DTB at 0x4000_0000**: Load bare-metal binaries at `0x4020_0000` or higher to avoid overlap. Set in linker script / start.S.
+20. **`llvm-objcopy` for ARM64 ELF→binary**: Host `objcopy` cannot handle ARM64 ELF. Use `llvm-objcopy -O binary`.
+21. **`lld` required for ARM64 linking**: Host `ld` lacks `aarch64linux` emulation. Use `-fuse-ld=lld` with clang or `lld-link` for UEFI.
 
 ### Disk-image
 
-17. **mtools required**: `mkfs.fat`, `mmd`, `mcopy` must be installed for FAT32 ESP creation. The Rust `disk-image` crate shells out to these tools.
-18. **Partition table format**: 16-byte entry at offset `0x1BE`: `u8 status`, `[u8; 3] chs_start`, `u8 type`, `[u8; 3] chs_end`, `u32 lba_start`, `u32 sector_count`. All little-endian.
-19. **Disk image size**: The MBR + stage2 occupy LBA 0–7. The FAT32 partition starts at LBA 8. Align the partition to a sector boundary.
+22. **mtools required**: `mkfs.fat`, `mmd`, `mcopy` must be installed for FAT32 ESP creation. The Rust `disk-image` crate shells out to these tools.
+23. **Partition table format**: 16-byte entry at offset `0x1BE`: `u8 status`, `[u8; 3] chs_start`, `u8 type`, `[u8; 3] chs_end`, `u32 lba_start`, `u32 sector_count`. All little-endian.
+24. **Disk image size**: The MBR + stage2 occupy LBA 0–7. The FAT32 partition starts at LBA 8. Align the partition to a sector boundary.
 
 ### BIOS stage2 (C, retained as-is)
 
-20. **INT 13h register preservation**: `INT 13h` can clobber registers. Use C local variables instead of relying on register values across calls.
-21. **DPB buffer size**: Must be set to `30` (`0x001E`) in the first word before AH=48h.
-22. **Global data in `.data` for `--oformat=binary`**: Accessed globals must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Both `dpb_buf` and `g_putc` use `__attribute__((section(".data")))`.
-23. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
-24. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
+25. **INT 13h register preservation**: `INT 13h` can clobber registers. Use C local variables instead of relying on register values across calls.
+26. **DPB buffer size**: Must be set to `30` (`0x001E`) in the first word before AH=48h.
+27. **Global data in `.data` for `--oformat=binary`**: Accessed globals must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Both `dpb_buf` and `g_putc` use `__attribute__((section(".data")))`.
+28. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
+29. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
 
 ## Makefile Targets
 
@@ -168,7 +184,6 @@ make combined                    # Build disk image (requires mtools)
 make run-bios                    # BIOS mode via SeaBIOS (serial output)
 make run-uefi                    # x86_64 UEFI from combined disk image
 make run-uefi-arm64              # ARM64 UEFI from FAT directory
-make run-uefi-fat                # x86_64 UEFI from standalone .efi
 make run-bare-arm64              # ARM64 bare-metal + AHCI drive
 make clean                       # Clean all artifacts
 ```
@@ -177,9 +192,9 @@ make clean                       # Clean all artifacts
 
 | Target                          | Arch   | Firmware          | Binary                           |
 | ------------------------------- | ------ | ----------------- | -------------------------------- |
-| `x86_64-unknown-uefi`           | x86_64 | UEFI              | `bin/strapper.efi`               |
-| `aarch64-unknown-uefi`          | ARM64  | UEFI              | `bin/strapper_arm64.efi`         |
-| `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/strapper_arm64_bare.elf`    |
+| `x86_64-unknown-uefi`           | x86_64 | UEFI              | `bin/rustrapper.efi`               |
+| `aarch64-unknown-uefi`          | ARM64  | UEFI              | `bin/rustrapper_arm64.efi`         |
+| `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/rustrapper_arm64_bare.elf`    |
 | `x86_64-linux-gnu` (disk-image) | Host   | —                 | `target/debug/disk-image`        |
 | `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
 
@@ -188,9 +203,9 @@ make clean                       # Clean all artifacts
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 66 tests across all crates
+cargo test --workspace        # All 69 tests across all crates
 cargo test --package common   # 22 tests (formatting, scan loop)
-cargo test --package uefi     # 15 tests (type sizes, GUID values, constants)
+cargo test --package uefi     # 18 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 15 tests (pci_off, storage_name)
 cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries)
 ```
@@ -198,7 +213,7 @@ cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries
 | Crate | Tests | What's tested |
 |-------|-------|---------------|
 | `common` | 22 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit), `format_dec` (zero, round numbers, max u64, powers of 10), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping) |
-| `uefi`/`efi` | 15 | Struct sizes under `repr(C)`, GUID byte values, `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness |
+| `uefi`/`efi` | 18 | Struct sizes under `repr(C)`, GUID byte values, `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets |
 | `arm64-bare`/`pci` | 15 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 11 subclass codes, unknown fallback) |
 | `disk-image` | 14 | `chs_from_lba` geometry (sector/head/cylinder boundaries), `build_mbr_partition` (bootable flag, type byte, LBA/sector count, CHS clamping at 1023/254/63), partition size invariants |
 

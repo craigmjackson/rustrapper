@@ -39,7 +39,7 @@ fn panic(_info: &PanicInfo) -> ! {
 #[no_mangle]
 pub extern "C" fn main() -> ! {
     print::init(uart::putc);
-    print::puts("\nStrapper ARM64 Bare-Metal\n");
+    print::puts("\nRustrapper ARM64 Bare-Metal\n");
     pci::pci_print_all();
     print::puts("\nStorage devices:\n");
     scan::scan_devices(pci::detect_device);

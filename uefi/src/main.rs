@@ -7,6 +7,8 @@ extern crate std;
 mod efi;
 #[cfg(not(test))]
 mod scan;
+#[cfg(not(test))]
+mod net;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -22,6 +24,7 @@ fn panic(_info: &PanicInfo) -> ! {
 
 #[cfg(not(test))]
 #[export_name = "efi_main"]
-pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &EFI_SYSTEM_TABLE) -> EFI_STATUS {
+pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &EFI_SYSTEM_TABLE) -> ! {
+    net::scan_network_devices(image_handle, system_table);
     scan::scan_storage_devices(image_handle, system_table)
 }

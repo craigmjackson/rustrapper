@@ -72,7 +72,7 @@ def build_fat_partition(pe_data, size_bytes):
             print(f"mmd error: {result.stderr}")
             sys.exit(1)
 
-        # Write strapper.efi as EFI/BOOT/BOOTX64.EFI
+        # Write rustrapper.efi as EFI/BOOT/BOOTX64.EFI
         with tempfile.NamedTemporaryFile(delete=False) as f:
             efi_tmp = f.name
             f.write(pe_data)
