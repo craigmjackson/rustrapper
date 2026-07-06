@@ -237,3 +237,138 @@ fn main() {
     }
     combine(&args[1], &args[2], &args[3], &args[4]);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chs_lba_zero() {
+        let chs = chs_from_lba(0, 16, 63);
+        assert_eq!(chs.c, 0);
+        assert_eq!(chs.h, 0);
+        assert_eq!(chs.s, 1);
+    }
+
+    #[test]
+    fn test_chs_lba_first_sector() {
+        let chs = chs_from_lba(0, 16, 63);
+        assert_eq!(chs.s, 1);
+    }
+
+    #[test]
+    fn test_chs_lba_second_sector() {
+        let chs = chs_from_lba(1, 16, 63);
+        assert_eq!(chs.c, 0);
+        assert_eq!(chs.h, 0);
+        assert_eq!(chs.s, 2);
+    }
+
+    #[test]
+    fn test_chs_lba_head_boundary() {
+        // After 63 sectors, next head
+        let chs = chs_from_lba(63, 16, 63);
+        assert_eq!(chs.c, 0);
+        assert_eq!(chs.h, 1);
+        assert_eq!(chs.s, 1);
+    }
+
+    #[test]
+    fn test_chs_lba_cylinder_boundary() {
+        // After 16*63 = 1008 sectors, next cylinder
+        let chs = chs_from_lba(1008, 16, 63);
+        assert_eq!(chs.c, 1);
+        assert_eq!(chs.h, 0);
+        assert_eq!(chs.s, 1);
+    }
+
+    #[test]
+    fn test_chs_lba_arbitrary() {
+        let chs = chs_from_lba(123456, 16, 63);
+        // c = 123456 / (16*63) = 123456 / 1008 = 122 rem 480
+        // h = 480 / 63 = 7 rem 39
+        // s = 39 + 1 = 40
+        assert_eq!(chs.c, 122);
+        assert_eq!(chs.h, 7);
+        assert_eq!(chs.s, 40);
+    }
+
+    #[test]
+    fn test_chs_cylinder_boundary_exact() {
+        let lba = 1023 * 16 * 63;
+        let chs = chs_from_lba(lba, 16, 63);
+        assert_eq!(chs.c, 1023);
+        assert_eq!(chs.h, 0);
+        assert_eq!(chs.s, 1);
+    }
+
+    #[test]
+    fn test_chs_max_within_geometry() {
+        // Max addressable within 16 heads, 63 sectors/track
+        let lba = 1023 * 16 * 63 + 15 * 63 + 62;
+        let chs = chs_from_lba(lba, 16, 63);
+        assert_eq!(chs.c, 1023);
+        assert_eq!(chs.h, 15);
+        assert_eq!(chs.s, 63);
+    }
+
+    #[test]
+    fn test_build_mbr_partition_bootable() {
+        let entry = build_mbr_partition(true, 0x0C, 8, 131064);
+        assert_eq!(entry[0], 0x80); // bootable
+        assert_eq!(entry[4], 0x0C); // FAT32 LBA
+        let start_lba = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+        assert_eq!(start_lba, 8);
+        let sectors = u32::from_le_bytes(entry[12..16].try_into().unwrap());
+        assert_eq!(sectors, 131064);
+    }
+
+    #[test]
+    fn test_build_mbr_partition_non_bootable() {
+        let entry = build_mbr_partition(false, 0x0C, 8, 131064);
+        assert_eq!(entry[0], 0x00); // non-bootable
+    }
+
+    #[test]
+    fn test_build_mbr_partition_zero_start_nonzero_sectors() {
+        let entry = build_mbr_partition(false, 0x00, 0, 1);
+        assert_eq!(entry[0], 0x00);
+        let start_lba = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+        assert_eq!(start_lba, 0);
+        let sectors = u32::from_le_bytes(entry[12..16].try_into().unwrap());
+        assert_eq!(sectors, 1);
+    }
+
+    #[test]
+    fn test_build_mbr_partition_type() {
+        let entry = build_mbr_partition(false, 0x83, 2048, 4096);
+        assert_eq!(entry[4], 0x83); // Linux ext4
+    }
+
+    #[test]
+    fn test_chs_clamping() {
+        // Very large LBA should clamp CHS to max values
+        let entry = build_mbr_partition(true, 0x0C, 1_000_000_000, 100_000);
+        // CHS should be clamped to 1023/254/63
+        let ce_h = entry[5];
+        let ce_s = entry[6] & 0x3F;
+        let ce_c = ((entry[6] as u16 & 0xC0) << 2) | entry[7] as u16;
+        assert_eq!(ce_c, 1023);
+        assert_eq!(ce_h, 254);
+        assert_eq!(ce_s, 63);
+    }
+
+    #[test]
+    fn test_build_fat_partition_size() {
+        // Test that we can compute partition size correctly
+        let mbr_stage2_size = PARTITION_LBA * 512;
+        let partition_bytes = DISK_SIZE - mbr_stage2_size;
+        assert_eq!(DISK_SIZE_MB, 64);
+        assert_eq!(DISK_SIZE, 64 * 1024 * 1024);
+        assert_eq!(PARTITION_LBA, 8);
+        assert_eq!(mbr_stage2_size, 4096);
+        assert_eq!(partition_bytes, 67104768);
+        assert_eq!(partition_bytes % 512, 0);
+        assert_eq!(partition_bytes / 512, 131064);
+    }
+}

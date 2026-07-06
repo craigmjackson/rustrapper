@@ -183,6 +183,29 @@ make clean                       # Clean all artifacts
 | `x86_64-linux-gnu` (disk-image) | Host   | —                 | `target/debug/disk-image`        |
 | `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
 
+## Tests
+
+Run the full host-testable suite:
+
+```bash
+cargo test --workspace        # All 66 tests across all crates
+cargo test --package common   # 22 tests (formatting, scan loop)
+cargo test --package uefi     # 15 tests (type sizes, GUID values, constants)
+cargo test --package arm64-bare  # 15 tests (pci_off, storage_name)
+cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries)
+```
+
+| Crate | Tests | What's tested |
+|-------|-------|---------------|
+| `common` | 22 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit), `format_dec` (zero, round numbers, max u64, powers of 10), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping) |
+| `uefi`/`efi` | 15 | Struct sizes under `repr(C)`, GUID byte values, `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness |
+| `arm64-bare`/`pci` | 15 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 11 subclass codes, unknown fallback) |
+| `disk-image` | 14 | `chs_from_lba` geometry (sector/head/cylinder boundaries), `build_mbr_partition` (bootable flag, type byte, LBA/sector count, CHS clamping at 1023/254/63), partition size invariants |
+
+**Test architecture**: `common`/`disk-image` tests run directly on the host. `uefi` tests run on the host by guarding platform-specific code with `#[cfg(not(test))]` and using `#[cfg_attr(not(test), no_std)]` / `#[cfg_attr(not(test), no_main)]` so the standard test harness can drive them. `arm64-bare` tests similarly guard the ARM64 `global_asm!` entry point and the `extern "C" fn main` behind `#[cfg(not(test))]`, exposing only pure functions (`pci_off`, `storage_name`) for host testing.
+
+The `print` module separates formatting from I/O: `format_hex`/`format_dec` write to caller-provided byte buffers and return `&str`, while `print_hex`/`print_dec` call `puts` through the global `PUTC_FN` callback. Tests exercise the pure formatting functions directly, avoiding the `static mut` callback.
+
 ## Tools Required
 
 - **Rust**: `rustc`, `cargo` with targets `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`

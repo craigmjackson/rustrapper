@@ -98,3 +98,98 @@ pub struct EFI_SYSTEM_TABLE {
     pub number_of_table_entries: u64,
     pub configuration_table: *mut c_void,
 }
+
+#[cfg(test)]
+mod tests {
+    use core::mem;
+    use super::*;
+
+    #[test]
+    fn test_guid_size() {
+        assert_eq!(mem::size_of::<EFI_GUID>(), 16);
+    }
+
+    #[test]
+    fn test_block_io_media_size() {
+        // 4 + 5 + 3 + 4 + 4 + pad(4) + 8 = 32 (last_block requires 8-byte alignment)
+        assert_eq!(mem::size_of::<EFI_BLOCK_IO_MEDIA>(), 32);
+    }
+
+    #[test]
+    fn test_block_io_protocol_size() {
+        assert_eq!(mem::size_of::<EFI_BLOCK_IO_PROTOCOL>(), 48);
+    }
+
+    #[test]
+    fn test_device_path_size() {
+        assert_eq!(mem::size_of::<EFI_DEVICE_PATH_PROTOCOL>(), 4);
+    }
+
+    #[test]
+    fn test_system_table_size() {
+        // 24 (hdr) + 6 ptrs*8 + 2 u32*4 + u64 + ptr = 120
+        assert_eq!(mem::size_of::<EFI_SYSTEM_TABLE>(), 120);
+    }
+
+    #[test]
+    fn test_table_header_size() {
+        assert_eq!(mem::size_of::<EFI_TABLE_HEADER>(), 24);
+    }
+
+    #[test]
+    fn test_simple_text_output_size() {
+        assert_eq!(mem::size_of::<SIMPLE_TEXT_OUTPUT_PROTOCOL>(), 16);
+    }
+
+    #[test]
+    fn test_block_io_guid_value() {
+        assert_eq!(BLOCK_IO_GUID.data1, 0x964E5B21);
+        assert_eq!(BLOCK_IO_GUID.data2, 0x6459);
+        assert_eq!(BLOCK_IO_GUID.data3, 0x11D2);
+        assert_eq!(BLOCK_IO_GUID.data4, [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
+    }
+
+    #[test]
+    fn test_device_path_guid_value() {
+        assert_eq!(DEVICE_PATH_GUID.data1, 0x09576E91);
+        assert_eq!(DEVICE_PATH_GUID.data2, 0x6D3F);
+        assert_eq!(DEVICE_PATH_GUID.data3, 0x11D2);
+        assert_eq!(DEVICE_PATH_GUID.data4, [0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
+    }
+
+    #[test]
+    fn test_efi_success() {
+        assert_eq!(EFI_SUCCESS, 0);
+    }
+
+    #[test]
+    fn test_efi_status_size() {
+        assert_eq!(mem::size_of::<EFI_STATUS>(), mem::size_of::<UINTN>());
+    }
+
+    #[test]
+    fn test_uintn_is_64() {
+        assert_eq!(mem::size_of::<UINTN>(), 8);
+    }
+
+    #[test]
+    fn test_efi_handle_size() {
+        assert_eq!(mem::size_of::<EFI_HANDLE>(), mem::size_of::<*mut core::ffi::c_void>());
+    }
+
+    #[test]
+    fn test_efi_constants() {
+        assert_eq!(EFI_INVALID_PARAMETER, 2);
+        assert_eq!(EFI_NOT_FOUND, 14);
+        assert_eq!(EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL, 0x00000001);
+    }
+
+    #[test]
+    fn test_guid_unique() {
+        assert!(
+            BLOCK_IO_GUID.data1 != DEVICE_PATH_GUID.data1
+                || BLOCK_IO_GUID.data2 != DEVICE_PATH_GUID.data2
+                || BLOCK_IO_GUID.data3 != DEVICE_PATH_GUID.data3
+        );
+    }
+}

@@ -4,7 +4,7 @@ use common::print::{print_dec, print_hex, putc, puts};
 
 const ECAM_BASE: u64 = 0x4010_0000_00;
 
-const fn pci_off(bus: u8, dev: u8, func: u8, offset: u8) -> u64 {
+pub const fn pci_off(bus: u8, dev: u8, func: u8, offset: u8) -> u64 {
     (bus as u64) << 20 | (dev as u64) << 15 | (func as u64) << 12 | (offset as u64)
 }
 
@@ -119,7 +119,7 @@ fn pci_enable_bars(bus: u8, dev: u8, func: u8) {
     puts("    Device enabled.\n");
 }
 
-fn storage_name(subclass: u8) -> &'static str {
+pub fn storage_name(subclass: u8) -> &'static str {
     match subclass {
         0x00 => "SCSI",
         0x01 => "IDE",

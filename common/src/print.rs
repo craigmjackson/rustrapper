@@ -33,7 +33,8 @@ impl Write for UartWriter {
     }
 }
 
-pub fn print_hex(val: u64, nibbles: usize) {
+fn format_hex(val: u64, nibbles: usize, buf: &mut [u8; 16]) -> &str {
+    let mut pos = 0;
     let mut started = false;
     for i in (0..nibbles).rev() {
         let digit = ((val >> (i * 4)) & 0xF) as u8;
@@ -41,34 +42,142 @@ pub fn print_hex(val: u64, nibbles: usize) {
             continue;
         }
         started = true;
-        putc(if digit < 10 { b'0' + digit } else { b'A' + digit - 10 });
+        buf[pos] = if digit < 10 { b'0' + digit } else { b'A' + digit - 10 };
+        pos += 1;
     }
     if !started {
-        putc(b'0');
+        buf[pos] = b'0';
+        pos += 1;
     }
+    unsafe { core::str::from_utf8_unchecked(&buf[..pos]) }
+}
+
+pub fn print_hex(val: u64, nibbles: usize) {
+    let mut hex_buf = [0u8; 16];
+    let s = format_hex(val, nibbles, &mut hex_buf);
+    puts(s);
+}
+
+fn format_dec(val: u64, buf: &mut [u8; 20]) -> &str {
+    if val == 0 {
+        buf[0] = b'0';
+        return unsafe { core::str::from_utf8_unchecked(&buf[..1]) };
+    }
+    let mut rev = [0u8; 20];
+    let mut n = 0;
+    let mut v = val;
+    while v > 0 {
+        rev[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    let mut j = 0;
+    while n > 0 {
+        n -= 1;
+        buf[j] = rev[n];
+        j += 1;
+    }
+    unsafe { core::str::from_utf8_unchecked(&buf[..j]) }
 }
 
 pub fn print_dec(val: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut v = val;
-    if v == 0 {
-        putc(b'0');
-        return;
-    }
-    while v > 0 {
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        i += 1;
-    }
-    while i > 0 {
-        i -= 1;
-        putc(buf[i]);
-    }
+    let mut dec_buf = [0u8; 20];
+    let s = format_dec(val, &mut dec_buf);
+    puts(s);
 }
 
 pub fn print_fmt(args: fmt::Arguments<'_>) {
     let _ = UartWriter.write_fmt(args);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn test_format_hex(val: u64, nibbles: usize, expected: &str) {
+        let mut buf = [0u8; 16];
+        let s = format_hex(val, nibbles, &mut buf);
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn hex_zero() {
+        test_format_hex(0, 4, "0");
+    }
+
+    #[test]
+    fn hex_no_leading_zeros() {
+        test_format_hex(0x00FF, 8, "FF");
+    }
+
+    #[test]
+    fn hex_all_digits() {
+        test_format_hex(0xABCD, 4, "ABCD");
+    }
+
+    #[test]
+    fn hex_lower_nibble() {
+        test_format_hex(0x5, 4, "5");
+    }
+
+    #[test]
+    fn hex_full_width() {
+        test_format_hex(0xDEAD_BEEF_CAFE_BABE, 16, "DEADBEEFCAFEBABE");
+    }
+
+    #[test]
+    fn hex_alternating() {
+        test_format_hex(0xAAAA, 4, "AAAA");
+    }
+
+    fn test_format_dec(val: u64, expected: &str) {
+        let mut buf = [0u8; 20];
+        let s = format_dec(val, &mut buf);
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn dec_zero() {
+        test_format_dec(0, "0");
+    }
+
+    #[test]
+    fn dec_single_digit() {
+        test_format_dec(7, "7");
+    }
+
+    #[test]
+    fn dec_round_number() {
+        test_format_dec(1000, "1000");
+    }
+
+    #[test]
+    fn dec_big() {
+        test_format_dec(123456789, "123456789");
+    }
+
+    #[test]
+    fn dec_max_u64() {
+        test_format_dec(u64::MAX, "18446744073709551615");
+    }
+
+    #[test]
+    fn dec_power_of_ten() {
+        test_format_dec(1_000_000_000_000_000_000, "1000000000000000000");
+    }
+
+    #[test]
+    fn dec_million() {
+        test_format_dec(1_000_000, "1000000");
+    }
+
+    #[test]
+    fn hex_single_nibble() {
+        test_format_hex(0xF, 1, "F");
+    }
+
+    #[test]
+    fn hex_zero_nibble_all() {
+        test_format_hex(0, 1, "0");
+    }
+}
