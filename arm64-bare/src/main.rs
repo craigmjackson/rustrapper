@@ -3,6 +3,7 @@
 
 mod uart;
 mod pci;
+mod net;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -17,6 +18,10 @@ core::arch::global_asm!(
     "_start:",
     "  ldr x30, =_stack_top",
     "  mov sp, x30",
+    "  mrs x9, cpacr_el1",
+    "  orr x9, x9, #(3 << 20)", // FPEN = 0b11: no trapping of FP/SIMD at EL0/EL1
+    "  msr cpacr_el1, x9",
+    "  isb",
     "  ldr x0, =_bss_start",
     "  ldr x1, =_bss_end",
     "  cmp x0, x1",
@@ -43,6 +48,8 @@ pub extern "C" fn main() -> ! {
     pci::pci_print_all();
     print::puts("\nStorage devices:\n");
     scan::scan_devices(pci::detect_device);
+    print::puts("\n");
+    net::scan_network();
     print::puts("Halting.\n");
     loop {
         unsafe { core::arch::asm!("wfi") }

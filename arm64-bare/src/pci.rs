@@ -8,7 +8,7 @@ pub const fn pci_off(bus: u8, dev: u8, func: u8, offset: u8) -> u64 {
     (bus as u64) << 20 | (dev as u64) << 15 | (func as u64) << 12 | (offset as u64)
 }
 
-fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+pub fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let addr = (ECAM_BASE + pci_off(bus, dev, func, offset)) as *const u32;
     unsafe { read_volatile(addr) }
 }
@@ -28,16 +28,16 @@ fn pci_write16(bus: u8, dev: u8, func: u8, offset: u8, val: u16) {
     unsafe { write_volatile(addr, val) };
 }
 
-fn pci_vid(bus: u8, dev: u8, func: u8) -> u16 {
+pub fn pci_vid(bus: u8, dev: u8, func: u8) -> u16 {
     pci_read32(bus, dev, func, 0) as u16
 }
-fn pci_did(bus: u8, dev: u8, func: u8) -> u16 {
+pub fn pci_did(bus: u8, dev: u8, func: u8) -> u16 {
     (pci_read32(bus, dev, func, 0) >> 16) as u16
 }
-fn pci_class(bus: u8, dev: u8, func: u8) -> u8 {
+pub fn pci_class(bus: u8, dev: u8, func: u8) -> u8 {
     (pci_read32(bus, dev, func, 8) >> 24) as u8
 }
-fn pci_subclass(bus: u8, dev: u8, func: u8) -> u8 {
+pub fn pci_subclass(bus: u8, dev: u8, func: u8) -> u8 {
     ((pci_read32(bus, dev, func, 8) >> 16) & 0xFF) as u8
 }
 
@@ -48,7 +48,7 @@ fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
 
 static mut MMIO_NEXT: u64 = 0x3E00_0000;
 
-fn pci_enable_bars(bus: u8, dev: u8, func: u8) {
+pub fn pci_enable_bars(bus: u8, dev: u8, func: u8) {
     let cmd = pci_read16(bus, dev, func, 0x04);
     if cmd & 0x03 != 0 {
         return;

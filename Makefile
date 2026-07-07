@@ -151,7 +151,7 @@ run-bare-arm64: $(BIN)/rustrapper_arm64_bare.elf test.img
 		-drive file=test.img,format=raw,if=none,id=drive0 \
 		-device ahci,id=ahci \
 		-device ide-hd,bus=ahci.0,drive=drive0 \
-		-net none -nographic
+		-nic user,model=e1000 -nographic
 
 # ── Clean ────────────────────────────────────────────────────────
 seabios-clean:

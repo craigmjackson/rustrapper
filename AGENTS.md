@@ -43,6 +43,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 │   └── src/
 │       ├── main.rs         # Entry (global_asm! start), UART init, PCI scan
 │       ├── pci.rs          # PCI ECAM walk, BAR sizing/enable, AHCI probe
+│       ├── net.rs          # e1000 MMIO driver + DHCP client (no firmware)
 │       └── uart.rs         # PL011 UART driver
 └── disk-image/             # Rust CLI tool (disk image combiner)
     ├── Cargo.toml
@@ -91,10 +92,23 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 ### `arm64-bare/src/main.rs` — ARM64 bare-metal entry
 
-- Entry point via `global_asm!`: sets stack pointer, zeroes BSS, calls `rust_main`.
+- Entry point via `global_asm!`: sets stack pointer, enables FP/SIMD access via `CPACR_EL1`, zeroes BSS, calls `main`.
+- **FP/SIMD must be enabled before any Rust code runs**: `CPACR_EL1.FPEN` bits (20-21) default to trapping. rustc's compiler-generated `memset`/`memcpy` intrinsics use NEON instructions for buffers over a few hundred bytes; without `orr x9, x9, #(3 << 20)` / `msr cpacr_el1, x9` / `isb` in the boot stub, any such call takes a synchronous exception. Since no exception vector table is installed (`VBAR_EL1` defaults to 0), the CPU silently loops forever fetching garbage at address `0x200` (the "current EL, SPx, synchronous" vector offset) — this looks exactly like a hang with no error output.
 - UART output via MMIO PL011 at `0x09000000` (QEMU virt machine).
 - PCI ECAM at `0x4010_0000_00` (QEMU virt v11+).
 - Load address: `0x4020_0000` (above DTB at `0x4000_0000`).
+- Calls `net::scan_network()` after storage scan (see `arm64-bare/src/net.rs`).
+
+### `arm64-bare/src/net.rs` — ARM64 bare-metal e1000 NIC + DHCP
+
+- Direct MMIO driver for the Intel 82540EM (`e1000`) emulated NIC — no firmware/UEFI involved, unlike the UEFI DHCP path in `uefi/src/net.rs`.
+- Descriptor rings (`RxDescs`/`TxDescs`) are `#[repr(align(16))]` wrapper structs around `#[repr(C, packed)]` descriptor arrays; QEMU's e1000 requires 16-byte-aligned ring base addresses for `RDBAL`/`TDBAL`.
+- **`RDLEN`/`TDLEN` minimum is 128 bytes** on QEMU's e1000 model — rings smaller than 8 descriptors (16 bytes each) are silently rejected (register reads back as the last valid value, not what was written).
+- **`RDT` must be set to `NUM_RX_DESC - 1` after init**, not `0`. `RDH == RDT` means zero descriptors are owned by hardware (empty ring) — a very easy off-by-one that results in silently receiving nothing.
+- All RX descriptors point at a single shared `RX_BUF` (2048 bytes); fine for the single in-flight DHCP transaction this driver performs, but would corrupt data under concurrent multi-packet traffic.
+- DHCP RX polling must be RAM-only status checks (`RX_DESCS.0[idx].status & RX_STATUS_DD`), not MMIO register polling (`reg_read32(base, REG_RDH)`) in a tight loop — repeated MMIO reads under QEMU TCG are drastically slower than cached RAM reads and can make a poll loop take far longer than intended for the same iteration count.
+- The RX poll loop needs roughly 100 million iterations (~1 second of wall time) for QEMU's slirp (`-nic user`) DHCP server to respond; smaller counts (e.g. 2 million, ~0.1s) reliably miss the OFFER even though the packet is delivered on the wire (verified with `-object filter-dump,netdev=net0,file=...` producing a valid pcap showing both DISCOVER and OFFER).
+- Uses `-nic user,model=e1000` in `run-bare-arm64` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
 
 ### `arm64-bare/src/pci.rs` — PCI/AHCI probe
 
@@ -140,57 +154,58 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 5. **`/NODEFAULTLIB` on x86_64-unknown-uefi**: Without `RUSTFLAGS="-C link-args=/NODEFAULTLIB"`, the linker pulls in CRT startup which conflicts with the UEFI environment. ARM64 doesn't need this.
 6. **`panic = "abort"`**: UEFI and bare-metal targets must set `panic = "abort"` in `Cargo.toml` (in `[profile.release]` or `[profile.dev]`). Panic unwinding is not supported.
 7. **`aarch64-unknown-none` requires `global_asm!` entry**: There's no CRT; use `core::arch::global_asm!` to define the `_start` symbol that sets SP and clears BSS before calling Rust code.
+8. **Enable `CPACR_EL1` FP/SIMD access before any Rust code runs on `aarch64-unknown-none`**: rustc's `memset`/`memcpy` compiler intrinsics use NEON registers for larger buffers (e.g. a 1514-byte Ethernet frame array). Without setting `CPACR_EL1.FPEN` (bits 20-21) to `0b11` in the boot stub, the first such call traps. With no exception vector table installed (`VBAR_EL1 == 0` at reset), the trap vectors to address `0x200` and the CPU spins forever on undefined instructions there — indistinguishable from a plain hang, with zero diagnostic output.
 
 ### Original project (C/NASM) still relevant
 
-8. **"MZ" corrupts DL**: The MBR's first 2 bytes are `0x4D 0x5A`, which execute as `dec bp; pop dx`. The `pop dx` overwrites the boot-drive value in DL. Always set DL explicitly before INT 13h calls.
-9. **512-byte MBR limit**: The MBR is strictly 512 bytes (including `0xAA55` at `0x1FE`). All real logic goes in `stage2.bin`.
-10. **ARM64 UEFI SNP single-transmit limit**: The ARM64 virtio SNP driver only supports one `Transmit` per session because `Initialize` returns `EFI_UNSUPPORTED` (no buffer recycling). Send DHCPDISCOVER and accept the OFFER as final — do not attempt REQUEST/ACK. x86_64 e1000 supports the full handshake.
-11. **ARM64 EDK2 error bit**: ARM64 firmware encodes EFI errors with bit 63 set (`0x8000000000000014` for `EFI_ALREADY_STARTED`). Always check both the plain constant and the error-bit variant when comparing status codes on ARM64.
-12. **`virtio-net-pci` is the only ARM64 SNP NIC**: QEMU `qemu-system-aarch64` EDK2 firmware only detects SNP via `virtio-net-pci`. All other models (e1000, e1000e, rtl8139, etc.) return "No network adapters found".
-13. **`EFI_OPEN_PROTOCOL_GET_PROTOCOL`**: Use `0x00000002` instead of `BY_HANDLE_PROTOCOL` (`0x00000001`) for SNP on ARM64 to avoid agent handle tracking issues.
-14. **Non-null SNP.Receive pointers**: Some firmware (ARM64) requires `SrcAddr`, `DestAddr`, and `Protocol` to be non-null output pointers. Passing `null` causes `EFI_INVALID_PARAMETER`.
-15. **`.comment` section causes OVMF Load Error**: Removed from stage2 with `objcopy -R .comment`. When producing PE/COFF from Rust UEFI targets, the linker may still add metadata sections; ensure they're stripped.
-16. **QEMU virt ECAM moved to 64-bit address**: PCIe ECAM is at `0x4010_0000_0000` (QEMU virt v11+), not `0x3F00_0000`. Hardcoded in `arm64-bare/src/pci.rs`.
-17. **PCI BARs unassigned without firmware**: On bare-metal, BARs read as 0. Must implement BAR sizing (write-all-1s) and resource allocation from PCI MMIO window (`0x1000_0000–0x3EFF_FFFF` on virt).
-18. **AHCI requires HBA enable before port access**: Set GHC.AE (bit 31 of ABAR+0x04) before reading CAP, PI, SSTS.
-19. **QEMU DTB at 0x4000_0000**: Load bare-metal binaries at `0x4020_0000` or higher to avoid overlap. Set in linker script / start.S.
-20. **`llvm-objcopy` for ARM64 ELF→binary**: Host `objcopy` cannot handle ARM64 ELF. Use `llvm-objcopy -O binary`.
-21. **`lld` required for ARM64 linking**: Host `ld` lacks `aarch64linux` emulation. Use `-fuse-ld=lld` with clang or `lld-link` for UEFI.
+9. **"MZ" corrupts DL**: The MBR's first 2 bytes are `0x4D 0x5A`, which execute as `dec bp; pop dx`. The `pop dx` overwrites the boot-drive value in DL. Always set DL explicitly before INT 13h calls.
+10. **512-byte MBR limit**: The MBR is strictly 512 bytes (including `0xAA55` at `0x1FE`). All real logic goes in `stage2.bin`.
+11. **ARM64 UEFI SNP single-transmit limit**: The ARM64 virtio SNP driver only supports one `Transmit` per session because `Initialize` returns `EFI_UNSUPPORTED` (no buffer recycling). Send DHCPDISCOVER and accept the OFFER as final — do not attempt REQUEST/ACK. x86_64 e1000 supports the full handshake.
+12. **ARM64 EDK2 error bit**: ARM64 firmware encodes EFI errors with bit 63 set (`0x8000000000000014` for `EFI_ALREADY_STARTED`). Always check both the plain constant and the error-bit variant when comparing status codes on ARM64.
+13. **`virtio-net-pci` is the only ARM64 SNP NIC**: QEMU `qemu-system-aarch64` EDK2 firmware only detects SNP via `virtio-net-pci`. All other models (e1000, e1000e, rtl8139, etc.) return "No network adapters found".
+14. **`EFI_OPEN_PROTOCOL_GET_PROTOCOL`**: Use `0x00000002` instead of `BY_HANDLE_PROTOCOL` (`0x00000001`) for SNP on ARM64 to avoid agent handle tracking issues.
+15. **Non-null SNP.Receive pointers**: Some firmware (ARM64) requires `SrcAddr`, `DestAddr`, and `Protocol` to be non-null output pointers. Passing `null` causes `EFI_INVALID_PARAMETER`.
+16. **`.comment` section causes OVMF Load Error**: Removed from stage2 with `objcopy -R .comment`. When producing PE/COFF from Rust UEFI targets, the linker may still add metadata sections; ensure they're stripped.
+17. **QEMU virt ECAM moved to 64-bit address**: PCIe ECAM is at `0x4010_0000_0000` (QEMU virt v11+), not `0x3F00_0000`. Hardcoded in `arm64-bare/src/pci.rs`.
+18. **PCI BARs unassigned without firmware**: On bare-metal, BARs read as 0. Must implement BAR sizing (write-all-1s) and resource allocation from PCI MMIO window (`0x1000_0000–0x3EFF_FFFF` on virt).
+19. **AHCI requires HBA enable before port access**: Set GHC.AE (bit 31 of ABAR+0x04) before reading CAP, PI, SSTS.
+20. **QEMU DTB at 0x4000_0000**: Load bare-metal binaries at `0x4020_0000` or higher to avoid overlap. Set in linker script / start.S.
+21. **`llvm-objcopy` for ARM64 ELF→binary**: Host `objcopy` cannot handle ARM64 ELF. Use `llvm-objcopy -O binary`.
+22. **`lld` required for ARM64 linking**: Host `ld` lacks `aarch64linux` emulation. Use `-fuse-ld=lld` with clang or `lld-link` for UEFI.
 
 ### Disk-image
 
-22. **mtools required**: `mkfs.fat`, `mmd`, `mcopy` must be installed for FAT32 ESP creation. The Rust `disk-image` crate shells out to these tools.
-23. **Partition table format**: 16-byte entry at offset `0x1BE`: `u8 status`, `[u8; 3] chs_start`, `u8 type`, `[u8; 3] chs_end`, `u32 lba_start`, `u32 sector_count`. All little-endian.
-24. **Disk image size**: The MBR + stage2 occupy LBA 0–10. The FAT32 partition starts at LBA 11. PARTITION_LBA=11 in disk-image/src/main.rs. Update when stage2 size changes.
+23. **mtools required**: `mkfs.fat`, `mmd`, `mcopy` must be installed for FAT32 ESP creation. The Rust `disk-image` crate shells out to these tools.
+24. **Partition table format**: 16-byte entry at offset `0x1BE`: `u8 status`, `[u8; 3] chs_start`, `u8 type`, `[u8; 3] chs_end`, `u32 lba_start`, `u32 sector_count`. All little-endian.
+25. **Disk image size**: The MBR + stage2 occupy LBA 0–10. The FAT32 partition starts at LBA 11. PARTITION_LBA=11 in disk-image/src/main.rs. Update when stage2 size changes.
 
 ### BIOS stage2 (C, retained as-is)
 
-25. **INT 13h register preservation**: `INT 13h` can clobber registers. Use C local variables instead of relying on register values across calls.
-26. **DPB buffer size**: Must be set to `30` (`0x001E`) in the first word before AH=48h.
-27. **Global data in `.data` for `--oformat=binary`**: Accessed globals must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Both `dpb_buf` and `g_putc` use `__attribute__((section(".data")))`.
-28. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
-29. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
+26. **INT 13h register preservation**: `INT 13h` can clobber registers. Use C local variables instead of relying on register values across calls.
+27. **DPB buffer size**: Must be set to `30` (`0x001E`) in the first word before AH=48h.
+28. **Global data in `.data` for `--oformat=binary`**: Accessed globals must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Both `dpb_buf` and `g_putc` use `__attribute__((section(".data")))`.
+29. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
+30. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
 
-30. **Stage2 10-sector limit (5120 bytes)**: The MBR loads 10 sectors (LBA 1-10, 5120 bytes) at physical 0x1000. Keep `stage2.bin` under this limit. Check with `stat -c%s bin/stage2.bin`.
+31. **Stage2 10-sector limit (5120 bytes)**: The MBR loads 10 sectors (LBA 1-10, 5120 bytes) at physical 0x1000. Keep `stage2.bin` under this limit. Check with `stat -c%s bin/stage2.bin`.
 
-31. **PXE/UNDI via INT 1Ah**: PXE entry is discovered via INT 1Ah AX=0x5650. Functions called via INT 1Ah AX=0, BX=function, ES:DI=parameter block. Function numbers: 0x0001=UNDI_STARTUP, 0x0003=UNDI_INITIALIZE, 0x0005=UNDI_OPEN, 0x000B=UNDI_GET_INFO, 0x0030=UDP_OPEN, 0x0034=UDP_TRANSMIT, 0x0036=UDP_RECEIVE.
+32. **PXE/UNDI via INT 1Ah**: PXE entry is discovered via INT 1Ah AX=0x5650. Functions called via INT 1Ah AX=0, BX=function, ES:DI=parameter block. Function numbers: 0x0001=UNDI_STARTUP, 0x0003=UNDI_INITIALIZE, 0x0005=UNDI_OPEN, 0x000B=UNDI_GET_INFO, 0x0030=UDP_OPEN, 0x0034=UDP_TRANSMIT, 0x0036=UDP_RECEIVE.
 
-32. **PXE inline asm clobbers**: For `int 0x1A` PXE calls, only AX and flags are preserved. Use `push`/`pop` for BX and ES inside the asm. List `"cc"` and `"memory"` as clobbers.
+33. **PXE inline asm clobbers**: For `int 0x1A` PXE calls, only AX and flags are preserved. Use `push`/`pop` for BX and ES inside the asm. List `"cc"` and `"memory"` as clobbers.
 
-33. **PXE buffer in `.data`**: The 64-byte `pxe_buf` must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Must be zeroed before each call via `pxe_clear()`.
+34. **PXE buffer in `.data`**: The 64-byte `pxe_buf` must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Must be zeroed before each call via `pxe_clear()`.
 
-34. **Frame buffers at fixed offset 0x1500**: DHCP and receive buffers at offset 0x1500 from DS=0x0100 (physical 0x2500) — past the max stage2 size of 0x1400 bytes. Hardcoded pointers avoid bloat from 1514+ byte buffers.
+35. **Frame buffers at fixed offset 0x1500**: DHCP and receive buffers at offset 0x1500 from DS=0x0100 (physical 0x2500) — past the max stage2 size of 0x1400 bytes. Hardcoded pointers avoid bloat from 1514+ byte buffers.
 
-35. **UDP port fields in network byte order**: PXE UDP parameter structures use big-endian port numbers (`htons()`). `BufferLen` is in host byte order.
+36. **UDP port fields in network byte order**: PXE UDP parameter structures use big-endian port numbers (`htons()`). `BufferLen` is in host byte order.
 
-36. **e1000 is the BIOS test NIC**: Use `-nic user,model=e1000` for SeaBIOS PXE support in QEMU. virtio-net-pci also works. Other models may not have UNDI support.
+37. **e1000 is the BIOS test NIC**: Use `-nic user,model=e1000` for SeaBIOS PXE support in QEMU. virtio-net-pci also works. Other models may not have UNDI support.
 
-37. **Single-transmit DHCP for BIOS**: Same pattern as ARM64 UEFI — send one DISCOVER via UDP_TRANSMIT, poll UDP_RECEIVE up to 100k iterations, accept OFFER as final. No REQUEST/ACK.
+38. **Single-transmit DHCP for BIOS**: Same pattern as ARM64 UEFI — send one DISCOVER via UDP_TRANSMIT, poll UDP_RECEIVE up to 100k iterations, accept OFFER as final. No REQUEST/ACK.
 
-38. **Custom SeaBIOS for PXE testing**: The `run-bios-pxe` target builds a custom SeaBIOS (`make seabios`, cloned from GitHub) and uses it via `-bios`. This ensures the PXE/UNDI INT 1Ah handler stays resident after boot (the default SeaBIOS that ships with QEMU tears down the PXE stack after it boots from a non-PXE device). The build uses `git clone --depth=1` into `build/seabios` and runs `make defconfig` to produce a QEMU-optimized `bios.bin`. On real hardware workstations, the PXE stack remains resident in UMA regardless of boot source and no custom SeaBIOS is needed.
+39. **Custom SeaBIOS for PXE testing**: The `run-bios-pxe` target builds a custom SeaBIOS (`make seabios`, cloned from GitHub) and uses it via `-bios`. This ensures the PXE/UNDI INT 1Ah handler stays resident after boot (the default SeaBIOS that ships with QEMU tears down the PXE stack after it boots from a non-PXE device). The build uses `git clone --depth=1` into `build/seabios` and runs `make defconfig` to produce a QEMU-optimized `bios.bin`. On real hardware workstations, the PXE stack remains resident in UMA regardless of boot source and no custom SeaBIOS is needed.
 
-39. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in `pxe.c` (which uses the PCI I/O BAR for register access) can NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-uefi` (UEFI path works in QEMU) or `make run-bios-pxe` (BIOS PXE with custom SeaBIOS).
+40. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in `pxe.c` (which uses the PCI I/O BAR for register access) can NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-uefi` (UEFI path works in QEMU) or `make run-bios-pxe` (BIOS PXE with custom SeaBIOS).
 
 ## Makefile Targets
 
