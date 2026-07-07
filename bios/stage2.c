@@ -1,5 +1,6 @@
 #include "print.h"
 #include "scan.h"
+#include "pxe.h"
 
 __asm__(
     ".globl _start\n"
@@ -114,7 +115,9 @@ void stage2_main(void)
 {
     serial_init();
     print_init(serial_out);
-    puts("\r\nStage 2 BIOS Storage Scanner\r\n");
+    puts("\r\nStage 2 BIOS\r\n");
+    pxe_scan();
+    puts("\r\n");
     scan_devices();
     puts("Halting.\r\n");
     for (;;)

@@ -9,8 +9,8 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 | LBA | Offset   | Content                                                             |
 | --- | -------- | ------------------------------------------------------------------- |
 | 0   | `0x000`  | MBR (`bios.bin`, 512 bytes) with partition table at `0x1BE`         |
-| 1–7 | `0x200`  | Stage-2 (`stage2.bin`, up to 3584 bytes), loaded by MBR to `0x1000` |
-| 8+  | `0x1000` | FAT32 ESP containing `EFI/BOOT/BOOTX64.EFI`                         |
+| 1–14| `0x200`  | Stage-2 (`stage2.bin`, up to 7168 bytes), loaded by MBR to `0x1000` |
+| 15+ | `0x1E00` | FAT32 ESP containing `EFI/BOOT/BOOTX64.EFI`                         |
 
 ## Directory Structure
 
@@ -162,7 +162,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 22. **mtools required**: `mkfs.fat`, `mmd`, `mcopy` must be installed for FAT32 ESP creation. The Rust `disk-image` crate shells out to these tools.
 23. **Partition table format**: 16-byte entry at offset `0x1BE`: `u8 status`, `[u8; 3] chs_start`, `u8 type`, `[u8; 3] chs_end`, `u32 lba_start`, `u32 sector_count`. All little-endian.
-24. **Disk image size**: The MBR + stage2 occupy LBA 0–7. The FAT32 partition starts at LBA 8. Align the partition to a sector boundary.
+24. **Disk image size**: The MBR + stage2 occupy LBA 0–10. The FAT32 partition starts at LBA 11. PARTITION_LBA=11 in disk-image/src/main.rs. Update when stage2 size changes.
 
 ### BIOS stage2 (C, retained as-is)
 
@@ -171,6 +171,26 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 27. **Global data in `.data` for `--oformat=binary`**: Accessed globals must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Both `dpb_buf` and `g_putc` use `__attribute__((section(".data")))`.
 28. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
 29. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
+
+30. **Stage2 10-sector limit (5120 bytes)**: The MBR loads 10 sectors (LBA 1-10, 5120 bytes) at physical 0x1000. Keep `stage2.bin` under this limit. Check with `stat -c%s bin/stage2.bin`.
+
+31. **PXE/UNDI via INT 1Ah**: PXE entry is discovered via INT 1Ah AX=0x5650. Functions called via INT 1Ah AX=0, BX=function, ES:DI=parameter block. Function numbers: 0x0001=UNDI_STARTUP, 0x0003=UNDI_INITIALIZE, 0x0005=UNDI_OPEN, 0x000B=UNDI_GET_INFO, 0x0030=UDP_OPEN, 0x0034=UDP_TRANSMIT, 0x0036=UDP_RECEIVE.
+
+32. **PXE inline asm clobbers**: For `int 0x1A` PXE calls, only AX and flags are preserved. Use `push`/`pop` for BX and ES inside the asm. List `"cc"` and `"memory"` as clobbers.
+
+33. **PXE buffer in `.data`**: The 64-byte `pxe_buf` must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Must be zeroed before each call via `pxe_clear()`.
+
+34. **Frame buffers at fixed offset 0x1500**: DHCP and receive buffers at offset 0x1500 from DS=0x0100 (physical 0x2500) — past the max stage2 size of 0x1400 bytes. Hardcoded pointers avoid bloat from 1514+ byte buffers.
+
+35. **UDP port fields in network byte order**: PXE UDP parameter structures use big-endian port numbers (`htons()`). `BufferLen` is in host byte order.
+
+36. **e1000 is the BIOS test NIC**: Use `-nic user,model=e1000` for SeaBIOS PXE support in QEMU. virtio-net-pci also works. Other models may not have UNDI support.
+
+37. **Single-transmit DHCP for BIOS**: Same pattern as ARM64 UEFI — send one DISCOVER via UDP_TRANSMIT, poll UDP_RECEIVE up to 100k iterations, accept OFFER as final. No REQUEST/ACK.
+
+38. **Custom SeaBIOS for PXE testing**: The `run-bios-pxe` target builds a custom SeaBIOS (`make seabios`, cloned from GitHub) and uses it via `-bios`. This ensures the PXE/UNDI INT 1Ah handler stays resident after boot (the default SeaBIOS that ships with QEMU tears down the PXE stack after it boots from a non-PXE device). The build uses `git clone --depth=1` into `build/seabios` and runs `make defconfig` to produce a QEMU-optimized `bios.bin`. On real hardware workstations, the PXE stack remains resident in UMA regardless of boot source and no custom SeaBIOS is needed.
+
+39. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in `pxe.c` (which uses the PCI I/O BAR for register access) can NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-uefi` (UEFI path works in QEMU) or `make run-bios-pxe` (BIOS PXE with custom SeaBIOS).
 
 ## Makefile Targets
 
@@ -181,11 +201,14 @@ make uefi                        # Build Rust UEFI binary (x86_64 + ARM64)
 make arm64                       # Alias for uefi (ARM64 UEFI)
 make bare-arm64                  # Build Rust ARM64 bare-metal
 make combined                    # Build disk image (requires mtools)
-make run-bios                    # BIOS mode via SeaBIOS (serial output)
+make seabios                     # Build custom SeaBIOS (auto-cloned from GitHub)
+make run-bios                    # BIOS mode via SeaBIOS (serial output; e1000 I/O not avail)
+make run-bios-pxe                # BIOS PXE with custom iPXE ROM + custom SeaBIOS
 make run-uefi                    # x86_64 UEFI from combined disk image
 make run-uefi-arm64              # ARM64 UEFI from FAT directory
 make run-bare-arm64              # ARM64 bare-metal + AHCI drive
-make clean                       # Clean all artifacts
+make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
+make seabios-clean               # Remove SeaBIOS checkout
 ```
 
 ## Targets

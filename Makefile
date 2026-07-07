@@ -17,7 +17,7 @@ UEFI_ARM64_TARGET := aarch64-unknown-uefi
 # ARM64 bare-metal target
 BARE_ARM64_TARGET := aarch64-unknown-none
 
-.PHONY: all bios uefi arm64 bare-arm64 combined \
+.PHONY: all bios uefi arm64 bare-arm64 combined seabios \
         run-bios run-uefi run-uefi-arm64 run-bare-arm64 clean
 
 all: combined arm64 bare-arm64
@@ -32,7 +32,7 @@ $(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN)
 
 # ── BIOS Stage-2 (C with -m16, flat binary) ──────────────────────
 S2_SRC    := $(BIOS_SRC)/stage2.c $(BIOS_SRC)/div64.c
-S2_COMMON := $(BIOS_SRC)/print.c $(BIOS_SRC)/scan.c
+S2_COMMON := $(BIOS_SRC)/print.c $(BIOS_SRC)/scan.c $(BIOS_SRC)/pxe.c
 S2_BUILD  := build/stage2
 
 $(S2_BUILD):
@@ -50,11 +50,16 @@ $(S2_BUILD)/print_bios.o: $(BIOS_SRC)/print.c | $(S2_BUILD)
 $(S2_BUILD)/scan_bios.o: $(BIOS_SRC)/scan.c | $(S2_BUILD)
 	$(CC) -m16 $(CFLAGS) -c $(BIOS_SRC)/scan.c -o $(S2_BUILD)/scan_bios.o
 
+$(S2_BUILD)/pxe_bios.o: $(BIOS_SRC)/pxe.c | $(S2_BUILD)
+	$(CC) -m16 $(CFLAGS) -c $(BIOS_SRC)/pxe.c -o $(S2_BUILD)/pxe_bios.o
+
 $(BIN)/stage2.bin: $(S2_BUILD)/stage2.o $(S2_BUILD)/div64.o \
-                   $(S2_BUILD)/print_bios.o $(S2_BUILD)/scan_bios.o | $(BIN)
+                   $(S2_BUILD)/print_bios.o $(S2_BUILD)/scan_bios.o \
+                   $(S2_BUILD)/pxe_bios.o | $(BIN)
 	ld -m elf_i386 -e _start -Ttext=0x0 -N --oformat=binary \
 		$(S2_BUILD)/stage2.o $(S2_BUILD)/print_bios.o \
-		$(S2_BUILD)/scan_bios.o $(S2_BUILD)/div64.o -o $@
+		$(S2_BUILD)/scan_bios.o $(S2_BUILD)/pxe_bios.o \
+		$(S2_BUILD)/div64.o -o $@
 
 bios: $(BIN)/bios.bin $(BIN)/stage2.bin
 
@@ -96,9 +101,36 @@ $(BIN)/bootloader.combined: $(BIN)/bios.bin $(BIN)/stage2.bin \
 
 combined: $(BIN)/bootloader.combined
 
+# ── SeaBIOS (custom build with PXE stack kept) ──────────────────
+SEABIOS_DIR := build/seabios
+SEABIOS_BIN := $(SEABIOS_DIR)/out/bios.bin
+
+$(SEABIOS_DIR):
+	git clone --depth=1 https://github.com/coreboot/seabios.git $(SEABIOS_DIR)
+
+$(SEABIOS_DIR)/.config: | $(SEABIOS_DIR)
+	$(MAKE) -C $(SEABIOS_DIR) defconfig
+
+$(SEABIOS_BIN): $(SEABIOS_DIR)/.config
+	$(MAKE) -C $(SEABIOS_DIR)
+
+seabios: $(SEABIOS_BIN)
+
 # ── Run targets ──────────────────────────────────────────────────
+# BIOS e1000 direct driver doesn't work on QEMU due to stub I/O BAR (see AGENTS.md).
+# Use run-uefi for QEMU testing, or real hardware for BIOS e1000.
 run-bios: $(BIN)/bootloader.combined
-	qemu-system-x86_64 -drive file=$<,format=raw -net none -nographic
+	@echo "Note: BIOS e1000 driver requires real hardware (QEMU I/O BAR is a stub)."
+	@echo "      Use run-uefi for QEMU testing, or run-bios-pxe with custom SeaBIOS."
+	qemu-system-x86_64 -drive file=$<,format=raw -nic user,model=e1000 -nographic
+
+# BIOS PXE test with custom iPXE ROM (requires custom SeaBIOS built by the
+# 'seabios' target to keep the PXE/UNDI INT 1Ah handler resident).
+run-bios-pxe: $(BIN)/bootloader.combined $(SEABIOS_BIN)
+	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$<,format=raw \
+		-netdev user,id=net0 \
+		-device e1000,romfile=/tmp/ipxe/src/bin/8086100e.rom,netdev=net0 \
+		-serial stdio -display none -m 64 -no-reboot
 
 run-uefi: $(BIN)/bootloader.combined
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
@@ -122,6 +154,9 @@ run-bare-arm64: $(BIN)/rustrapper_arm64_bare.elf test.img
 		-net none -nographic
 
 # ── Clean ────────────────────────────────────────────────────────
-clean:
+seabios-clean:
+	rm -rf $(SEABIOS_DIR)
+
+clean: seabios-clean
 	rm -rf $(BIN)/* build/
 	rm -rf target/ EFI/

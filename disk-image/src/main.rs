@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PARTITION_LBA: u64 = 8;
+const PARTITION_LBA: u64 = 15;
 const DISK_SIZE_MB: u64 = 64;
 const DISK_SIZE: u64 = DISK_SIZE_MB * 1024 * 1024;
 
@@ -314,18 +314,18 @@ mod tests {
 
     #[test]
     fn test_build_mbr_partition_bootable() {
-        let entry = build_mbr_partition(true, 0x0C, 8, 131064);
+        let entry = build_mbr_partition(true, 0x0C, PARTITION_LBA, 131060);
         assert_eq!(entry[0], 0x80); // bootable
         assert_eq!(entry[4], 0x0C); // FAT32 LBA
         let start_lba = u32::from_le_bytes(entry[8..12].try_into().unwrap());
-        assert_eq!(start_lba, 8);
+        assert_eq!(start_lba, PARTITION_LBA as u32);
         let sectors = u32::from_le_bytes(entry[12..16].try_into().unwrap());
-        assert_eq!(sectors, 131064);
+        assert_eq!(sectors, 131060);
     }
 
     #[test]
     fn test_build_mbr_partition_non_bootable() {
-        let entry = build_mbr_partition(false, 0x0C, 8, 131064);
+        let entry = build_mbr_partition(false, 0x0C, PARTITION_LBA, 131060);
         assert_eq!(entry[0], 0x00); // non-bootable
     }
 
@@ -365,10 +365,10 @@ mod tests {
         let partition_bytes = DISK_SIZE - mbr_stage2_size;
         assert_eq!(DISK_SIZE_MB, 64);
         assert_eq!(DISK_SIZE, 64 * 1024 * 1024);
-        assert_eq!(PARTITION_LBA, 8);
-        assert_eq!(mbr_stage2_size, 4096);
-        assert_eq!(partition_bytes, 67104768);
+        assert_eq!(PARTITION_LBA, 15);
+        assert_eq!(mbr_stage2_size, 7680);
+        assert_eq!(partition_bytes, 67101184);
         assert_eq!(partition_bytes % 512, 0);
-        assert_eq!(partition_bytes / 512, 131064);
+        assert_eq!(partition_bytes / 512, 131057);
     }
 }
