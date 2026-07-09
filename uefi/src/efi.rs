@@ -147,6 +147,19 @@ pub struct SIMPLE_TEXT_OUTPUT_PROTOCOL {
 }
 
 #[repr(C)]
+pub struct EFI_INPUT_KEY {
+    pub scan_code: u16,
+    pub unicode_char: u16,
+}
+
+#[repr(C)]
+pub struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
+    pub reset: *mut c_void,
+    pub read_key_stroke: unsafe extern "efiapi" fn(*mut EFI_SIMPLE_TEXT_INPUT_PROTOCOL, *mut EFI_INPUT_KEY) -> EFI_STATUS,
+    pub wait_for_key: EFI_EVENT,
+}
+
+#[repr(C)]
 pub struct EFI_SYSTEM_TABLE {
     pub hdr: EFI_TABLE_HEADER,
     pub firmware_vendor: *mut u16,
@@ -266,6 +279,17 @@ mod tests {
     #[test]
     fn test_mac_address_size() {
         assert_eq!(mem::size_of::<EFI_MAC_ADDRESS>(), 32);
+    }
+
+    #[test]
+    fn test_input_key_size() {
+        assert_eq!(mem::size_of::<EFI_INPUT_KEY>(), 4);
+    }
+
+    #[test]
+    fn test_simple_text_input_size() {
+        // 2 ptrs + 1 EFI_EVENT = 3*8 = 24
+        assert_eq!(mem::size_of::<EFI_SIMPLE_TEXT_INPUT_PROTOCOL>(), 24);
     }
 
     #[test]

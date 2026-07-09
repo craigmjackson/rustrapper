@@ -56,6 +56,24 @@ static void serial_init(void)
     );
 }
 
+static char serial_getc(void)
+{
+    unsigned char c;
+    __asm__ volatile (
+        "mov $0x3FD, %%dx\n"
+        "1:\n"
+        "in %%dx, %%al\n"
+        "test $0x01, %%al\n"
+        "jz 1b\n"
+        "mov $0x3F8, %%dx\n"
+        "in %%dx, %%al\n"
+        : "=a"(c)
+        :
+        : "dx", "cc"
+    );
+    return (char)c;
+}
+
 int detect_device(int index, struct device_info *info)
 {
     unsigned char drive;
@@ -113,12 +131,30 @@ int detect_device(int index, struct device_info *info)
 
 void stage2_main(void)
 {
+    char choice;
     serial_init();
     print_init(serial_out);
     puts("\r\nStage 2 BIOS\r\n");
-    pxe_scan();
+
+    puts("\r\nMenu:\r\n");
+    puts("  [1] List storage devices\r\n");
+    puts("  [2] Boot from network\r\n");
+    puts("Choose: ");
+    while (1) {
+        choice = serial_getc();
+        putc(choice);
+        if (choice == '1' || choice == '2')
+            break;
+        puts("\r\nInvalid choice, try again: ");
+    }
     puts("\r\n");
-    scan_devices();
+
+    if (choice == '1') {
+        scan_devices();
+    } else {
+        pxe_scan();
+    }
+
     puts("Halting.\r\n");
     for (;;)
         __asm__ volatile ("hlt");

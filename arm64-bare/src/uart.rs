@@ -5,6 +5,7 @@ const UART_BASE: u64 = 0x0900_0000;
 const UART_DR: *mut u32 = (UART_BASE + 0x000) as *mut u32;
 const UART_FR: *mut u32 = (UART_BASE + 0x018) as *mut u32;
 const UART_FR_TXFF: u32 = 1 << 5;
+const UART_FR_RXFE: u32 = 1 << 4;
 
 pub fn putc(c: u8) {
     if c == b'\n' {
@@ -13,4 +14,11 @@ pub fn putc(c: u8) {
     }
     while unsafe { read_volatile(UART_FR) } & UART_FR_TXFF != 0 {}
     unsafe { write_volatile(UART_DR, c as u32) };
+}
+
+pub fn getc() -> Option<u8> {
+    if unsafe { read_volatile(UART_FR) } & UART_FR_RXFE != 0 {
+        return None;
+    }
+    Some(unsafe { read_volatile(UART_DR) } as u8)
 }

@@ -30,7 +30,7 @@ fn read_boot_svc_fn<T>(gbs: *const c_void, offset: usize) -> T {
     unsafe { core::mem::transmute_copy(&*ptr) }
 }
 
-fn w16(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, s: &str) {
+pub fn w16(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, s: &str) {
     let mut buf = [0u16; 256];
     let bytes = s.as_bytes();
     let len = bytes.len().min(255);

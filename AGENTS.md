@@ -2,7 +2,7 @@
 
 ## Overview
 
-Produces a single `bootloader.combined` disk image bootable under legacy BIOS and x86_64 UEFI, plus standalone ARM64 EFI and ARM64 bare-metal binaries. All variants scan storage devices and print media info; UEFI variants also scan network adapters and run DHCP.
+Produces a single `bootloader.combined` disk image bootable under legacy BIOS and x86_64 UEFI, plus standalone ARM64 EFI and ARM64 bare-metal binaries. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP).
 
 ## Layout (bootloader.combined, 64 MB disk image)
 
@@ -29,6 +29,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
+│       ├── menu.rs         # Shared [1]/[2] menu logic
 │       ├── print.rs        # Callback-based print (putc/puts/print_hex/print_dec)
 │       └── scan.rs         # Generic device-scan loop
 ├── uefi/                   # Rust UEFI binary (x86_64 + ARM64)
@@ -68,7 +69,9 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 ### `uefi/src/main.rs` — UEFI entry point
 
 - `efi_main` is `extern "efiapi" fn(image_handle, system_table) -> !`.
-- Calls `scan_storage_devices` which never returns (infinite loop at end).
+- Stores a global reference to the system table for console input.
+- Presents the `[1]/[2]` menu via `common::menu::show_menu`, using `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` for non-blocking input.
+- Dispatches to `scan_storage_devices` or `net::scan_network_devices` based on the choice.
 
 ### `uefi/src/scan.rs` — UEFI storage scan
 
@@ -97,7 +100,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 - UART output via MMIO PL011 at `0x09000000` (QEMU virt machine).
 - PCI ECAM at `0x4010_0000_00` (QEMU virt v11+).
 - Load address: `0x4020_0000` (above DTB at `0x4000_0000`).
-- Calls `net::scan_network()` after storage scan (see `arm64-bare/src/net.rs`).
+- Presents the `[1]/[2]` menu via `common::menu::show_menu`, reading from the PL011 UART (`uart::getc`), and dispatches to `scan::scan_devices` or `net::scan_network` based on the choice.
 
 ### `arm64-bare/src/net.rs` — ARM64 bare-metal e1000 NIC + DHCP
 
@@ -116,6 +119,17 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 - For each mass-storage class device, calls `enable_bars` (BAR sizing via all-1s write, MMIO from `0x3E00_0000`) and `probe_ahci`.
 - `probe_ahci` enables HBA (`GHC.AE`, bit 31 of ABAR+0x04), reads CAP/PI/SSTS to detect attached drives.
 - `pci_read_config` / `pci_write_config`: MMIO ECAM access via pointer dereference.
+
+### `common/src/menu.rs` — Shared menu logic
+
+- `MenuAction` enum: `StorageScan` / `NetworkBoot`.
+- `show_menu(puts, putc, get_key)` prints `[1]/[2]` and polls `get_key` until the user presses a valid choice.
+- `puts`/`putc` are function pointers, so the same function can be used with ASCII (UART/BIOS) and UEFI (wrapped to u16 `OutputString`) output.
+
+### `bios/stage2.c` — BIOS stage-2 menu and scan
+
+- Presents `[1]/[2]` menu and reads the choice from the serial port (COM1, 0x3F8), because the BIOS stage-2 uses serial output. This matches the `-serial stdio` setup used by `run-bios` and `run-bios-pxe`.
+- Dispatches to `scan_devices()` (INT 13h) or `pxe_scan()` (e1000 direct I/O BAR + PXE/UNDI fallback).
 
 ### `common/src/print.rs` — Shared formatting
 
@@ -206,6 +220,8 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 39. **Custom SeaBIOS for PXE testing**: The `run-bios-pxe` target builds a custom SeaBIOS (`make seabios`, cloned from GitHub) and uses it via `-bios`. This ensures the PXE/UNDI INT 1Ah handler stays resident after boot (the default SeaBIOS that ships with QEMU tears down the PXE stack after it boots from a non-PXE device). The build uses `git clone --depth=1` into `build/seabios` and runs `make defconfig` to produce a QEMU-optimized `bios.bin`. On real hardware workstations, the PXE stack remains resident in UMA regardless of boot source and no custom SeaBIOS is needed.
 
 40. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in `pxe.c` (which uses the PCI I/O BAR for register access) can NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-uefi` (UEFI path works in QEMU) or `make run-bios-pxe` (BIOS PXE with custom SeaBIOS).
+41. **UEFI keyboard input is non-blocking**: `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` returns `EFI_NOT_READY` when no key is pressed. The menu polls it in a tight loop until a valid choice is received. Store the system table pointer globally so the polling function can reach `con_in` without threading it through every helper.
+42. **BIOS menu reads from serial port**: The BIOS stage-2 uses serial output, so the menu reads from COM1 (0x3F8) rather than the keyboard. This matches the `-serial stdio` setup used by `run-bios` and `run-bios-pxe`. Real hardware with a serial console will work the same way; a VGA+keyboard setup would require a keyboard input path instead.
 
 ## Makefile Targets
 
@@ -241,9 +257,9 @@ make seabios-clean               # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 69 tests across all crates
+cargo test --workspace        # All 71 tests across all crates
 cargo test --package common   # 22 tests (formatting, scan loop)
-cargo test --package uefi     # 18 tests (type sizes, GUID values, constants, SNP mode layout)
+cargo test --package uefi     # 20 tests (type sizes, GUID values, constants, SNP mode layout, input protocol sizes)
 cargo test --package arm64-bare  # 15 tests (pci_off, storage_name)
 cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries)
 ```
@@ -251,7 +267,7 @@ cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries
 | Crate | Tests | What's tested |
 |-------|-------|---------------|
 | `common` | 22 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit), `format_dec` (zero, round numbers, max u64, powers of 10), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping) |
-| `uefi`/`efi` | 18 | Struct sizes under `repr(C)`, GUID byte values, `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets |
+| `uefi`/`efi` | 20 | Struct sizes under `repr(C)`, GUID byte values, `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes |
 | `arm64-bare`/`pci` | 15 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 11 subclass codes, unknown fallback) |
 | `disk-image` | 14 | `chs_from_lba` geometry (sector/head/cylinder boundaries), `build_mbr_partition` (bootable flag, type byte, LBA/sector count, CHS clamping at 1023/254/63), partition size invariants |
 
