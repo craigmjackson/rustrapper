@@ -18,7 +18,8 @@ UEFI_ARM64_TARGET := aarch64-unknown-uefi
 BARE_ARM64_TARGET := aarch64-unknown-none
 
 .PHONY: all bios uefi arm64 bare-arm64 combined seabios \
-        run-bios run-uefi run-uefi-arm64 run-bare-arm64 clean
+        run-bios run-uefi run-uefi-arm64 run-bare-arm64 clean \
+        romwrap-uefi run-rom-uefi
 
 all: combined arm64 bare-arm64
 
@@ -79,6 +80,17 @@ $(BIN)/rustrapper_arm64.efi: $(shell find uefi common -name '*.rs') Cargo.toml |
 uefi: $(BIN)/rustrapper.efi
 arm64: $(BIN)/rustrapper_arm64.efi
 
+# ── UEFI PCI Expansion ROM ──────────────────────────────────────
+ROMWRAP_BIN := target/debug/romwrap
+
+$(ROMWRAP_BIN): $(shell find romwrap -name '*.rs') Cargo.toml
+	$(CARGO) build --package romwrap
+
+$(BIN)/rustrapper_efi.rom: $(BIN)/rustrapper.efi $(ROMWRAP_BIN) | $(BIN)
+	$(CARGO) run --package romwrap -- $(BIN)/rustrapper.efi $@
+
+romwrap-uefi: $(BIN)/rustrapper_efi.rom
+
 # ── ARM64 Bare-metal ──────────────────────────────────────────────
 $(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common -name '*.rs') \
                                 arm64-bare/link.ld Cargo.toml | $(BIN)
@@ -135,6 +147,13 @@ run-bios-pxe: $(BIN)/bootloader.combined $(SEABIOS_BIN)
 run-uefi: $(BIN)/bootloader.combined
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
 		-drive file=$<,format=raw -nic user,model=e1000 -nographic
+
+run-rom-uefi: $(BIN)/bootloader.combined $(BIN)/rustrapper_efi.rom
+	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
+		-drive file=$(BIN)/bootloader.combined,format=raw \
+		-netdev user,id=net0 \
+		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0 \
+		-nographic
 
 run-uefi-arm64: $(BIN)/rustrapper_arm64.efi
 	mkdir -p EFI/BOOT

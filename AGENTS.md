@@ -16,7 +16,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 ```
 .
-├── Cargo.toml              # Workspace root (4 member crates)
+├── Cargo.toml              # Workspace root (5 member crates)
 ├── Makefile                # Build orchestration (make all, make run-*)
 ├── AGENTS.md               # This file
 ├── bios/                   # Retained C/NASM sources
@@ -46,10 +46,14 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 │       ├── pci.rs          # PCI ECAM walk, BAR sizing/enable, AHCI probe
 │       ├── net.rs          # e1000 MMIO driver + DHCP client (no firmware)
 │       └── uart.rs         # PL011 UART driver
-└── disk-image/             # Rust CLI tool (disk image combiner)
+├── disk-image/             # Rust CLI tool (disk image combiner)
+│   ├── Cargo.toml
+│   └── src/
+│       └── main.rs         # Assembles MBR + stage2 + FAT32 → combined image
+└── romwrap/                # Rust CLI tool (PCI expansion ROM wrapper)
     ├── Cargo.toml
     └── src/
-        └── main.rs         # Assembles MBR + stage2 + FAT32 → combined image
+        └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
 ```
 
 ## Files
@@ -59,7 +63,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 - All types hand-written (no `uefi` crate dependency).
 - `extern "efiapi"` calling convention is the EFI ABI on both x86_64 and ARM64.
 - Function pointers that dereference raw pointers (e.g. `output_string`) must be `unsafe extern "efiapi" fn(...)`, NOT `extern "efiapi" fn(...)`. Using safe `extern "efiapi" fn` causes "unnecessary `unsafe` block" warnings when wrapping calls.
-- **Boot Services function offsets** (hardcoded, from GNU-EFI / EDK2 headers):
+- **Boot Services function offsets** (hardcoded, verified on OVMF/EDK2):
   - `0x48` — `FreePool`
   - `0x118` — `OpenProtocol`
   - `0x138` — `LocateHandleBuffer`
@@ -150,9 +154,18 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 - Writes MBR partition entry (type `0x0C` FAT32 LBA) at offset `0x1BE`.
 - Partition table entry format (16 bytes): `<status><chs_start[3]><type><chs_end[3]><lba_start[4]><sector_count[4]>`.
 
+### `romwrap/src/main.rs` — PCI expansion ROM wrapper
+
+- Wraps a PE/COFF binary (`rustrapper.efi`) into a PCI expansion ROM container usable by UEFI firmware (OVMF).
+- ROM header at offset 0: `0xAA55` signature, init vector = `0x0000` (EFI-only), PCIR offset at `0x18`.
+- **PCI Data Structure (PCIR)**: `"PCIR"` signature, vendor/device IDs (default `0x8086`/`0x100E` for Intel e1000), code type `0x03` (EFI), indicator `0x80` (last image), revision `0x00`.
+- Total header size: 52 bytes (28 B ROM header + 24 B PCIR structure). PE/COFF follows at offset `0x34`.
+- Output is padded to the next 512-byte boundary (file size is always a multiple of 512).
+- Supports `--vendor=` and `--device=` flags for custom PCI IDs (e.g. `--vendor=0x10EC --device=0x8139`).
+
 ### `Makefile` — Build orchestration
 
-- Top-level targets: `all`, `bios`, `uefi`, `arm64`, `bare-arm64`, `combined`, `run-*`, `clean`.
+- Top-level targets: `all`, `bios`, `uefi`, `arm64`, `bare-arm64`, `combined`, `romwrap-uefi`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
 - mtools (`mmd`, `mcopy`) and `mkfs.fat` must be on `$PATH` for `make combined`.
@@ -223,6 +236,22 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 41. **UEFI keyboard input is non-blocking**: `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` returns `EFI_NOT_READY` when no key is pressed. The menu polls it in a tight loop until a valid choice is received. Store the system table pointer globally so the polling function can reach `con_in` without threading it through every helper.
 42. **BIOS menu reads from serial port**: The BIOS stage-2 uses serial output, so the menu reads from COM1 (0x3F8) rather than the keyboard. This matches the `-serial stdio` setup used by `run-bios` and `run-bios-pxe`. Real hardware with a serial console will work the same way; a VGA+keyboard setup would require a keyboard input path instead.
 
+### UEFI Option ROM & Direct e1000 (added during option ROM work)
+
+43. **PCI device path node packs device/function into one byte**: UEFI PCI device path nodes are 6 bytes total — 4-byte header (`type_`, `sub_type`, `length=6`) + 1-byte `bus` + 1-byte `dev_func`. The `dev_func` byte packs device number in the upper 5 bits (`>> 3`) and function in the lower 3 bits (`& 0x07`). Do NOT use 3 separate bytes for bus/device/function. See `uefi/src/net.rs PciNode`.
+
+44. **Device path PCI type check must be 0x01**: Use `type_ == 0x01 && sub_type == 0x01` to detect PCI hardware device path nodes. Type `0x02` is ACPI (not PCI). The first node of most device paths is ACPI Expanded, which has a completely different data layout. Wrong type check (=0x02) reads ACPI HID bytes as if they were PCI bus/dev, producing garbage.
+
+45. **Direct x86 I/O ports for PCI config space**: On x86, `outl(0xCF8, addr)` + `inl(0xCFC)` reads PCI config space at any time — during DXE phase, while option ROMs run, in real mode, etc. This bypasses all UEFI protocols. Use when `EFI_PCI_IO_PROTOCOL.Pci.Read` returns `EFI_UNSUPPORTED` (as it does during option ROM entry on OVMF).
+
+46. **Raw MMIO e1000 driver for option ROM context**: `DirectMmioE1000` in `uefi/src/net.rs` duplicates the e1000 init/send/receive logic from `PciIoHandle` but uses `core::ptr::read_volatile`/`write_volatile` on the BAR0 address instead of UEFI PCI IO protocol MMIO access. Shares the same `static mut` descriptor ring and buffer structures. Called from tier 4 of the fallback chain.
+
+47. **`scan_e1000_devices` fallback chain**: 4 tiers, each tried in order until one succeeds: (1) DevicePath on image handle — fails for option ROM (DP not installed), (2) PCI IO protocol handles — `OpenProtocol` works but `PciRead`/`GetLocation` return `EFI_UNSUPPORTED`, (3) Loaded Image protocol — device handle lacks PCI IO, (4) Direct PCI scan via I/O ports + raw MMIO e1000 — works in all phases.
+
+48. **Option ROM runs `efi_main` twice with `run-rom-uefi`**: The custom option ROM is executed once during DXE (driver entry) and again from the disk (BDS menu). With tier 4 fallback, the DXE instance now succeeds too. The x86_64 non-ROM path (`run-uefi`) only runs from the disk and has full SNP support.
+
+49. **QEMU e1000 MMIO BAR0 is valid during DXE**: Even though option ROM runs early, QEMU's firmware assigns PCI resources before dispatching option ROMs. BAR0 reads back a valid MMIO address (e.g. `0x80F80000`). On real hardware this is also true — the BIOS/firmware configures PCI devices before option ROM entry.
+
 ## Makefile Targets
 
 ```bash
@@ -235,7 +264,9 @@ make combined                    # Build disk image (requires mtools)
 make seabios                     # Build custom SeaBIOS (auto-cloned from GitHub)
 make run-bios                    # BIOS mode via SeaBIOS (serial output; e1000 I/O not avail)
 make run-bios-pxe                # BIOS PXE with custom iPXE ROM + custom SeaBIOS
+make romwrap-uefi                # Build UEFI PCI expansion ROM from rustrapper.efi
 make run-uefi                    # x86_64 UEFI from combined disk image
+make run-rom-uefi                # x86_64 UEFI with custom PCI expansion ROM + combined disk
 make run-uefi-arm64              # ARM64 UEFI from FAT directory
 make run-bare-arm64              # ARM64 bare-metal + AHCI drive
 make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
@@ -250,18 +281,21 @@ make seabios-clean               # Remove SeaBIOS checkout
 | `aarch64-unknown-uefi`          | ARM64  | UEFI              | `bin/rustrapper_arm64.efi`         |
 | `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/rustrapper_arm64_bare.elf`    |
 | `x86_64-linux-gnu` (disk-image) | Host   | —                 | `target/debug/disk-image`        |
+| `x86_64-linux-gnu` (romwrap)    | Host   | —                 | `target/debug/romwrap`           |
 | `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
+| PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
 
 ## Tests
 
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 71 tests across all crates
+cargo test --workspace        # All 81 tests across all crates
 cargo test --package common   # 22 tests (formatting, scan loop)
 cargo test --package uefi     # 20 tests (type sizes, GUID values, constants, SNP mode layout, input protocol sizes)
 cargo test --package arm64-bare  # 15 tests (pci_off, storage_name)
 cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries)
+cargo test --package romwrap  # 10 tests (PCIR layout, header fields, 512-byte alignment)
 ```
 
 | Crate | Tests | What's tested |
@@ -270,6 +304,7 @@ cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries
 | `uefi`/`efi` | 20 | Struct sizes under `repr(C)`, GUID byte values, `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes |
 | `arm64-bare`/`pci` | 15 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 11 subclass codes, unknown fallback) |
 | `disk-image` | 14 | `chs_from_lba` geometry (sector/head/cylinder boundaries), `build_mbr_partition` (bootable flag, type byte, LBA/sector count, CHS clamping at 1023/254/63), partition size invariants |
+| `romwrap` | 10 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, block count consistency |
 
 **Test architecture**: `common`/`disk-image` tests run directly on the host. `uefi` tests run on the host by guarding platform-specific code with `#[cfg(not(test))]` and using `#[cfg_attr(not(test), no_std)]` / `#[cfg_attr(not(test), no_main)]` so the standard test harness can drive them. `arm64-bare` tests similarly guard the ARM64 `global_asm!` entry point and the `extern "C" fn main` behind `#[cfg(not(test))]`, exposing only pure functions (`pci_off`, `storage_name`) for host testing.
 

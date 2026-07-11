@@ -15,6 +15,64 @@ pub const EFI_ALREADY_STARTED: EFI_STATUS = 20;
 
 pub const EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL: u32 = 0x00000001;
 pub const EFI_OPEN_PROTOCOL_GET_PROTOCOL: u32 = 0x00000002;
+pub const EFI_OPEN_PROTOCOL_BY_DRIVER: u32 = 0x00000004;
+pub const EFI_OPEN_PROTOCOL_EXCLUSIVE: u32 = 0x00000008;
+
+pub static PCI_IO_GUID: EFI_GUID = EFI_GUID {
+    data1: 0x4CF5B200,
+    data2: 0x68B8,
+    data3: 0x4CA5,
+    data4: [0x9E, 0xEC, 0xB2, 0x3E, 0x3F, 0x50, 0x02, 0x9A],
+};
+
+#[repr(u8)]
+pub enum EFI_PCI_IO_PROTOCOL_WIDTH {
+    Uint8 = 0,
+    Uint16 = 1,
+    Uint32 = 2,
+    Uint64 = 3,
+    FifoUint8 = 4,
+    FifoUint16 = 5,
+    FifoUint32 = 6,
+    FifoUint64 = 7,
+    FillUint8 = 8,
+    FillUint16 = 9,
+    FillUint32 = 10,
+    FillUint64 = 11,
+}
+
+#[repr(C)]
+pub struct EFI_PCI_IO_PROTOCOL {
+    pub poll_mem: *mut c_void,
+    pub poll_io: *mut c_void,
+    pub mem: EFI_PCI_IO_PROTOCOL_ACCESS,
+    pub io: EFI_PCI_IO_PROTOCOL_ACCESS,
+    pub pci: EFI_PCI_IO_PROTOCOL_PCI,
+    pub copy_mem: *mut c_void,
+    pub map: *mut c_void,
+    pub unmap: *mut c_void,
+    pub allocate_buffer: *mut c_void,
+    pub free_buffer: *mut c_void,
+    pub flush: *mut c_void,
+    pub get_location: *mut c_void,
+    pub attributes: *mut c_void,
+    pub get_bar_attributes: *mut c_void,
+    pub set_bar_attributes: *mut c_void,
+    pub rom_size: u64,
+    pub rom_image: *mut c_void,
+}
+
+#[repr(C)]
+pub struct EFI_PCI_IO_PROTOCOL_ACCESS {
+    pub read: unsafe extern "efiapi" fn(*mut EFI_PCI_IO_PROTOCOL, EFI_PCI_IO_PROTOCOL_WIDTH, u64, UINTN, *mut c_void) -> EFI_STATUS,
+    pub write: unsafe extern "efiapi" fn(*mut EFI_PCI_IO_PROTOCOL, EFI_PCI_IO_PROTOCOL_WIDTH, u64, UINTN, *const c_void) -> EFI_STATUS,
+}
+
+#[repr(C)]
+pub struct EFI_PCI_IO_PROTOCOL_PCI {
+    pub read: unsafe extern "efiapi" fn(*mut EFI_PCI_IO_PROTOCOL, EFI_PCI_IO_PROTOCOL_WIDTH, u64, *mut c_void) -> EFI_STATUS,
+    pub write: unsafe extern "efiapi" fn(*mut EFI_PCI_IO_PROTOCOL, EFI_PCI_IO_PROTOCOL_WIDTH, u64, *const c_void) -> EFI_STATUS,
+}
 
 #[repr(C)]
 pub struct EFI_GUID {
@@ -43,6 +101,20 @@ pub static SNP_GUID: EFI_GUID = EFI_GUID {
     data2: 0xAC25,
     data3: 0x11D3,
     data4: [0x9A, 0x2D, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D],
+};
+
+pub static LOADED_IMAGE_GUID: EFI_GUID = EFI_GUID {
+    data1: 0x5B1B31A1,
+    data2: 0x9562,
+    data3: 0x11D2,
+    data4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
+
+pub static PCI_ROOT_BRIDGE_IO_GUID: EFI_GUID = EFI_GUID {
+    data1: 0x2F707EBB,
+    data2: 0x4A1A,
+    data3: 0x11D4,
+    data4: [0x9A, 0x38, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D],
 };
 
 pub type EFI_EVENT = *mut c_void;
@@ -157,6 +229,55 @@ pub struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
     pub reset: *mut c_void,
     pub read_key_stroke: unsafe extern "efiapi" fn(*mut EFI_SIMPLE_TEXT_INPUT_PROTOCOL, *mut EFI_INPUT_KEY) -> EFI_STATUS,
     pub wait_for_key: EFI_EVENT,
+}
+
+#[repr(C)]
+pub struct EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL {
+    pub parent_handle: EFI_HANDLE,
+    pub poll_io: *mut c_void,
+    pub poll_mem: *mut c_void,
+    pub io: EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_IO,
+    pub mem: EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_IO,
+    pub pci: EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_PCI,
+    pub copy_mem: *mut c_void,
+    pub map: *mut c_void,
+    pub unmap: *mut c_void,
+    pub allocate_buffer: *mut c_void,
+    pub free_buffer: *mut c_void,
+    pub flush: *mut c_void,
+    pub get_attributes: *mut c_void,
+    pub set_attributes: *mut c_void,
+    pub configuration: *mut c_void,
+    pub segment_number: u64,
+}
+
+#[repr(C)]
+pub struct EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_IO {
+    pub read: *mut c_void,
+    pub write: *mut c_void,
+}
+
+#[repr(C)]
+pub struct EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_PCI {
+    pub read: *mut c_void,
+    pub write: *mut c_void,
+}
+
+#[repr(C)]
+pub struct EFI_LOADED_IMAGE_PROTOCOL {
+    pub revision: u32,
+    pub parent_handle: EFI_HANDLE,
+    pub system_table: *mut EFI_SYSTEM_TABLE,
+    pub device_handle: EFI_HANDLE,
+    pub file_path: *mut EFI_DEVICE_PATH_PROTOCOL,
+    pub reserved: *mut c_void,
+    pub load_options_size: u32,
+    pub load_options: *mut c_void,
+    pub image_base: *mut c_void,
+    pub image_size: u64,
+    pub image_code_type: u32,
+    pub image_data_type: u32,
+    pub unload: unsafe extern "efiapi" fn(EFI_HANDLE) -> EFI_STATUS,
 }
 
 #[repr(C)]
