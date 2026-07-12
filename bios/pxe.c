@@ -109,14 +109,14 @@ static uint16_t pxe_api(uint16_t function, uint16_t di, uint16_t es_seg)
 {
     uint16_t ax;
     __asm__ volatile (
-        "push %%ds\n"
-        "push %%bx\n"
+        "pushw %%ds\n"
+        "pushw %%bx\n"
         "mov %2, %%es\n"
         "mov %3, %%bx\n"
         "xor %%ax, %%ax\n"
         "int $0x1A\n"
-        "pop %%bx\n"
-        "pop %%ds\n"
+        "popw %%bx\n"
+        "popw %%ds\n"
         : "=a"(ax)
         : "D"(di), "r"(es_seg), "m"(function)
         : "cx", "dx", "si", "cc", "memory"
@@ -135,7 +135,7 @@ static int pxe_detect(void)
     uint16_t ax = 0x5650;
     uint8_t cf;
     __asm__ volatile (
-        "push %%bx\npush %%es\nint $0x1A\nsetc %1\npop %%es\npop %%bx\n"
+        "pushw %%bx\npushw %%es\nint $0x1A\nsetc %1\npopw %%es\npopw %%bx\n"
         : "+a"(ax), "=qm"(cf)
         : : "cx", "dx", "si", "di", "cc", "memory"
     );
@@ -143,6 +143,10 @@ static int pxe_detect(void)
 }
 
 // ── Direct e1000 driver via PCI I/O BAR ──
+//
+// NOTE: QEMU's e1000 I/O BAR is an empty stub (returns 0, ignores writes).
+// On QEMU this path will fail with "Link timeout" and fall back to PXE/UNDI.
+// On real hardware with a proper I/O BAR software access protocol it works.
 
 #define E1000_VENDOR 0x8086
 #define E1000_DEVICE 0x100E
@@ -339,8 +343,8 @@ static int e1000_init(uint8_t *mac)
                 break;
             }
         }
-        if (!link_up) {
-            puts("  Link timeout (I/O BAR not accessible?)\r\n");
+    if (!link_up) {
+        puts("  Link timeout (QEMU I/O BAR stub - expected, trying PXE...)\r\n");
             return -1;
         }
     }
@@ -528,7 +532,7 @@ static int e1000_scan(void)
     }
 
     if (e1000_init(mac) != 0) {
-        puts("  e1000 init failed.\r\n");
+        puts("  e1000 init failed (QEMU I/O stub - trying PXE/UNDI...)\r\n");
         return -1;
     }
 
@@ -607,7 +611,7 @@ int pxe_scan(void)
         uint16_t raw[5];
         int i;
         __asm__ (
-            "push %%es\n"
+            "pushw %%es\n"
             "xor %%ax, %%ax\n"
             "mov %%ax, %%es\n"
             "mov %%es:(0x500), %0\n"
@@ -615,7 +619,7 @@ int pxe_scan(void)
             "mov %%es:(0x504), %2\n"
             "mov %%es:(0x506), %3\n"
             "mov %%es:(0x508), %4\n"
-            "pop %%es\n"
+            "popw %%es\n"
             : "=r"(raw[0]), "=r"(raw[1]), "=r"(raw[2]),
               "=r"(raw[3]), "=r"(raw[4])
             : : "ax", "cc"
@@ -628,14 +632,14 @@ int pxe_scan(void)
         uint16_t raw[4];
         int i;
         __asm__ (
-            "push %%es\n"
+            "pushw %%es\n"
             "xor %%ax, %%ax\n"
             "mov %%ax, %%es\n"
             "mov %%es:(0x50A), %0\n"
             "mov %%es:(0x50C), %1\n"
             "mov %%es:(0x50E), %2\n"
             "mov %%es:(0x510), %3\n"
-            "pop %%es\n"
+            "popw %%es\n"
             : "=r"(raw[0]), "=r"(raw[1]), "=r"(raw[2]), "=r"(raw[3])
             : : "ax", "cc"
         );

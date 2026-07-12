@@ -19,7 +19,7 @@ BARE_ARM64_TARGET := aarch64-unknown-none
 
 .PHONY: all bios uefi arm64 bare-arm64 combined seabios \
         run-bios run-uefi run-uefi-arm64 run-bare-arm64 clean \
-        romwrap-uefi run-rom-uefi
+        romwrap-uefi romwrap-bios run-rom-uefi run-bios-rom run-bios-rom-pxe
 
 all: combined arm64 bare-arm64
 
@@ -91,6 +91,12 @@ $(BIN)/rustrapper_efi.rom: $(BIN)/rustrapper.efi $(ROMWRAP_BIN) | $(BIN)
 
 romwrap-uefi: $(BIN)/rustrapper_efi.rom
 
+# ── BIOS PCI Expansion ROM ────────────────────────────────
+$(BIN)/rustrapper_bios.rom: $(BIN)/stage2.bin $(ROMWRAP_BIN) | $(BIN)
+	$(CARGO) run --package romwrap -- $(BIN)/stage2.bin $@ --bios
+
+romwrap-bios: $(BIN)/rustrapper_bios.rom
+
 # ── ARM64 Bare-metal ──────────────────────────────────────────────
 $(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common -name '*.rs') \
                                 arm64-bare/link.ld Cargo.toml | $(BIN)
@@ -154,6 +160,31 @@ run-rom-uefi: $(BIN)/bootloader.combined $(BIN)/rustrapper_efi.rom
 		-netdev user,id=net0 \
 		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0 \
 		-nographic
+
+# BIOS option ROM: stage2.bin wrapped as PCI option ROM with PCIR header.
+# The ROM is detected by SeaBIOS which calls the init routine (minimal:
+# just returns). The stage2 code uses the INT 1Ah PXE/UNDI API if a PXE
+# stack is available.  Direct e1000 I/O BAR is a QEMU stub (see AGENTS.md
+# gotcha #40), so QEMU testing requires a separate PXE stack.
+#
+# Two run modes (QEMU only, not real hardware):
+#   make run-bios-rom         — uses stock SeaBIOS, no PXE (no networking)
+#   make run-bios-rom-pxe     — uses custom SeaBIOS + iPXE ROM on 2nd NIC
+PXE_ROM ?= /tmp/ipxe/src/bin/8086100e.rom
+run-bios-rom: $(BIN)/bootloader.combined $(BIN)/rustrapper_bios.rom
+	qemu-system-x86_64 -drive file=$(BIN)/bootloader.combined,format=raw \
+		-netdev user,id=net0 \
+		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0 \
+		-nographic
+
+run-bios-rom-pxe: $(BIN)/bootloader.combined $(BIN)/rustrapper_bios.rom $(SEABIOS_BIN)
+	@test -f $(PXE_ROM) || { echo "Error: $(PXE_ROM) not found. Build iPXE first (see Makefile comments)."; exit 1; }
+	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$(BIN)/bootloader.combined,format=raw \
+		-netdev user,id=net0 \
+		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0 \
+		-netdev user,id=net1 \
+		-device e1000,romfile=$(PXE_ROM),netdev=net1 \
+		-serial stdio -display none -m 64 -no-reboot
 
 run-uefi-arm64: $(BIN)/rustrapper_arm64.efi
 	mkdir -p EFI/BOOT

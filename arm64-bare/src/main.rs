@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+#![cfg_attr(test, allow(dead_code))]
 
 mod uart;
 mod pci;
@@ -152,5 +153,37 @@ mod tests {
     #[test]
     fn test_storage_name_default() {
         assert_eq!(pci::storage_name(0x0B), "Other");
+    }
+
+    #[test]
+    fn test_storage_name_floppy() {
+        assert_eq!(pci::storage_name(0x02), "Floppy");
+    }
+
+    #[test]
+    fn test_storage_name_ipi() {
+        assert_eq!(pci::storage_name(0x03), "IPI");
+    }
+
+    #[test]
+    fn test_storage_name_raid() {
+        assert_eq!(pci::storage_name(0x04), "RAID");
+    }
+
+    #[test]
+    fn test_storage_name_ata() {
+        assert_eq!(pci::storage_name(0x05), "ATA");
+    }
+
+    #[test]
+    fn test_storage_name_sas() {
+        assert_eq!(pci::storage_name(0x07), "SAS");
+    }
+
+    #[test]
+    fn test_storage_name_unassigned() {
+        assert_eq!(pci::storage_name(0x0B), "Other");
+        assert_eq!(pci::storage_name(0x0C), "Other");
+        assert_eq!(pci::storage_name(0x0D), "Other");
     }
 }

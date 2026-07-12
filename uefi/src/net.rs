@@ -1,5 +1,4 @@
 use core::ffi::c_void;
-use core::ptr;
 
 use crate::efi::*;
 
@@ -317,209 +316,6 @@ static mut TX_DESCS: TxDescs = TxDescs([TxDesc { addr: 0, length: 0, cso: 0, cmd
 static mut RX_BUF: [u8; RX_BUFFER_SIZE] = [0u8; RX_BUFFER_SIZE];
 static mut TX_BUF: [u8; 2048] = [0u8; 2048];
 
-struct PciIoHandle {
-    pci_io: *mut EFI_PCI_IO_PROTOCOL,
-    bar0: u64,
-}
-
-impl PciIoHandle {
-    fn from_pci_io(pci_io: *mut EFI_PCI_IO_PROTOCOL) -> Option<Self> {
-        let mut bar0: u64 = 0;
-        let pci_access = unsafe { &(*pci_io).pci };
-        let mut val: u32 = 0;
-        let st = unsafe {
-            (pci_access.read)(pci_io, EFI_PCI_IO_PROTOCOL_WIDTH::Uint32, 0x10, &mut val as *mut _ as *mut c_void)
-        };
-        if st != EFI_SUCCESS {
-            return None;
-        }
-        bar0 = (val & !0xF) as u64;
-        if bar0 == 0 {
-            return None;
-        }
-
-        Some(Self { pci_io, bar0 })
-    }
-
-    fn new(handle: EFI_HANDLE, open_protocol: OpenProtocolFn, image_handle: EFI_HANDLE) -> Option<Self> {
-        let mut pci_io_ptr: *mut c_void = core::ptr::null_mut();
-        let st = unsafe {
-            open_protocol(
-                handle,
-                &PCI_IO_GUID as *const EFI_GUID,
-                &mut pci_io_ptr,
-                image_handle,
-                core::ptr::null_mut(),
-                EFI_OPEN_PROTOCOL_GET_PROTOCOL,
-            )
-        };
-        if st != EFI_SUCCESS {
-            return None;
-        }
-        Self::from_pci_io(pci_io_ptr as *mut EFI_PCI_IO_PROTOCOL)
-    }
-
-    fn init_pci_io(&mut self) -> bool {
-        let mut bar0: u64 = 0;
-        let pci_access = unsafe { &(*self.pci_io).pci };
-        let mut val: u32 = 0;
-        let st = unsafe {
-            (pci_access.read)(self.pci_io, EFI_PCI_IO_PROTOCOL_WIDTH::Uint32, 0x10, &mut val as *mut _ as *mut c_void)
-        };
-        if st != EFI_SUCCESS {
-            return false;
-        }
-        bar0 = (val & !0xF) as u64;
-        if bar0 == 0 {
-            return false;
-        }
-        self.bar0 = bar0;
-        true
-    }
-
-    fn mmio_read32(&self, reg: u64) -> u32 {
-        let mem_access = unsafe { &(*self.pci_io).mem };
-        let mut val: u32 = 0;
-        let st = unsafe {
-            (mem_access.read)(self.pci_io, EFI_PCI_IO_PROTOCOL_WIDTH::Uint32, self.bar0 + reg, 1, &mut val as *mut _ as *mut c_void)
-        };
-        if st != EFI_SUCCESS { 0 } else { val }
-    }
-
-    fn mmio_write32(&self, reg: u64, val: u32) {
-        let mem_access = unsafe { &(*self.pci_io).mem };
-        unsafe {
-            (mem_access.write)(self.pci_io, EFI_PCI_IO_PROTOCOL_WIDTH::Uint32, self.bar0 + reg, 1, &val as *const _ as *const c_void);
-        }
-    }
-
-    fn read_mac(&self) -> [u8; 6] {
-        let low = self.mmio_read32(REG_RA);
-        let high = self.mmio_read32(REG_RA + 4);
-        [
-            low as u8,
-            (low >> 8) as u8,
-            (low >> 16) as u8,
-            (low >> 24) as u8,
-            high as u8,
-            (high >> 8) as u8,
-        ]
-    }
-
-    fn set_mac(&self, mac: &[u8; 6]) {
-        let low = mac[0] as u32 | (mac[1] as u32) << 8 | (mac[2] as u32) << 16 | (mac[3] as u32) << 24;
-        let high = mac[4] as u32 | (mac[5] as u32) << 8;
-        self.mmio_write32(REG_RA, low);
-        self.mmio_write32(REG_RA + 4, high | 0x8000_0001);
-    }
-
-    fn clear_multicast(&self) {
-        for i in 0..128 {
-            self.mmio_write32(REG_MTA + (i as u64) * 4, 0);
-        }
-    }
-
-    fn init(&self) -> bool {
-        self.mmio_write32(REG_CTRL, self.mmio_read32(REG_CTRL) | CTRL_RST);
-        for _ in 0..100000 {
-            if self.mmio_read32(REG_CTRL) & CTRL_RST == 0 { break; }
-            core::hint::spin_loop();
-        }
-        for _ in 0..1000000 {
-            if self.mmio_read32(REG_STATUS) & STATUS_LU != 0 { break; }
-            core::hint::spin_loop();
-        }
-
-        let mac = self.read_mac();
-        if mac == [0u8; 6] || mac == [0xFFu8; 6] {
-            return false;
-        }
-
-        self.set_mac(&mac);
-        self.clear_multicast();
-
-        unsafe {
-            let rx_buf_addr = core::ptr::addr_of!(RX_BUF) as *const u8 as u64;
-            for i in 0..NUM_RX_DESC {
-                RX_DESCS.0[i].addr = rx_buf_addr;
-            }
-            TX_DESCS.0[0].addr = core::ptr::addr_of!(TX_BUF) as *const u8 as u64;
-        }
-
-        let rx_descs_addr = unsafe { core::ptr::addr_of!(RX_DESCS) as u64 };
-        let tx_descs_addr = unsafe { core::ptr::addr_of!(TX_DESCS) as u64 };
-
-        self.mmio_write32(REG_RDBAL, rx_descs_addr as u32);
-        self.mmio_write32(REG_RDBAH, 0);
-        self.mmio_write32(REG_RDLEN, (NUM_RX_DESC * 16) as u32);
-        self.mmio_write32(REG_RDH, 0);
-        self.mmio_write32(REG_RDT, (NUM_RX_DESC - 1) as u32);
-
-        self.mmio_write32(REG_TDBAL, tx_descs_addr as u32);
-        self.mmio_write32(REG_TDBAH, 0);
-        self.mmio_write32(REG_TDLEN, (NUM_TX_DESC * 16) as u32);
-        self.mmio_write32(REG_TDH, 0);
-        self.mmio_write32(REG_TDT, 0);
-
-        let rctl = RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC | (0 << RCTL_BSIZE_SHIFT);
-        self.mmio_write32(REG_RCTL, rctl);
-
-        let tctl = TCTL_EN | TCTL_PSP | (0x0F << TCTL_CT_SHIFT) | (0x3F << TCTL_COLD_SHIFT);
-        self.mmio_write32(REG_TCTL, tctl);
-
-        self.mmio_write32(REG_CTRL, self.mmio_read32(REG_CTRL) | CTRL_SLU | CTRL_FD);
-
-        for _ in 0..1000000 {
-            if self.mmio_read32(REG_STATUS) & STATUS_LU != 0 { break; }
-            core::hint::spin_loop();
-        }
-
-        true
-    }
-
-    fn send(&self, data: &[u8]) -> bool {
-        if data.len() > 2048 { return false; }
-        unsafe {
-            let buf = core::ptr::addr_of_mut!(TX_BUF) as *mut u8;
-            for i in 0..data.len() {
-                *buf.add(i) = data[i];
-            }
-            TX_DESCS.0[0].length = data.len() as u16;
-            TX_DESCS.0[0].cmd = CMD_EOP | CMD_IFCS | CMD_RS;
-            TX_DESCS.0[0].status = 0;
-        }
-        let old_tdt = self.mmio_read32(REG_TDT);
-        self.mmio_write32(REG_TDT, old_tdt.wrapping_add(1));
-        for _ in 0..2000000 {
-            unsafe {
-                if TX_DESCS.0[0].status & TX_STATUS_DD != 0 { break; }
-            }
-            core::hint::spin_loop();
-        }
-        unsafe { TX_DESCS.0[0].status & TX_STATUS_DD != 0 }
-    }
-
-    fn receive_into(&self, buf: &mut [u8; 1514]) -> Option<usize> {
-        for idx in 0..NUM_RX_DESC {
-            unsafe {
-                if RX_DESCS.0[idx].status & RX_STATUS_DD != 0 {
-                    let len = RX_DESCS.0[idx].length as usize;
-                    let copy_len = if len > 1514 { 1514 } else { len };
-                    core::ptr::copy_nonoverlapping(
-                        core::ptr::addr_of!(RX_BUF) as *const u8,
-                        buf.as_mut_ptr(),
-                        copy_len,
-                    );
-                    RX_DESCS.0[idx].status = 0;
-                    self.mmio_write32(REG_RDT, idx as u32);
-                    return Some(copy_len);
-                }
-            }
-        }
-        None
-    }
-}
-
 // ─── Direct MMIO e1000 driver (no UEFI protocols) ───
 
 struct DirectMmioE1000 {
@@ -592,8 +388,8 @@ impl DirectMmioE1000 {
             TX_DESCS.0[0].addr = core::ptr::addr_of!(TX_BUF) as *const u8 as u64;
         }
 
-        let rx_descs_addr = unsafe { core::ptr::addr_of!(RX_DESCS) as u64 };
-        let tx_descs_addr = unsafe { core::ptr::addr_of!(TX_DESCS) as u64 };
+        let rx_descs_addr = core::ptr::addr_of!(RX_DESCS) as u64;
+        let tx_descs_addr = core::ptr::addr_of!(TX_DESCS) as u64;
 
         self.mmio_write32(REG_RDBAL, rx_descs_addr as u32);
         self.mmio_write32(REG_RDBAH, 0);
@@ -763,7 +559,7 @@ fn scan_e1000_devices(
     gbs: *mut c_void,
     image_handle: EFI_HANDLE,
 ) -> Option<DhcpConfig> {
-    let open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
+    let _open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
 
     // Try 1: Get device path from image handle to find PCI location
     w16(con_out, "Trying Device Path on image handle...\r\n");
@@ -825,99 +621,48 @@ fn scan_e1000_devices(
     None
 }
 
-fn scan_root_bridge(
-    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
-    handle: EFI_HANDLE,
-    open_protocol: OpenProtocolFn,
-    image_handle: EFI_HANDLE,
-) -> Option<DhcpConfig> {
-    w16(con_out, "  Trying PCI Root Bridge IO...\r\n");
-    let mut pci_root_bridge_ptr: *mut c_void = core::ptr::null_mut();
-    let st = unsafe {
-        open_protocol(
-            handle,
-            &PCI_ROOT_BRIDGE_IO_GUID as *const EFI_GUID,
-            &mut pci_root_bridge_ptr,
-            image_handle,
-            core::ptr::null_mut(),
-            EFI_OPEN_PROTOCOL_GET_PROTOCOL,
-        )
-    };
-    if st != EFI_SUCCESS {
-        w16(con_out, "  Cannot open PCI Root Bridge IO: status=");
-        put_dec(con_out, st as u64);
-        w16(con_out, "\r\n");
-        return None;
-    }
-    w16(con_out, "  PCI Root Bridge IO opened successfully\r\n");
-    let pci_root_bridge = pci_root_bridge_ptr as *mut EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL;
-
-    // Try to read PCI config via Root Bridge IO
-    for bus in 0..=255 {
-        for dev in 0..32 {
-            for func in 0..8 {
-                let vendor_dev = pci_root_bridge_pci_read32(pci_root_bridge, bus, dev, func, 0x00);
-                if vendor_dev == 0xFFFFFFFF {
-                    continue;
-                }
-                let vendor = vendor_dev as u16;
-                let device = (vendor_dev >> 16) as u16;
-
-                if vendor == 0x8086 && device == 0x100E {
-                    w16(con_out, "Found e1000 at bus=");
-                    put_dec(con_out, bus as u64);
-                    w16(con_out, " dev=");
-                    put_dec(con_out, dev as u64);
-                    w16(con_out, " func=");
-                    put_dec(con_out, func as u64);
-                    w16(con_out, "\r\n");
-
-                    let bar0 = pci_root_bridge_pci_read32(pci_root_bridge, bus, dev, func, 0x10) & !0xF;
-                    if bar0 == 0 {
-                        continue;
-                    }
-                    w16(con_out, "BAR0=0x");
-                    put_dec(con_out, bar0 as u64);
-                    w16(con_out, "\r\n");
-
-                    if let Some(cfg) = e1000_init_and_dhcp(con_out, bar0 as u64) {
-                        return Some(cfg);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn pci_root_bridge_pci_read32(
-    pci_root_bridge: *mut EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL,
-    bus: u8,
-    dev: u8,
-    func: u8,
-    offset: u8,
-) -> u32 {
-    let pci_access = unsafe { &(*pci_root_bridge).pci };
-    let mut val: u32 = 0;
-    let addr = ((bus as u64) << 24) | ((dev as u64) << 16) | ((func as u64) << 8) | (offset as u64);
-    unsafe {
-        let read_fn: unsafe extern "efiapi" fn(
-            *const EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_PCI,
-            u64,
-            u64,
-            u64,
-            *mut c_void,
-        ) -> EFI_STATUS = core::mem::transmute(pci_access.read);
-        let st = read_fn(pci_access as *const _, addr, 4, 1, &mut val as *mut _ as *mut c_void);
-        if st != EFI_SUCCESS { 0xFFFFFFFF } else { val }
-    }
-}
-
 fn e1000_init_and_dhcp(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, bar0: u64) -> Option<DhcpConfig> {
     w16(con_out, "e1000 init at BAR0=0x");
     put_dec(con_out, bar0);
     w16(con_out, "\r\n");
-    None
+
+    let e1000 = DirectMmioE1000::new(bar0);
+    if !e1000.init() {
+        w16(con_out, "e1000 init failed\r\n");
+        return None;
+    }
+
+    let mac = e1000.read_mac();
+    w16(con_out, "MAC: ");
+    for b in &mac {
+        put_dec(con_out, *b as u64);
+        w16(con_out, if *b as u64 == mac[5] as u64 { "" } else { ":" });
+    }
+    w16(con_out, "\r\n");
+
+    let config = e1000.dhcp_run()?;
+
+    let ip_bytes = config.yiaddr;
+    w16(con_out, "DHCP: IP=");
+    put_dec(con_out, ip_bytes[0] as u64);
+    w16(con_out, ".");
+    put_dec(con_out, ip_bytes[1] as u64);
+    w16(con_out, ".");
+    put_dec(con_out, ip_bytes[2] as u64);
+    w16(con_out, ".");
+    put_dec(con_out, ip_bytes[3] as u64);
+    w16(con_out, " Gateway=");
+    let gw_bytes = config.gateway;
+    put_dec(con_out, gw_bytes[0] as u64);
+    w16(con_out, ".");
+    put_dec(con_out, gw_bytes[1] as u64);
+    w16(con_out, ".");
+    put_dec(con_out, gw_bytes[2] as u64);
+    w16(con_out, ".");
+    put_dec(con_out, gw_bytes[3] as u64);
+    w16(con_out, "\r\n");
+
+    Some(config)
 }
 
 fn try_loaded_image_path(
@@ -947,7 +692,7 @@ fn try_loaded_image_path(
     }
     let loaded_image = unsafe { &*(loaded_image_ptr as *const EFI_LOADED_IMAGE_PROTOCOL) };
     let device_handle = loaded_image.device_handle;
-    let file_path = loaded_image.file_path;
+    let _file_path = loaded_image.file_path;
 
     w16(con_out, "Loaded Image: device_handle=");
     put_dec(con_out, device_handle as u64);
@@ -1020,6 +765,7 @@ fn try_loaded_image_path(
 None
 }
 
+#[cfg(target_arch = "x86_64")]
 fn pci_read_config32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let addr: u32 = 0x8000_0000
         | (bus as u32) << 16
@@ -1042,6 +788,13 @@ fn pci_read_config32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
         );
         val
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn pci_read_config32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
+    let ecam_base: u64 = 0x4010_0000_0000;
+    let addr = ecam_base | ((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12) | (offset as u64);
+    unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
 fn try_device_path(
@@ -1118,9 +871,7 @@ fn try_device_path(
         return None;
     }
 
-    // Use direct PCI config space access via I/O ports (x86 only)
-    // This bypasses the need for EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL
-    #[cfg(target_arch = "x86_64")]
+    // Use direct PCI config space access (via I/O ports on x86, ECAM on ARM64)
     {
         let vendor_dev = pci_read_config32(pci_bus, pci_dev, pci_func, 0x00);
         let vendor = vendor_dev as u16;
@@ -1141,11 +892,6 @@ fn try_device_path(
                 return e1000_init_and_dhcp(con_out, bar0);
             }
         }
-    }
-
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        w16(con_out, "Direct PCI config not supported on this arch\r\n");
     }
 
     None
@@ -1237,112 +983,7 @@ fn scan_pci_io_handle(
     e1000_init_and_dhcp(con_out, bar0)
 }
 
-#[repr(C, packed)]
-struct PciDevicePathNode {
-    header: EFI_DEVICE_PATH_PROTOCOL,
-    bus: u8,
-    device: u8,
-    function: u8,
-}
-
 // ─── SNP-based network scan (original) ───
-
-fn print_network_info(
-    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
-    gbs: *mut c_void,
-    image_handle: EFI_HANDLE,
-) {
-    let locate_handle_buffer: LocateHandleBufferFn = read_boot_svc_fn(gbs, BOOT_SVC_LOCATE_HANDLE_BUFFER);
-    let open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
-    let free_pool: FreePoolFn = read_boot_svc_fn(gbs, BOOT_SVC_FREE_POOL);
-
-    let mut handle_count: UINTN = 0;
-    let mut handle_buffer: *mut EFI_HANDLE = core::ptr::null_mut();
-    let status = unsafe {
-        locate_handle_buffer(
-            2,
-            &SNP_GUID as *const EFI_GUID,
-            core::ptr::null_mut(),
-            &mut handle_count,
-            &mut handle_buffer,
-        )
-    };
-
-    if status != EFI_SUCCESS || handle_count == 0 {
-        w16(con_out, "No network adapters found.\r\n");
-        return;
-    }
-
-    for i in 0..handle_count.min(1) {
-        let handle = unsafe { *handle_buffer.add(i as usize) };
-
-        let mut snp_ptr: *mut c_void = core::ptr::null_mut();
-        let st = unsafe {
-            open_protocol(
-                handle,
-                &SNP_GUID as *const EFI_GUID,
-                &mut snp_ptr,
-                image_handle,
-                core::ptr::null_mut(),
-                EFI_OPEN_PROTOCOL_GET_PROTOCOL,
-            )
-        };
-
-        if st != EFI_SUCCESS {
-            w16(con_out, "Cannot open SNP protocol.\r\n");
-            continue;
-        }
-
-        let snp = unsafe { &*(snp_ptr as *const EFI_SIMPLE_NETWORK_PROTOCOL) };
-
-        let rst = unsafe { (snp.start)(snp as *const _ as *mut _) };
-        if rst != EFI_SUCCESS && rst != EFI_ALREADY_STARTED && rst != (EFI_ALREADY_STARTED | (1 << 63)) {
-            continue;
-        }
-
-        let rst = unsafe { (snp.initialize)(snp as *const _ as *mut _, 0, 0) };
-        if rst != EFI_SUCCESS {
-        }
-
-        let mode = unsafe { &*snp.mode };
-        let hw_addr_size = mode.hw_address_size as usize;
-        if hw_addr_size < 6 { continue; }
-
-        let mac: [u8; 6] = [
-            mode.current_address.addr[0],
-            mode.current_address.addr[1],
-            mode.current_address.addr[2],
-            mode.current_address.addr[3],
-            mode.current_address.addr[4],
-            mode.current_address.addr[5],
-        ];
-
-        w16(con_out, "Network adapter:\r\n");
-        w16(con_out, "  MAC: ");
-        print_mac(con_out, &mac);
-        w16(con_out, "\r\n");
-
-        w16(con_out, "  DHCP: ");
-        match dhcp_run(con_out, snp, &mac) {
-            Some(cfg) => {
-                w16(con_out, "OK\r\n");
-                w16(con_out, "  IP: ");
-                print_ip(con_out, &cfg.yiaddr);
-                w16(con_out, "\r\n  Subnet: ");
-                print_ip(con_out, &cfg.subnet);
-                w16(con_out, "\r\n  Gateway: ");
-                if cfg.gateway == [0,0,0,0] { w16(con_out, "(none)"); }
-                else { print_ip(con_out, &cfg.gateway); }
-                w16(con_out, "\r\n");
-            }
-            None => {
-                w16(con_out, "FAILED\r\n");
-            }
-        }
-    }
-
-    unsafe { free_pool(handle_buffer as *mut c_void); }
-}
 
 fn dhcp_run(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
@@ -1530,6 +1171,35 @@ pub fn scan_network_devices(
 }
 
 #[cfg(test)]
+fn build_dhcp_response_frame(
+    mac: &[u8; 6],
+    xid: u32,
+    msg_type: u8,
+    yiaddr: [u8; 4],
+    subnet: Option<[u8; 4]>,
+    gateway: Option<[u8; 4]>,
+) -> [u8; 1514] {
+    let mut dhcp = make_dhcp_discover(xid, mac);
+    dhcp[16..20].copy_from_slice(&yiaddr);
+    dhcp[240] = 53; dhcp[241] = 1; dhcp[242] = msg_type;
+    let mut off = 243;
+    if let Some(s) = subnet {
+        dhcp[off] = 1; dhcp[off + 1] = 4;
+        dhcp[off + 2..off + 6].copy_from_slice(&s);
+        off += 6;
+    }
+    if let Some(g) = gateway {
+        dhcp[off] = 3; dhcp[off + 1] = 4;
+        dhcp[off + 2..off + 6].copy_from_slice(&g);
+        off += 6;
+    }
+    dhcp[off] = 255;
+    let mut frame = [0u8; 1514];
+    build_eth_ip_udp_dhcp(mac, &dhcp, 240, &mut frame);
+    frame
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1537,6 +1207,31 @@ mod tests {
     fn test_ip_checksum() {
         let buf = [0x45, 0x00, 0x00, 0x2E, 0x00, 0x00, 0x00, 0x00, 0x40, 0x11, 0x00, 0x00, 0xC0, 0xA8, 0x01, 0x01, 0xC0, 0xA8, 0x01, 0x02];
         assert_eq!(ip_checksum(&buf), 0x8ED7);
+    }
+
+    #[test]
+    fn test_ip_checksum_all_zeros() {
+        assert_eq!(ip_checksum(&[0u8; 20]), 0xFFFF);
+    }
+
+    #[test]
+    fn test_ip_checksum_all_ones() {
+        let ones = [0xFFu8; 20];
+        // (0xFFFF * 10) = 0x9FFF6, fold: 0xFFF6 + 9 = 0xFFFF, !0xFFFF = 0x0000
+        assert_eq!(ip_checksum(&ones), 0x0000);
+    }
+
+    #[test]
+    fn test_ip_checksum_odd_length() {
+        // Odd number of bytes - last byte occupies high byte of word
+        let buf = [0x12, 0x34, 0x56];
+        // (0x1234 + 0x5600) = 0x6834, !0x6834 = 0x97CB
+        assert_eq!(ip_checksum(&buf), 0x97CB);
+    }
+
+    #[test]
+    fn test_ip_checksum_single_byte() {
+        assert_eq!(ip_checksum(&[0xAB]), !(0xAB00u16));
     }
 
     #[test]
@@ -1555,6 +1250,18 @@ mod tests {
     }
 
     #[test]
+    fn test_make_dhcp_discover_padding() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let pkt = make_dhcp_discover(0x12345678, &mac);
+        // End marker at the option end
+        assert_eq!(pkt[245], 255);
+        // Padding after end marker should be zeros
+        for i in 246..300 {
+            assert_eq!(pkt[i], 0, "byte {} should be zero padding", i);
+        }
+    }
+
+    #[test]
     fn test_build_eth_ip_udp_dhcp() {
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
         let mut dhcp_payload = [0u8; 300];
@@ -1567,23 +1274,145 @@ mod tests {
         assert_eq!(buf[13], 0x00);
         assert_eq!(buf[14], 0x45);
         assert_eq!(len, 14 + 20 + 8 + 240);
+        // UDP checksum should be 0 (not used)
+        assert_eq!(buf[14 + 20 + 6], 0x00);
+        assert_eq!(buf[14 + 20 + 7], 0x00);
+    }
+
+    // ── parse_dhcp_response success cases ──
+
+    #[test]
+    fn test_parse_dhcp_response_offer() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2, /* OFFER */
+            [10, 0, 2, 15],
+            Some([255, 255, 255, 0]),
+            Some([10, 0, 2, 1]),
+        );
+        let cfg = parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).unwrap();
+        assert_eq!(cfg.yiaddr, [10, 0, 2, 15]);
+        assert_eq!(cfg.subnet, [255, 255, 255, 0]);
+        assert_eq!(cfg.gateway, [10, 0, 2, 1]);
     }
 
     #[test]
-    fn test_parse_dhcp_response() {
-        let mut buf = [0u8; 1514];
+    fn test_parse_dhcp_response_ack() {
         let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 5, /* ACK */
+            [192, 168, 1, 100],
+            Some([255, 255, 255, 0]),
+            Some([192, 168, 1, 1]),
+        );
+        let cfg = parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).unwrap();
+        assert_eq!(cfg.yiaddr, [192, 168, 1, 100]);
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_no_gateway() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2,
+            [10, 0, 2, 15],
+            Some([255, 255, 255, 0]),
+            None,
+        );
+        let cfg = parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).unwrap();
+        assert_eq!(cfg.gateway, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_no_subnet() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2,
+            [10, 0, 2, 15],
+            None,
+            None,
+        );
+        let cfg = parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).unwrap();
+        assert_eq!(cfg.subnet, [255, 255, 255, 255]);
+    }
+
+    // ── parse_dhcp_response error cases ──
+
+    #[test]
+    fn test_parse_dhcp_response_too_short() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        assert!(parse_dhcp_response(&[0u8; 200], 200, 0x12345678, &mac).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_wrong_ethertype() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let mut frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2,
+            [10, 0, 2, 15],
+            None, None,
+        );
+        frame[12] = 0x08; frame[13] = 0x06; // ARP instead of IP
+        assert!(parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_not_udp() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let mut frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2,
+            [10, 0, 2, 15],
+            None, None,
+        );
+        frame[14 + 9] = 6; // TCP instead of UDP
+        assert!(parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_bad_cookie() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let mut frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2,
+            [10, 0, 2, 15],
+            None, None,
+        );
+        let ip_off = 14;
+        let ip_hdr_len = (frame[ip_off] & 0x0F) as usize * 4;
+        let dhcp_off = ip_off + ip_hdr_len + 8;
+        frame[dhcp_off + 236] = 0x00; // corrupt magic cookie
+        assert!(parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_wrong_xid() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2,
+            [10, 0, 2, 15],
+            None, None,
+        );
+        assert!(parse_dhcp_response(&frame, frame.len(), 0xDEADBEEF, &mac).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_wrong_mac() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let other_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let frame = build_dhcp_response_frame(
+            &mac, 0x12345678, 2,
+            [10, 0, 2, 15],
+            None, None,
+        );
+        assert!(parse_dhcp_response(&frame, frame.len(), 0x12345678, &other_mac).is_none());
+    }
+
+    #[test]
+    fn test_parse_dhcp_response_no_dhcp_msg_type() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        // Frame with only end marker (255) at option start — no DHCP message type
         let mut dhcp = make_dhcp_discover(0x12345678, &mac);
-        dhcp[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
-        dhcp[240] = 53; dhcp[241] = 1; dhcp[242] = 2;
-        dhcp[243] = 1; dhcp[244] = 4; dhcp[245] = 255; dhcp[246] = 255; dhcp[247] = 255; dhcp[248] = 0;
-        dhcp[249] = 3; dhcp[250] = 4; dhcp[251] = 192; dhcp[252] = 168; dhcp[253] = 1; dhcp[254] = 1;
-        dhcp[255] = 255;
+        dhcp[240] = 255; // End marker immediately after cookie
         let mut frame = [0u8; 1514];
         build_eth_ip_udp_dhcp(&mac, &dhcp, 240, &mut frame);
-        let cfg = parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).unwrap();
-        assert_eq!(cfg.yiaddr, [192, 168, 1, 2]);
-        assert_eq!(cfg.subnet, [255, 255, 255, 0]);
-        assert_eq!(cfg.gateway, [192, 168, 1, 1]);
+        assert!(parse_dhcp_response(&frame, frame.len(), 0x12345678, &mac).is_none());
     }
 }

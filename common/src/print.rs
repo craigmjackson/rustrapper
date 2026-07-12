@@ -180,4 +180,46 @@ mod tests {
     fn hex_zero_nibble_all() {
         test_format_hex(0, 1, "0");
     }
+
+    #[test]
+    fn hex_zero_with_nibbles_8() {
+        test_format_hex(0, 8, "0");
+    }
+
+    #[test]
+    fn hex_full_64bit_zero() {
+        test_format_hex(0, 16, "0");
+    }
+
+    #[test]
+    fn hex_truncated_by_nibbles() {
+        // Only bottom 4 nibbles shown
+        test_format_hex(0x1ABCD, 4, "ABCD");
+    }
+
+    #[test]
+    fn hex_large_64bit() {
+        test_format_hex(0xFEDCBA9876543210, 16, "FEDCBA9876543210");
+    }
+
+    #[test]
+    fn dec_power_of_two() {
+        let mut buf = [0u8; 20];
+        let s = format_dec(1 << 20, &mut buf);
+        assert_eq!(s, "1048576");
+    }
+
+    #[test]
+    fn dec_ten() {
+        let mut buf = [0u8; 20];
+        let s = format_dec(10, &mut buf);
+        assert_eq!(s, "10");
+    }
+
+    #[test]
+    fn dec_hundred() {
+        let mut buf = [0u8; 20];
+        let s = format_dec(100, &mut buf);
+        assert_eq!(s, "100");
+    }
 }

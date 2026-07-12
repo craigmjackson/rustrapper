@@ -7,3 +7,9 @@ members = [
     "disk-image",
     "romwrap",
 ]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

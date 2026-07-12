@@ -421,4 +421,102 @@ mod tests {
                 || BLOCK_IO_GUID.data3 != DEVICE_PATH_GUID.data3
         );
     }
+
+    #[test]
+    fn test_pci_io_guid_value() {
+        assert_eq!(PCI_IO_GUID.data1, 0x4CF5B200);
+        assert_eq!(PCI_IO_GUID.data2, 0x68B8);
+        assert_eq!(PCI_IO_GUID.data3, 0x4CA5);
+        assert_eq!(PCI_IO_GUID.data4, [0x9E, 0xEC, 0xB2, 0x3E, 0x3F, 0x50, 0x02, 0x9A]);
+    }
+
+    #[test]
+    fn test_loaded_image_guid_value() {
+        assert_eq!(LOADED_IMAGE_GUID.data1, 0x5B1B31A1);
+        assert_eq!(LOADED_IMAGE_GUID.data2, 0x9562);
+        assert_eq!(LOADED_IMAGE_GUID.data3, 0x11D2);
+        assert_eq!(LOADED_IMAGE_GUID.data4, [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B]);
+    }
+
+    #[test]
+    fn test_pci_root_bridge_io_guid_value() {
+        assert_eq!(PCI_ROOT_BRIDGE_IO_GUID.data1, 0x2F707EBB);
+        assert_eq!(PCI_ROOT_BRIDGE_IO_GUID.data2, 0x4A1A);
+        assert_eq!(PCI_ROOT_BRIDGE_IO_GUID.data3, 0x11D4);
+        assert_eq!(PCI_ROOT_BRIDGE_IO_GUID.data4, [0x9A, 0x38, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D]);
+    }
+
+    #[test]
+    fn test_pci_io_protocol_width_values() {
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::Uint8 as u8, 0);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::Uint16 as u8, 1);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::Uint32 as u8, 2);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::Uint64 as u8, 3);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FifoUint8 as u8, 4);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FifoUint16 as u8, 5);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FifoUint32 as u8, 6);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FifoUint64 as u8, 7);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FillUint8 as u8, 8);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FillUint16 as u8, 9);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FillUint32 as u8, 10);
+        assert_eq!(EFI_PCI_IO_PROTOCOL_WIDTH::FillUint64 as u8, 11);
+    }
+
+    #[test]
+    fn test_pci_io_protocol_size() {
+        assert_eq!(mem::size_of::<EFI_PCI_IO_PROTOCOL>(), 160);
+    }
+
+    #[test]
+    fn test_pci_io_protocol_access_size() {
+        assert_eq!(mem::size_of::<EFI_PCI_IO_PROTOCOL_ACCESS>(), 16);
+    }
+
+    #[test]
+    fn test_pci_io_protocol_pci_size() {
+        assert_eq!(mem::size_of::<EFI_PCI_IO_PROTOCOL_PCI>(), 16);
+    }
+
+    #[test]
+    fn test_loaded_image_protocol_size() {
+        assert_eq!(mem::size_of::<EFI_LOADED_IMAGE_PROTOCOL>(), 96);
+    }
+
+    #[test]
+    fn test_simple_network_protocol_size() {
+        assert_eq!(mem::size_of::<EFI_SIMPLE_NETWORK_PROTOCOL>(), 128);
+    }
+
+    #[test]
+    fn test_open_protocol_constants() {
+        assert_eq!(EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL, 0x00000001);
+        assert_eq!(EFI_OPEN_PROTOCOL_GET_PROTOCOL, 0x00000002);
+        assert_eq!(EFI_OPEN_PROTOCOL_BY_DRIVER, 0x00000004);
+        assert_eq!(EFI_OPEN_PROTOCOL_EXCLUSIVE, 0x00000008);
+    }
+
+    #[test]
+    fn test_efi_status_constants() {
+        assert_eq!(EFI_NOT_STARTED, 19);
+        assert_eq!(EFI_ALREADY_STARTED, 20);
+    }
+
+    #[test]
+    fn test_boot_svc_offsets_consistent() {
+        // These offsets must be unique and in increasing order
+        let offs = [0x48usize, 0x118, 0x138];
+        let mut sorted = offs;
+        sorted.sort();
+        assert_eq!(offs, sorted);
+        for i in 0..offs.len() {
+            for j in (i + 1)..offs.len() {
+                assert_ne!(offs[i], offs[j], "offset {} duplicated", offs[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_pci_root_bridge_io_size() {
+        assert_eq!(mem::size_of::<EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL>(), 152);
+    }
 }

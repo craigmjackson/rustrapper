@@ -7,3 +7,4 @@ test.img
 *.obj
 *.elf
 *.bin
+serial.log

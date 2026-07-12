@@ -5,9 +5,3 @@ edition = "2021"
 
 [dependencies]
 common = { path = "../common" }
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
