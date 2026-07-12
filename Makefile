@@ -165,9 +165,7 @@ run-i386-bios: $(BIN)/bios.img
 	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw -nic user,model=e1000 -nographic
 
 run-i386-bios-rust: $(BIN)/bios-rust.img
-	@echo "Note: VGA text-mode output is rendered via curses. Press Ctrl-A X to exit."
-	qemu-system-x86_64 -drive file=$(BIN)/bios-rust.img,format=raw -nic user,model=e1000 \
-		-display curses
+	qemu-system-x86_64 -drive file=$(BIN)/bios-rust.img,format=raw -nic user,model=e1000 -nographic
 
 # BIOS PXE test with custom iPXE ROM (requires custom SeaBIOS built by the
 # 'x86_64-seabios' target to keep the PXE/UNDI INT 1Ah handler resident).
