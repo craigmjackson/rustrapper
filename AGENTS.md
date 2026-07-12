@@ -118,7 +118,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 - All RX descriptors point at a single shared `RX_BUF` (2048 bytes); fine for the single in-flight DHCP transaction this driver performs, but would corrupt data under concurrent multi-packet traffic.
 - DHCP RX polling must be RAM-only status checks (`RX_DESCS.0[idx].status & RX_STATUS_DD`), not MMIO register polling (`reg_read32(base, REG_RDH)`) in a tight loop — repeated MMIO reads under QEMU TCG are drastically slower than cached RAM reads and can make a poll loop take far longer than intended for the same iteration count.
 - The RX poll loop needs roughly 100 million iterations (~1 second of wall time) for QEMU's slirp (`-nic user`) DHCP server to respond; smaller counts (e.g. 2 million, ~0.1s) reliably miss the OFFER even though the packet is delivered on the wire (verified with `-object filter-dump,netdev=net0,file=...` producing a valid pcap showing both DISCOVER and OFFER).
-- Uses `-nic user,model=e1000` in `run-bare-arm64` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
+- Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
 
 ### `arm64-bare/src/pci.rs` — PCI/AHCI probe
 
@@ -135,7 +135,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 ### `bios/stage2.c` — BIOS stage-2 menu and scan
 
-- Presents `[1]/[2]` menu and reads the choice from the serial port (COM1, 0x3F8), because the BIOS stage-2 uses serial output. This matches the `-serial stdio` setup used by `run-bios` and `run-bios-pxe`.
+- Presents `[1]/[2]` menu and reads the choice from the serial port (COM1, 0x3F8), because the BIOS stage-2 uses serial output. This matches the `-serial stdio` setup used by `run-i386-bios` and `run-i386-bios-ipxe`.
 - Dispatches to `scan_devices()` (INT 13h) or `pxe_scan()` (e1000 direct I/O BAR + PXE/UNDI fallback).
 
 ### `common/src/print.rs` — Shared formatting
@@ -171,10 +171,10 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 ### `Makefile` — Build orchestration
 
-- Top-level targets: `all`, `bios`, `uefi`, `arm64`, `bare-arm64`, `combined`, `romwrap-uefi`, `run-*`, `clean`.
+- Top-level targets: `all`, `i386-bios`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `i386-bios-x86_64-uefi`, `x86_64-uefi-rom`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
-- mtools (`mmd`, `mcopy`) and `mkfs.fat` must be on `$PATH` for `make combined`.
+- mtools (`mmd`, `mcopy`) and `mkfs.fat` must be on `$PATH` for `make i386-bios-x86_64-uefi`.
 
 ## Key Gotchas
 
@@ -236,11 +236,11 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 38. **Single-transmit DHCP for BIOS**: Same pattern as ARM64 UEFI — send one DISCOVER via UDP_TRANSMIT, poll UDP_RECEIVE up to 100k iterations, accept OFFER as final. No REQUEST/ACK.
 
-39. **Custom SeaBIOS for PXE testing**: The `run-bios-pxe` target builds a custom SeaBIOS (`make seabios`, cloned from GitHub) and uses it via `-bios`. This ensures the PXE/UNDI INT 1Ah handler stays resident after boot (the default SeaBIOS that ships with QEMU tears down the PXE stack after it boots from a non-PXE device). The build uses `git clone --depth=1` into `build/seabios` and runs `make defconfig` to produce a QEMU-optimized `bios.bin`. On real hardware workstations, the PXE stack remains resident in UMA regardless of boot source and no custom SeaBIOS is needed.
+39. **Custom SeaBIOS for PXE testing**: The `run-i386-bios-ipxe` target builds a custom SeaBIOS (`make x86_64-seabios`, cloned from GitHub) and uses it via `-bios`. This ensures the PXE/UNDI INT 1Ah handler stays resident after boot (the default SeaBIOS that ships with QEMU tears down the PXE stack after it boots from a non-PXE device). The build uses `git clone --depth=1` into `build/seabios` and runs `make defconfig` to produce a QEMU-optimized `bios.bin`. On real hardware workstations, the PXE stack remains resident in UMA regardless of boot source and no custom SeaBIOS is needed.
 
-40. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in `pxe.c` (which uses the PCI I/O BAR for register access) can NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-uefi` (UEFI path works in QEMU) or `make run-bios-pxe` (BIOS PXE with custom SeaBIOS) or `make run-bios-rom-pxe` (BIOS option ROM with PXE fallback via second NIC).
+40. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in `pxe.c` (which uses the PCI I/O BAR for register access) can NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-x86_64-uefi` (UEFI path works in QEMU) or `make run-i386-bios-ipxe` (BIOS PXE with custom SeaBIOS) or `make run-i386-bios-rom-pxe` (BIOS option ROM with PXE fallback via second NIC).
 41. **UEFI keyboard input is non-blocking**: `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` returns `EFI_NOT_READY` when no key is pressed. The menu polls it in a tight loop until a valid choice is received. Store the system table pointer globally so the polling function can reach `con_in` without threading it through every helper.
-42. **BIOS menu reads from serial port**: The BIOS stage-2 uses serial output, so the menu reads from COM1 (0x3F8) rather than the keyboard. This matches the `-serial stdio` setup used by `run-bios` and `run-bios-pxe`. Real hardware with a serial console will work the same way; a VGA+keyboard setup would require a keyboard input path instead.
+42. **BIOS menu reads from serial port**: The BIOS stage-2 uses serial output, so the menu reads from COM1 (0x3F8) rather than the keyboard. This matches the `-serial stdio` setup used by `run-i386-bios` and `run-i386-bios-ipxe`. Real hardware with a serial console will work the same way; a VGA+keyboard setup would require a keyboard input path instead.
 
 ### UEFI Option ROM & Direct e1000 (added during option ROM work)
 
@@ -254,7 +254,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 47. **`scan_e1000_devices` fallback chain**: 4 tiers, each tried in order until one succeeds: (1) DevicePath on image handle — fails for option ROM (DP not installed), (2) PCI IO protocol handles — `OpenProtocol` works but `PciRead`/`GetLocation` return `EFI_UNSUPPORTED`, (3) Loaded Image protocol — device handle lacks PCI IO, (4) Direct PCI scan via I/O ports + raw MMIO e1000 — works in all phases.
 
-48. **Option ROM runs `efi_main` twice with `run-rom-uefi`**: The custom option ROM is executed once during DXE (driver entry) and again from the disk (BDS menu). With tier 4 fallback, the DXE instance now succeeds too. The x86_64 non-ROM path (`run-uefi`) only runs from the disk and has full SNP support.
+48. **Option ROM runs `efi_main` twice with `run-x86_64-uefi-rom`**: The custom option ROM is executed once during DXE (driver entry) and again from the disk (BDS menu). With tier 4 fallback, the DXE instance now succeeds too. The x86_64 non-ROM path (`run-x86_64-uefi`) only runs from the disk and has full SNP support.
 
 49. **QEMU e1000 MMIO BAR0 is valid during DXE**: Even though option ROM runs early, QEMU's firmware assigns PCI resources before dispatching option ROMs. BAR0 reads back a valid MMIO address (e.g. `0x80F80000`). On real hardware this is also true — the BIOS/firmware configures PCI devices before option ROM entry.
 
@@ -264,24 +264,24 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 ```bash
 make all                         # Build everything
-make bios                        # Build MBR + stage2 (C/NASM)
-make uefi                        # Build Rust UEFI binary (x86_64 + ARM64)
-make arm64                       # Alias for uefi (ARM64 UEFI)
-make bare-arm64                  # Build Rust ARM64 bare-metal
-make combined                    # Build disk image (requires mtools)
-make seabios                     # Build custom SeaBIOS (auto-cloned from GitHub)
-make run-bios                    # BIOS mode via SeaBIOS (serial output; e1000 I/O not avail)
-make run-bios-pxe                # BIOS PXE with custom iPXE ROM + custom SeaBIOS
-make romwrap-uefi                # Build UEFI PCI expansion ROM from rustrapper.efi
-make romwrap-bios                # Build BIOS PCI expansion ROM from stage2.bin
-make run-uefi                    # x86_64 UEFI from combined disk image
-make run-rom-uefi                # x86_64 UEFI with custom PCI expansion ROM + combined disk
-make run-bios-rom                # Legacy BIOS with custom PCI expansion ROM (SeaBIOS)
-make run-bios-rom-pxe            # Legacy BIOS option ROM + PXE (second NIC with iPXE ROM)
-make run-uefi-arm64              # ARM64 UEFI from FAT directory
-make run-bare-arm64              # ARM64 bare-metal + AHCI drive
+make i386-bios                   # Build MBR + stage2 (C/NASM)
+make x86_64-uefi                 # Build x86_64 UEFI binary
+make aarch64-uefi                # Build ARM64 UEFI binary
+make aarch64-bare                # Build Rust ARM64 bare-metal
+make i386-bios-x86_64-uefi       # Build combined disk image (requires mtools)
+make x86_64-uefi-rom             # Build UEFI PCI expansion ROM from rustrapper.efi
+make i386-bios-rom               # Build BIOS PCI expansion ROM from stage2.bin
+make x86_64-seabios              # Build custom SeaBIOS (auto-cloned from GitHub)
+make run-i386-bios               # BIOS mode via SeaBIOS (serial output; e1000 I/O not avail)
+make run-i386-bios-ipxe          # BIOS PXE with custom iPXE ROM + custom SeaBIOS
+make run-i386-bios-rom           # Legacy BIOS with custom PCI expansion ROM (SeaBIOS)
+make run-i386-bios-rom-pxe       # Legacy BIOS option ROM + PXE (second NIC with iPXE ROM)
+make run-x86_64-uefi             # x86_64 UEFI from combined disk image
+make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM + combined disk
+make run-aarch64-uefi            # ARM64 UEFI from FAT directory
+make run-aarch64-bare            # ARM64 bare-metal + AHCI drive
 make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
-make seabios-clean               # Remove SeaBIOS checkout
+make x86_64-seabios-clean        # Remove SeaBIOS checkout
 ```
 
 ## Targets

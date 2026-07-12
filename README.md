@@ -32,35 +32,35 @@ rustup target add x86_64-unknown-uefi aarch64-unknown-uefi aarch64-unknown-none
 # Fedora: dnf install nasm gcc mtools dosfstools qemu-system-x86 qemu-system-arm
 
 make all                          # Build everything
-make run-uefi                     # x86_64 UEFI in QEMU (e1000 NIC, full DHCP)
-make run-rom-uefi                 # x86_64 UEFI with custom option ROM + DHCP
+make run-x86_64-uefi              # x86_64 UEFI in QEMU (e1000 NIC, full DHCP)
+make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
 ```
 
 ## Build Targets
 
 | Target | Binary | Description |
 |--------|--------|-------------|
-| `make bios` | `bin/bios.bin`, `bin/stage2.bin` | 16‑bit BIOS MBR + stage2 |
-| `make uefi` | `bin/rustrapper.efi` | x86_64 UEFI application |
-| `make arm64` | `bin/rustrapper_arm64.efi` | ARM64 UEFI application |
-| `make bare-arm64` | `bin/rustrapper_arm64_bare.elf` | ARM64 bare‑metal |
-| `make combined` | `bin/bootloader.combined` | Hybrid disk image (64 MB) |
-| `make romwrap-uefi` | `bin/rustrapper_efi.rom` | PCI expansion ROM (UEFI option ROM) |
-| `make romwrap-bios` | `bin/rustrapper_bios.rom` | PCI expansion ROM (BIOS option ROM) |
-| `make seabios` | `build/seabios/out/bios.bin` | Custom SeaBIOS (auto-cloned) |
-| `make seabios-clean` | — | Remove SeaBIOS checkout |
+| `make i386-bios` | `bin/bios.bin`, `bin/stage2.bin` | 16‑bit BIOS MBR + stage2 |
+| `make x86_64-uefi` | `bin/rustrapper.efi` | x86_64 UEFI application |
+| `make aarch64-uefi` | `bin/rustrapper_arm64.efi` | ARM64 UEFI application |
+| `make aarch64-bare` | `bin/rustrapper_arm64_bare.elf` | ARM64 bare‑metal |
+| `make i386-bios-x86_64-uefi` | `bin/bootloader.combined` | Hybrid disk image (64 MB) |
+| `make x86_64-uefi-rom` | `bin/rustrapper_efi.rom` | PCI expansion ROM (UEFI option ROM) |
+| `make i386-bios-rom` | `bin/rustrapper_bios.rom` | PCI expansion ROM (BIOS option ROM) |
+| `make x86_64-seabios` | `build/seabios/out/bios.bin` | Custom SeaBIOS (auto-cloned) |
+| `make x86_64-seabios-clean` | — | Remove SeaBIOS checkout |
 
 ## Run in QEMU
 
 ```bash
-make run-bios                    # Legacy BIOS boot (no PXE, e1000 I/O stub)
-make run-bios-pxe                # Legacy BIOS + PXE (custom SeaBIOS + iPXE ROM)
-make run-uefi                    # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP)
-make run-rom-uefi                # x86_64 UEFI with custom option ROM (direct e1000 MMIO)
-make run-bios-rom                # Legacy BIOS with custom option ROM (SeaBIOS)
-make run-bios-rom-pxe            # Legacy BIOS option ROM with PXE fallback (second NIC)
-make run-uefi-arm64              # ARM64 UEFI (virtio-net-pci NIC, DHCP OFFER)
-make run-bare-arm64              # ARM64 bare‑metal with AHCI drive
+make run-i386-bios                # Legacy BIOS boot (no PXE, e1000 I/O stub)
+make run-i386-bios-ipxe           # Legacy BIOS + PXE (custom SeaBIOS + iPXE ROM)
+make run-x86_64-uefi              # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP)
+make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM (direct e1000 MMIO)
+make run-i386-bios-rom            # Legacy BIOS with custom option ROM (SeaBIOS)
+make run-i386-bios-rom-pxe        # Legacy BIOS option ROM with PXE fallback (second NIC)
+make run-aarch64-uefi             # ARM64 UEFI (virtio-net-pci NIC, DHCP OFFER)
+make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 ```
 
 ## Network Support
