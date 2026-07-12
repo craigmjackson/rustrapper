@@ -5,6 +5,7 @@ members = [
     "uefi",
     "arm64-bare",
     "romwrap",
+    "bios-rust",
 ]
 
 [profile.dev]

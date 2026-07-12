@@ -20,7 +20,7 @@ BARE_ARM64_TARGET := aarch64-unknown-none
 .PHONY: all i386-bios x86_64-uefi aarch64-uefi aarch64-bare x86_64-seabios \
         run-i386-bios run-x86_64-uefi run-aarch64-uefi run-aarch64-bare clean \
         x86_64-uefi-rom i386-bios-rom run-x86_64-uefi-rom run-i386-bios-rom run-i386-bios-rom-pxe \
-        run-i386-bios-ipxe x86_64-seabios-clean
+        run-i386-bios-ipxe x86_64-seabios-clean i386-bios-rust run-i386-bios-rust
 
 all: i386-bios x86_64-uefi aarch64-uefi aarch64-bare
 
@@ -28,7 +28,29 @@ all: i386-bios x86_64-uefi aarch64-uefi aarch64-bare
 $(BIN):
 	mkdir -p $(BIN)
 
+# ── BIOS Rust payload (32-bit protected mode, loaded at 1 MB) ────
+# Requires nightly for -Zjson-target-spec and -Zbuild-std=core
+BIOS_RUST_TARGET := $(CURDIR)/targets/i386-unknown-none.json
+CARGO_NIGHTLY    := cargo +nightly
+
+$(BIN)/rust_payload.bin: $(shell find bios-rust common -name '*.rs') \
+                         bios-rust/link.ld Cargo.toml $(BIOS_RUST_TARGET) | $(BIN)
+	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-arg=-T$(CURDIR)/bios-rust/link.ld -C link-arg=-N" \
+		$(CARGO_NIGHTLY) build -Zjson-target-spec -Zbuild-std=core \
+		--target $(BIOS_RUST_TARGET) --package bios-rust --release
+	objcopy -O binary target/i386-unknown-none/release/bios-rust $@
+
+# Combined stage2 = entry stub + Rust payload (assembled by NASM, which
+# incbins the payload so it can compute copy offsets at assembly time)
+$(BIN)/stage2_entry.bin: $(BIN)/rust_payload.bin | $(BIN)
+	cd $(BIOS_SRC) && $(NASM) -f bin -o ../$@ stage2_entry.nasm
+
+# Experimental: build the Rust-based BIOS stage2 instead of the C one
+i386-bios-rust: $(BIN)/bios.bin $(BIN)/stage2_entry.bin
+
 # ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
+# NOTE: when switching to the Rust payload, update the sector count
+# in mbr.asm (line 69: `dw 14`) to cover the full stage2_entry.bin.
 $(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN)
 	$(NASM) -f bin -o $@ $<
 
@@ -113,6 +135,12 @@ $(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2.bin | $(BIN)
 	dd if=$(BIN)/bios.bin of=$@ conv=notrunc 2>/dev/null
 	dd if=$(BIN)/stage2.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
 
+# BIOS disk image with Rust stage2 payload
+$(BIN)/bios-rust.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
+	dd if=/dev/zero bs=1M count=64 of=$@ 2>/dev/null
+	dd if=$(BIN)/bios.bin of=$@ conv=notrunc 2>/dev/null
+	dd if=$(BIN)/stage2_entry.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
+
 # ── SeaBIOS (custom build with PXE stack kept) ──────────────────
 SEABIOS_DIR := build/seabios
 SEABIOS_BIN := $(SEABIOS_DIR)/out/bios.bin
@@ -135,6 +163,11 @@ run-i386-bios: $(BIN)/bios.img
 	@echo "Note: BIOS e1000 driver requires real hardware (QEMU I/O BAR is a stub)."
 	@echo "      Use run-x86_64-uefi for QEMU testing, or run-i386-bios-ipxe with custom SeaBIOS."
 	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw -nic user,model=e1000 -nographic
+
+run-i386-bios-rust: $(BIN)/bios-rust.img
+	@echo "Note: VGA text-mode output is rendered via curses. Press Ctrl-A X to exit."
+	qemu-system-x86_64 -drive file=$(BIN)/bios-rust.img,format=raw -nic user,model=e1000 \
+		-display curses
 
 # BIOS PXE test with custom iPXE ROM (requires custom SeaBIOS built by the
 # 'x86_64-seabios' target to keep the PXE/UNDI INT 1Ah handler resident).

@@ -7,4 +7,5 @@ test.img
 *.obj
 *.elf
 *.bin
-serial.log
+*.log
+NvVars

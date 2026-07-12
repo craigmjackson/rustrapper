@@ -8,15 +8,21 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ```
 .
-├── Cargo.toml              # Workspace root (5 member crates)
+├── Cargo.toml              # Workspace root (6 member crates)
 ├── Makefile                # Build orchestration (make all, make run-*)
 ├── AGENTS.md               # This file
 ├── bios/                   # Retained C/NASM sources
 │   ├── mbr.asm             # 16-bit MBR stage-1
 │   ├── stage2.c            # 16-bit stage-2 scanner
+│   ├── stage2_entry.nasm   # Entry stub for Rust stage2 (A20, protected mode, copy to 1 MB)
 │   ├── div64.c             # 64-bit division helpers for -m16
 │   ├── print.c / print.h   # Shared formatting (putc callback, hex, dec)
 │   └── scan.c / scan.h     # Shared scan loop (calls arch detect_device)
+├── bios-rust/              # Rust 32-bit BIOS stage2 (experimental, nightly)
+│   ├── Cargo.toml
+│   ├── link.ld             # Link at 0x100000
+│   └── src/
+│       └── main.rs         # _start entry, VGA text-mode driver
 ├── common/                 # Rust no_std library
 │   ├── Cargo.toml
 │   └── src/
@@ -126,6 +132,70 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - Presents `[1]/[2]` menu and reads the choice from the serial port (COM1, 0x3F8), because the BIOS stage-2 uses serial output. This matches the `-serial stdio` setup used by `run-i386-bios` and `run-i386-bios-ipxe`.
 - Dispatches to `scan_devices()` (INT 13h) or `pxe_scan()` (e1000 direct I/O BAR + PXE/UNDI fallback).
 
+### `bios/stage2_entry.nasm` — BIOS entry stub for Rust stage2
+
+- Loaded by MBR at physical `0x1000` (part of the 16-sector load). First 512 bytes are the stub itself; the Rust payload (`incbin`'d) follows at offset 512.
+- Enables A20 gate (fast method via port `0x92`).
+- Loads a minimal GDT (32-bit code/data segments, flat at 0-4G).
+- Enters protected mode via `mov cr0, eax; jmp 0x08:pmode_start`.
+- Copies Rust payload from `0x1200` → `0x100000` using `rep movsb`.
+- Zeros 0x2000 bytes of BSS immediately after the payload with `rep stosb`.
+- **Stack must NOT be in BIOS ROM area** (`0xF0000`–`0xFFFFF`). The BIOS ROM is read-only; pushes silently drop, corrupting return addresses, causing triple faults. Stack is at `0x00070000` (low RAM, well below BIOS area).
+- **`cli` before calling Rust**: no IDT is set up in protected mode. A hardware timer interrupt with no IDT causes a triple fault. `cli` disables interrupts for the duration of the Rust code.
+- Pushes `boot_drive` on the stack, calls `_start(0x100000)` via `call eax`.
+- Total size = 512 B stub + Rust payload (currently ~7.4 KB = ~15 sectors total, under 16-sector limit).
+
+### `bios-rust/src/main.rs` — Rust BIOS stage2 entry
+
+- `#![no_std]`, `#![no_main]`, `extern "C" fn _start(boot_drive: u32) -> !` as entry point.
+- **Dual output**: VGA text-mode driver (`vga.rs`) writing directly to `0xB8000` via `write_volatile` (COL/ROW statics in BSS), and serial output (`serial.rs`) via COM1 (`0x3F8`) using inline `asm!` for `in al, dx` / `out dx, al`.
+- Both VGA and serial `putc` auto-translate `\n` → `\r\n` (matching `arm64-bare/src/uart.rs`).
+- Serial `putc` polls LSR (0x3FD) bit 5 (THRE) before writing; `flush` waits for TEMT (bit 6); `getc` polls LSR bit 0 (Data Ready) for non-blocking input.
+- Uses `common::print::init(dual_putc)` to wire the global print callback, then `common::menu::show_menu` for the `[1]/[2]` menu, and `common::scan::scan_devices` for storage scan — same pattern as `arm64-bare/src/main.rs`.
+- Presents the `[1]/[2]` menu via `common::menu::show_menu`, reading from the PS/2 keyboard (`kbd::getc`), and dispatches to `scan::scan_devices(pci::detect_device)` or `net::scan_network()`.
+- `#[cfg(not(test))]` guards on `_start` and `#[panic_handler]` so the crate can be compiled in the host test harness.
+- Custom `link.ld` links at `0x100000` (where the entry stub copies the payload).
+
+### `bios-rust/src/pci.rs` — BIOS Rust PCI scan (x86 I/O ports)
+
+- PCI config space via x86 I/O ports `0xCF8`/`0xCFC` (NOT ECAM like `arm64-bare/src/pci.rs`).
+- `pci_read32`/`pci_write32` use `out dx, eax` / `in eax, dx` inline `asm!` with the 32-bit address format `0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC)`.
+- `pci_enable_bars` always enables I/O + Memory + Bus Master (command bits 0-2). Does NOT re-assign BARs if firmware already assigned them (checks if BAR0 is non-zero). BAR sizing only runs for unassigned BARs, allocating from `MMIO_NEXT` starting at `0x1000_0000`.
+- `detect_device` callback for `common::scan::scan_devices` — walks PCI bus 0 for mass-storage class (0x01) devices, enables BARs, probes AHCI for SATA controllers.
+- `storage_name` maps subclass codes to names (same as `arm64-bare/src/pci.rs`).
+- `pci_print_all` prints all PCI devices with vendor/device IDs and class descriptions.
+
+### `bios-rust/src/net.rs` — BIOS Rust e1000 NIC + DHCP
+
+- Direct MMIO driver for the Intel 82540EM (`e1000`) emulated NIC — same logic as `arm64-bare/src/net.rs` but using `u32` addresses instead of `u64` (32-bit target).
+- Uses `core::ptr::read_volatile`/`write_volatile` with `&raw const`/`&raw mut` for packed struct descriptor field access (avoiding "reference to field of packed struct is unaligned" errors).
+- `e1000_init` resets NIC, reads MAC, sets up RX/TX descriptor rings, enables RCTL/TCTL. Explicitly writes `REG_RDBAH`/`REG_TDBAH` to 0 (high 32 bits of ring base address).
+- `e1000_send` copies frame to TX_BUF, fills TX descriptor with EOP|IFCS|RS, rings TDT, polls status DD bit via `read_volatile`.
+- `dhcp_run` sends a single DHCPDISCOVER and polls for OFFER (100M iterations, ~1 second).
+- `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, inits e1000, runs DHCP, prints IP/subnet/gateway.
+
+### `bios-rust/src/serial.rs` — BIOS Rust serial driver
+
+- `putc` auto-translates `\n` → `\r\n` (writes `\r` first).
+- Polls LSR (0x3FD) bit 5 (THRE) before writing to 0x3F8.
+- `getc` polls LSR bit 0 (Data Ready), reads from 0x3F8 if ready, returns `Option<u8>`.
+- `flush` waits for TEMT (LSR bit 6).
+- Uses separate `asm!` blocks for reads and writes; poll block must NOT use `options(pure)`.
+
+### `bios-rust/src/vga.rs` — BIOS Rust VGA text-mode driver
+
+- Writes directly to `0xB8000` (VGA text buffer) via `write_volatile`.
+- COL/ROW statics in BSS track cursor position.
+- `putc` auto-translates `\n` → `\r\n` (writes `\r` first, then the char).
+- 80x25 text mode, attribute byte `0x07` (white on black).
+
+### `bios-rust/src/kbd.rs` — BIOS Rust PS/2 keyboard driver
+
+- Reads Set 1 scancodes from the PS/2 keyboard controller (port `0x60` data, `0x64` status).
+- `getc` polls status bit 0 (output buffer full), reads scancode from port 0x60, ignores break codes (bit 7 set), translates scancode to ASCII via `SET1_MAP` table.
+- Enter (0x1C) → `\n`, Backspace (0x0E) → `0x08`, all other printable keys from the scancode table.
+- Used as the `get_key` callback for `common::menu::show_menu`. Required because `-display curses` sends keyboard input to the PS/2 controller, not to the serial port.
+
 ### `common/src/print.rs` — Shared formatting
 
 - Callback-based: `print_init(putc_fn)` sets the output function.
@@ -155,6 +225,8 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - Top-level targets: `all`, `i386-bios`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
+- `i386-bios-rust` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
+- `run-i386-bios-rust` uses `-display curses` because the Rust stage2 writes to VGA text mode (no serial).
 
 ## Key Gotchas
 
@@ -168,6 +240,16 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 6. **`panic = "abort"`**: UEFI and bare-metal targets must set `panic = "abort"` in `[profile.*]`. Define profiles in the workspace root `Cargo.toml` (not per-crate) to avoid "profiles for the non root package will be ignored" warnings.
 7. **`aarch64-unknown-none` requires `global_asm!` entry**: There's no CRT; use `core::arch::global_asm!` to define the `_start` symbol that sets SP and clears BSS before calling Rust code.
 8. **Enable `CPACR_EL1` FP/SIMD access before any Rust code runs on `aarch64-unknown-none`**: rustc's `memset`/`memcpy` compiler intrinsics use NEON registers for larger buffers (e.g. a 1514-byte Ethernet frame array). Without setting `CPACR_EL1.FPEN` (bits 20-21) to `0b11` in the boot stub, the first such call traps. With no exception vector table installed (`VBAR_EL1 == 0` at reset), the trap vectors to address `0x200` and the CPU spins forever on undefined instructions there — indistinguishable from a plain hang, with zero diagnostic output.
+
+9. **`i386-unknown-none` requires `i128:128` in data-layout**: The custom target JSON (`targets/i386-unknown-none.json`) must include `i128:128` in the `data-layout` field. LLVM's 32-bit x86 default data layout has `i128:64` on some versions; omitting `i128:128` produces linker errors about missing `__multi3`.
+10. **Rust BIOS payload compiles as a 32-bit ELF, not a flat binary**: `cargo build` produces a relocatable ELF; `objcopy -O binary` strips it to a flat binary suitable for the entry stub's `incbin` and copy to 1 MB.
+11. **NASM incbin path relative to source, not CWD**: The `incbin "../bin/rust_payload.bin"` in `stage2_entry.nasm` resolves relative to the `bios/` directory. The Makefile runs NASM with `cd bios` to make this work.
+12. **Stack must be in low RAM, NOT BIOS ROM area for Rust BIOS stage2**: The BIOS ROM at `0xF0000`–`0xFFFFF` is read-only. Setting `esp` to `0x000FFFF0` (top of 1 MB) causes pushes to silently drop, corrupting return addresses and causing triple faults. Use `0x00070000` (low RAM) instead.
+13. **`cli` before Rust code in protected mode**: No IDT is set up after the protected mode switch. A hardware timer interrupt with no IDT causes a triple fault. Always `cli` before calling Rust code from the entry stub.
+14. **Inline `asm!` for serial I/O**: Use separate `asm!` blocks for the LSR poll (`in al, dx`) and data output (`out dx, al`). The poll block must NOT use `options(pure)` (I/O port reads are NOT idempotent — `pure` causes the compiler to optimize the poll loop into `jmp $`). Pass the output byte via `in("al") c` — do NOT let the compiler choose the register, as `in al, dx` clobbers AL.
+15. **BSS_ZERO_SIZE must cover actual BSS**: The entry stub zeros `BSS_ZERO_SIZE` bytes after the payload. If BSS grows (e1000 descriptor rings + packet buffers ~4.3 KB), increase `BSS_ZERO_SIZE` from `0x1000` to `0x2000`. Check with `readelf -S target/i386-unknown-none/release/bios-rust | grep .bss`.
+16. **MBR sector count must match payload**: The MBR loads 16 sectors (8192 bytes) for the Rust stage2 (was 14 for the C stage2). The Rust payload + 512 B stub is ~7.8 KB = 15 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
+17. **PCI Bus Master must be enabled for e1000 DMA**: SeaBIOS enables Memory Space (bit 1) but may NOT enable Bus Master (bit 2) in the PCI Command register. Without Bus Master, the e1000 can read descriptors (MMIO works) but TX descriptor write-back (DMA) silently fails — TDH advances but the status DD bit is never set. `pci_enable_bars` must always set command bits 0-2 (I/O + Memory + Bus Master), even if some are already set. Do NOT re-assign BARs if firmware already assigned them (check if BAR0 is non-zero before sizing).
 
 ### Original project (C/NASM) still relevant
 
@@ -194,7 +276,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 29. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
 30. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
 
-31. **Stage2 14-sector limit (7168 bytes)**: The MBR loads 14 sectors (LBA 1-14, 7168 bytes) at physical 0x1000. Keep `stage2.bin` under this limit. Check with `stat -c%s bin/stage2.bin`.
+31. **Stage2 14-sector limit (7168 bytes)**: The MBR loads 14 sectors (LBA 1-14, 7168 bytes) at physical 0x1000 for the C stage2. Keep `stage2.bin` under this limit. Check with `stat -c%s bin/stage2.bin`. The Rust stage2 MBR loads 16 sectors (8192 bytes) to accommodate the larger Rust payload.
 
 32. **PXE/UNDI via INT 1Ah**: PXE entry is discovered via INT 1Ah AX=0x5650. Functions called via INT 1Ah AX=0, BX=function, ES:DI=parameter block. Function numbers: 0x0001=UNDI_STARTUP, 0x0003=UNDI_INITIALIZE, 0x0005=UNDI_OPEN, 0x000B=UNDI_GET_INFO, 0x0030=UDP_OPEN, 0x0034=UDP_TRANSMIT, 0x0036=UDP_RECEIVE.
 
@@ -239,6 +321,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 ```bash
 make all                         # Build everything
 make i386-bios                   # Build MBR + stage2 (C/NASM)
+make i386-bios-rust              # Build Rust BIOS stage2 (nightly only)
 make x86_64-uefi                 # Build x86_64 UEFI binary
 make aarch64-uefi                # Build ARM64 UEFI binary
 make aarch64-bare                # Build Rust ARM64 bare-metal
@@ -246,6 +329,7 @@ make x86_64-uefi-rom             # Build UEFI PCI expansion ROM from rustrapper.
 make i386-bios-rom               # Build BIOS PCI expansion ROM from stage2.bin
 make x86_64-seabios              # Build custom SeaBIOS (auto-cloned from GitHub)
 make run-i386-bios               # BIOS mode via SeaBIOS (serial output; e1000 I/O not avail)
+make run-i386-bios-rust          # BIOS with Rust stage2 (VGA via curses)
 make run-i386-bios-ipxe          # BIOS PXE with custom iPXE ROM + custom SeaBIOS
 make run-i386-bios-rom           # Legacy BIOS with custom PCI expansion ROM (SeaBIOS)
 make run-i386-bios-rom-pxe       # Legacy BIOS option ROM + PXE (second NIC with iPXE ROM)
@@ -266,6 +350,7 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 | `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/rustrapper_arm64_bare.elf`    |
 | `x86_64-linux-gnu` (romwrap)    | Host   | —                 | `target/debug/romwrap`           |
 | `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
+| `i386-unknown-none` (Rust BIOS) | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
 | PCI Option ROM (BIOS)           | x86-16 | BIOS (ROM)        | `bin/rustrapper_bios.rom`        |
 
@@ -295,5 +380,6 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 ## Tools Required
 
 - **Rust**: `rustc`, `cargo` with targets `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
+- **Rust nightly**: needed for `i386-bios-rust` target (`-Zjson-target-spec -Zbuild-std=core`)
 - **BIOS (C/NASM)**: `gcc`, `ld` (`-m elf_i386`), `nasm`, `objcopy`
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `/usr/share/edk2/aarch64/QEMU_EFI.fd`)

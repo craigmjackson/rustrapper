@@ -3,7 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A hybrid BIOS/UEFI bootloader that scans storage devices and network adapters —
-written in Rust, with 16‑bit BIOS stages retained in C/NASM.
+written in Rust, with 16‑bit BIOS stages retained in C/NASM and an experimental
+32‑bit Rust BIOS stage2.
 
 Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications,
 ARM64 bare-metal binaries, and PCI expansion ROMs.
@@ -11,6 +12,8 @@ ARM64 bare-metal binaries, and PCI expansion ROMs.
 ## Features
 
 - **BIOS** — 16‑bit MBR + stage2 (NASM + C `-m16`) scans drives via INT 13h
+- **BIOS (Rust, experimental)** — 32‑bit protected-mode payload (Rust `no_std`) avoids
+  the 14‑sector limit, uses VGA text mode via `-display curses`
 - **BIOS network** — Direct e1000 I/O BAR driver (real hardware) or PXE/UNDI fallback via iPXE ROM
 - **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, storage scan
 - **UEFI option ROM** — PCI expansion ROM with direct e1000 MMIO driver (no UEFI protocols needed during DXE)
@@ -39,6 +42,7 @@ make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
 | Target | Binary | Description |
 |--------|--------|-------------|
 | `make i386-bios` | `bin/bios.bin`, `bin/stage2.bin` | 16‑bit BIOS MBR + stage2 |
+| `make i386-bios-rust` | `bin/rust_payload.bin`, `bin/stage2_entry.bin` | 32‑bit Rust BIOS stage2 (nightly only) |
 | `make x86_64-uefi` | `bin/rustrapper.efi` | x86_64 UEFI application |
 | `make aarch64-uefi` | `bin/rustrapper_arm64.efi` | ARM64 UEFI application |
 | `make aarch64-bare` | `bin/rustrapper_arm64_bare.elf` | ARM64 bare‑metal |
@@ -51,6 +55,7 @@ make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
 
 ```bash
 make run-i386-bios                # Legacy BIOS boot (no PXE, e1000 I/O stub)
+make run-i386-bios-rust          # Legacy BIOS with Rust stage2 (VGA via curses)
 make run-i386-bios-ipxe           # Legacy BIOS + PXE (custom SeaBIOS + iPXE ROM)
 make run-x86_64-uefi              # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP)
 make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM (direct e1000 MMIO)
@@ -78,10 +83,15 @@ make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 ├── bios/               # C/NASM 16‑bit BIOS sources
 │   ├── mbr.asm         # 512‑byte MBR stage‑1
 │   ├── stage2.c        # Stage‑2: drive + network scan
+│   ├── stage2_entry.nasm # Entry stub for Rust stage2 (A20, protected mode, payload copy)
 │   ├── pxe.c           # e1000 driver + PXE/UNDI fallback
 │   ├── div64.c         # 64‑bit division helpers
 │   ├── print.c/.h      # Shared formatting (putc, hex, dec)
 │   └── scan.c/.h       # Shared device‑scan loop
+├── bios-rust/          # Rust 32-bit BIOS stage2 (experimental, nightly)
+│   ├── Cargo.toml
+│   ├── link.ld         # Link at 0x100000
+│   └── src/main.rs     # _start entry, VGA text-mode driver
 ├── common/             # no_std Rust library (print, scan, menu)
 ├── uefi/               # Rust UEFI binary (x86_64 + ARM64)
 │   └── src/
@@ -118,5 +128,6 @@ cargo test --workspace   # 107 tests across all crates
 ## Requirements
 
 - **Rust** with targets: `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
+- **Rust nightly** for the `i386-bios-rust` target (needs `-Zjson-target-spec` and `-Zbuild-std=core`)
 - **BIOS**: `nasm`, `gcc`, `ld` (with `elf_i386` emulation), `objcopy`
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `QEMU_EFI.fd`)

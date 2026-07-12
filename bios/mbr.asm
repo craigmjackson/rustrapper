@@ -66,7 +66,7 @@ msg_err: db 'Boot error', 0x0D, 0x0A, 0
 dap:
     db 0x10        ; size
     db 0x00        ; reserved
-    dw 14          ; sectors to read (LBA 1-14 = bytes 0x200-0x2FFF)
+    dw 16          ; sectors to read (LBA 1-16 = bytes 0x200-0x3FFF)
     dw 0x1000      ; buffer offset
     dw 0x0000      ; buffer segment
     dq 1           ; start LBA
