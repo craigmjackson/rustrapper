@@ -8,21 +8,22 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ```
 .
-├── Cargo.toml              # Workspace root (6 member crates)
+├── Cargo.toml              # Workspace root (5 member crates)
 ├── Makefile                # Build orchestration (make all, make run-*)
 ├── AGENTS.md               # This file
-├── bios/                   # Retained C/NASM sources
-│   ├── mbr.asm             # 16-bit MBR stage-1
-│   ├── stage2.c            # 16-bit stage-2 scanner
-│   ├── stage2_entry.nasm   # Entry stub for Rust stage2 (A20, protected mode, copy to 1 MB)
-│   ├── div64.c             # 64-bit division helpers for -m16
-│   ├── print.c / print.h   # Shared formatting (putc callback, hex, dec)
-│   └── scan.c / scan.h     # Shared scan loop (calls arch detect_device)
-├── bios-rust/              # Rust 32-bit BIOS stage2 (experimental, nightly)
+├── bios/                   # Minimal NASM for BIOS boot
+│   ├── mbr.asm             # 16-bit MBR stage-1 (loads sector 1+ and jumps to it)
+│   └── stage2_entry.nasm   # Entry stub for Rust stage2 (A20, PM, copy to 1 MB)
+├── bios-rust/              # Rust 32-bit BIOS stage2 (nightly only)
 │   ├── Cargo.toml
 │   ├── link.ld             # Link at 0x100000
+│   ├── targets/i386-unknown-none.json  # Bare-metal i386 target spec
 │   └── src/
-│       └── main.rs         # _start entry, VGA text-mode driver
+│       ├── main.rs         # _start entry, menu dispatch
+│       ├── serial.rs       # COM1 driver (putc, getc, flush)
+│       ├── vga.rs          # VGA text-mode driver with scrolling
+│       ├── pci.rs          # PCI scan via I/O ports 0xCF8/0xCFC
+│       └── net.rs          # e1000 MMIO driver + DHCP (adapted from arm64-bare)
 ├── common/                 # Rust no_std library
 │   ├── Cargo.toml
 │   └── src/
@@ -127,10 +128,11 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `show_menu(puts, putc, get_key)` prints `[1]/[2]` and polls `get_key` until the user presses a valid choice.
 - `puts`/`putc` are function pointers, so the same function can be used with ASCII (UART/BIOS) and UEFI (wrapped to u16 `OutputString`) output.
 
-### `bios/stage2.c` — BIOS stage-2 menu and scan
+### `bios/mbr.asm` — 16-bit MBR stage-1
 
-- Presents `[1]/[2]` menu and reads the choice from the serial port (COM1, 0x3F8), because the BIOS stage-2 uses serial output. This matches the `-serial stdio` setup used by `run-i386-bios` and `run-i386-bios-ipxe`.
-- Dispatches to `scan_devices()` (INT 13h) or `pxe_scan()` (e1000 direct I/O BAR + PXE/UNDI fallback).
+- 512-byte MBR that loads 16 sectors (LBA 1-16, 8192 bytes) to physical `0x1000` and jumps to `0x0100:0x0000`.
+- The DAP (Disk Address Packet) at line 69 sets the sector count to 16 (was 14 for the original C stage2).
+- "MZ" at offset 0 executes as `dec bp; pop dx`, which overwrites DL (the boot-drive value). Always set DL explicitly before `int 0x13`.
 
 ### `bios/stage2_entry.nasm` — BIOS entry stub for Rust stage2
 
@@ -216,11 +218,11 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ### `Makefile` — Build orchestration
 
-- Top-level targets: `all`, `i386-bios`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `i386-bios-rust-rom`, `run-*`, `clean`.
+- Top-level targets: `all`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
-- `i386-bios-rust` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
-- `run-i386-bios-rust` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
+- `i386-bios` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
+- `run-i386-bios` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
 
 ## Key Gotchas
 
@@ -245,10 +247,13 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 16. **MBR sector count must match payload**: The MBR loads 16 sectors (8192 bytes) for the Rust stage2 (was 14 for the C stage2). The Rust payload + 512 B stub is ~7.8 KB = 15 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
 17. **PCI Bus Master must be enabled for e1000 DMA**: SeaBIOS enables Memory Space (bit 1) but may NOT enable Bus Master (bit 2) in the PCI Command register. Without Bus Master, the e1000 can read descriptors (MMIO works) but TX descriptor write-back (DMA) silently fails — TDH advances but the status DD bit is never set. `pci_enable_bars` must always set command bits 0-2 (I/O + Memory + Bus Master), even if some are already set. Do NOT re-assign BARs if firmware already assigned them (check if BAR0 is non-zero before sizing).
 
-### Original project (C/NASM) still relevant
+### MBR
 
 9. **"MZ" corrupts DL**: The MBR's first 2 bytes are `0x4D 0x5A`, which execute as `dec bp; pop dx`. The `pop dx` overwrites the boot-drive value in DL. Always set DL explicitly before INT 13h calls.
-10. **512-byte MBR limit**: The MBR is strictly 512 bytes (including `0xAA55` at `0x1FE`). All real logic goes in `stage2.bin`.
+10. **512-byte MBR limit**: The MBR is strictly 512 bytes (including `0xAA55` at `0x1FE`). All real logic goes in the stage2 entry stub.
+
+### ARM64 / UEFI
+
 11. **ARM64 UEFI SNP single-transmit limit**: The ARM64 virtio SNP driver only supports one `Transmit` per session because `Initialize` returns `EFI_UNSUPPORTED` (no buffer recycling). Send DHCPDISCOVER and accept the OFFER as final — do not attempt REQUEST/ACK. x86_64 e1000 supports the full handshake.
 12. **ARM64 EDK2 error bit**: ARM64 firmware encodes EFI errors with bit 63 set (`0x8000000000000014` for `EFI_ALREADY_STARTED`). Always check both the plain constant and the error-bit variant when comparing status codes on ARM64.
 13. **`virtio-net-pci` is the only ARM64 SNP NIC**: QEMU `qemu-system-aarch64` EDK2 firmware only detects SNP via `virtio-net-pci`. All other models (e1000, e1000e, rtl8139, etc.) return "No network adapters found".
@@ -262,35 +267,13 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 21. **`llvm-objcopy` for ARM64 ELF→binary**: Host `objcopy` cannot handle ARM64 ELF. Use `llvm-objcopy -O binary`.
 22. **`lld` required for ARM64 linking**: Host `ld` lacks `aarch64linux` emulation. Use `-fuse-ld=lld` with clang or `lld-link` for UEFI.
 
-### BIOS stage2 (C, retained as-is)
+### QEMU e1000
 
-26. **INT 13h register preservation**: `INT 13h` can clobber registers. Use C local variables instead of relying on register values across calls.
-27. **DPB buffer size**: Must be set to `30` (`0x001E`) in the first word before AH=48h.
-28. **Global data in `.data` for `--oformat=binary`**: Accessed globals must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Both `dpb_buf` and `g_putc` use `__attribute__((section(".data")))`.
-29. **`"di"` clobber for INT 13h AH=48h**: The call clobbers `%edi`. List `"di"` as a clobber in inline asm, otherwise GCC may keep the info pointer in `%edi` across the asm, corrupting memory.
-30. **`__umoddi3` inline asm indexing**: With two outputs (`"=a", "=d"`) before three inputs, the divisor is `%4`, not `%3`. Using `%3` causes `divl %edx` (divide by EDX), which hangs when EDX=0.
+23. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in any code that uses the PCI I/O BAR (not the MMIO BAR) for register access will NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-x86_64-uefi` (UEFI path works in QEMU) or `make run-i386-bios` (BIOS uses MMIO + PCI I/O port config).
 
-31. **Stage2 14-sector limit (7168 bytes)**: The MBR loads 14 sectors (LBA 1-14, 7168 bytes) at physical 0x1000 for the C stage2. Keep `stage2.bin` under this limit. Check with `stat -c%s bin/stage2.bin`. The Rust stage2 MBR loads 16 sectors (8192 bytes) to accommodate the larger Rust payload.
+### UEFI keyboard / menu
 
-32. **PXE/UNDI via INT 1Ah**: PXE entry is discovered via INT 1Ah AX=0x5650. Functions called via INT 1Ah AX=0, BX=function, ES:DI=parameter block. Function numbers: 0x0001=UNDI_STARTUP, 0x0003=UNDI_INITIALIZE, 0x0005=UNDI_OPEN, 0x000B=UNDI_GET_INFO, 0x0030=UDP_OPEN, 0x0034=UDP_TRANSMIT, 0x0036=UDP_RECEIVE.
-
-33. **PXE inline asm clobbers**: For `int 0x1A` PXE calls, only AX and flags are preserved. Use `push`/`pop` for BX and ES inside the asm. List `"cc"` and `"memory"` as clobbers.
-
-34. **PXE buffer in `.data`**: The 64-byte `pxe_buf` must be in `.data` (not `.bss`) because `ld --oformat=binary` skips `.bss`. Must be zeroed before each call via `pxe_clear()`.
-
-35. **Frame buffers at fixed offset 0x1500**: DHCP and receive buffers at offset 0x1500 from DS=0x0100 (physical 0x2500) — past the max stage2 size of 0x1400 bytes. Hardcoded pointers avoid bloat from 1514+ byte buffers.
-
-36. **UDP port fields in network byte order**: PXE UDP parameter structures use big-endian port numbers (`htons()`). `BufferLen` is in host byte order.
-
-37. **e1000 is the BIOS test NIC**: Use `-nic user,model=e1000` for SeaBIOS PXE support in QEMU. virtio-net-pci also works. Other models may not have UNDI support.
-
-38. **Single-transmit DHCP for BIOS**: Same pattern as ARM64 UEFI — send one DISCOVER via UDP_TRANSMIT, poll UDP_RECEIVE up to 100k iterations, accept OFFER as final. No REQUEST/ACK.
-
-39. **Custom SeaBIOS for PXE testing**: The `run-i386-bios-ipxe` target builds a custom SeaBIOS (`make x86_64-seabios`, cloned from GitHub) and uses it via `-bios`. This ensures the PXE/UNDI INT 1Ah handler stays resident after boot (the default SeaBIOS that ships with QEMU tears down the PXE stack after it boots from a non-PXE device). The build uses `git clone --depth=1` into `build/seabios` and runs `make defconfig` to produce a QEMU-optimized `bios.bin`. On real hardware workstations, the PXE stack remains resident in UMA regardless of boot source and no custom SeaBIOS is needed.
-
-40. **QEMU e1000 I/O BAR is a stub**: QEMU's classic e1000 PCI I/O handler (`e1000_io_read`/`e1000_io_write`) is an empty stub — it returns 0 for all reads and ignores all writes. This means the direct e1000 driver in `pxe.c` (which uses the PCI I/O BAR for register access) can NOT work on QEMU. On real hardware, the I/O BAR software access protocol provides full register access. For QEMU testing, use `make run-x86_64-uefi` (UEFI path works in QEMU) or `make run-i386-bios-ipxe` (BIOS PXE with custom SeaBIOS) or `make run-i386-bios-rom-pxe` (BIOS option ROM with PXE fallback via second NIC).
 41. **UEFI keyboard input is non-blocking**: `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` returns `EFI_NOT_READY` when no key is pressed. The menu polls it in a tight loop until a valid choice is received. Store the system table pointer globally so the polling function can reach `con_in` without threading it through every helper.
-42. **BIOS menu reads from serial port**: The BIOS stage-2 uses serial output, so the menu reads from COM1 (0x3F8) rather than the keyboard. This matches the `-serial stdio` setup used by `run-i386-bios` and `run-i386-bios-ipxe`. Real hardware with a serial console will work the same way; a VGA+keyboard setup would require a keyboard input path instead.
 
 ### UEFI Option ROM & Direct e1000 (added during option ROM work)
 
@@ -314,21 +297,14 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ```bash
 make all                         # Build everything
-make i386-bios                   # Build MBR + stage2 (C/NASM)
-make i386-bios-rust              # Build Rust BIOS stage2 (nightly only)
+make i386-bios                   # Build BIOS stage2 (nightly only) — MBR + entry stub + Rust payload
 make x86_64-uefi                 # Build x86_64 UEFI binary
 make aarch64-uefi                # Build ARM64 UEFI binary
 make aarch64-bare                # Build Rust ARM64 bare-metal
 make x86_64-uefi-rom             # Build UEFI PCI expansion ROM from rustrapper.efi
-make i386-bios-rom               # Build BIOS PCI expansion ROM from stage2.bin
-make i386-bios-rust-rom          # Build BIOS PCI expansion ROM from rust_payload.bin
-make x86_64-seabios              # Build custom SeaBIOS (auto-cloned from GitHub)
-make run-i386-bios               # BIOS mode via SeaBIOS (serial output; e1000 I/O not avail)
-make run-i386-bios-rust          # BIOS with Rust stage2 (serial, Ctrl-A X to exit)
-make run-i386-bios-ipxe          # BIOS PXE with custom iPXE ROM + custom SeaBIOS
-make run-i386-bios-rom           # Legacy BIOS with C PCI expansion ROM (SeaBIOS)
-make run-i386-bios-rust-rom      # Legacy BIOS with Rust PCI expansion ROM (rust_payload.bin)
-make run-i386-bios-rom-pxe       # Legacy BIOS option ROM + PXE (second NIC with iPXE ROM)
+make i386-bios-rom               # Build BIOS PCI expansion ROM from rust_payload.bin
+make run-i386-bios                # BIOS stage2 (serial, Ctrl-A X to exit)
+make run-i386-bios-rom            # Legacy BIOS with PCI expansion ROM (rust_payload.bin)
 make run-x86_64-uefi             # x86_64 UEFI via FAT dir (e1000, full DHCP)
 make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
 make run-aarch64-uefi            # ARM64 UEFI from FAT directory
@@ -337,12 +313,12 @@ make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
 make x86_64-seabios-clean        # Remove SeaBIOS checkout
 ```
 
-### `i386-bios-rust-rom` — Rust BIOS option ROM
+### `i386-bios-rom` — BIOS option ROM
 
-- Wraps `bin/rust_payload.bin` (raw 32-bit PM binary) as a legacy BIOS PCI expansion ROM via `romwrap --bios`. Produces `bin/rustrapper_bios_rust.rom` (~15 blocks / ~7.7 KB for the current payload).
-- Like the C BIOS option ROM, the 3-byte init routine at 0x34 is a no-op (`xor ax,ax; retf`). SeaBIOS acknowledges the ROM and continues to boot from the disk image.
+- Wraps `bin/rust_payload.bin` (raw 32-bit PM binary) as a legacy BIOS PCI expansion ROM via `romwrap --bios`. Produces `bin/rustrapper_bios.rom` (~15 blocks / ~7.7 KB for the current payload).
+- Like all BIOS option ROMs, the 3-byte init routine at 0x34 is a no-op (`xor ax,ax; retf`). SeaBIOS acknowledges the ROM and continues to boot from the disk image.
 - The Rust payload at 0x37+ is just data — the actual Rust execution comes from the MBR → stage2 entry stub → Rust code at 0x100000 on the disk, not from the ROM.
-- The `run-i386-bios-rust-rom` target boots `bin/bios-rust.img` with the ROM loaded on an e1000 NIC via `-device e1000,romfile=...`. Useful for testing that the option ROM is correctly detected by SeaBIOS.
+- The `run-i386-bios-rom` target boots `bin/bios.img` with the ROM loaded on an e1000 NIC via `-device e1000,romfile=...`. Useful for testing that the option ROM is correctly detected by SeaBIOS.
 - Default PCI IDs are `0x8086:0x100E` (Intel e1000). Use `romwrap --vendor=... --device=...` for custom IDs.
 
 ## Targets
@@ -357,7 +333,7 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 | `i386-unknown-none` (Rust BIOS) | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
 | PCI Option ROM (BIOS, C)        | x86-16 | BIOS (ROM)        | `bin/rustrapper_bios.rom`        |
-| PCI Option ROM (BIOS, Rust)     | x86-32 | BIOS (ROM)        | `bin/rustrapper_bios_rust.rom`   |
+| PCI Option ROM (BIOS)           | x86-32 | BIOS (ROM)        | `bin/rustrapper_bios.rom`        |
 
 ## Tests
 
@@ -385,6 +361,6 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 ## Tools Required
 
 - **Rust**: `rustc`, `cargo` with targets `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
-- **Rust nightly**: needed for `i386-bios-rust` target (`-Zjson-target-spec -Zbuild-std=core`)
+- **Rust nightly**: needed for `i386-bios` target (`-Zjson-target-spec -Zbuild-std=core`)
 - **BIOS (C/NASM)**: `gcc`, `ld` (`-m elf_i386`), `nasm`, `objcopy`
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `/usr/share/edk2/aarch64/QEMU_EFI.fd`)

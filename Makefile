@@ -1,12 +1,12 @@
 # Rustrapper - Rust Bootloader
-# Targets: all, i386-bios, x86_64-uefi, aarch64-uefi, aarch64-bare
-# Uses cargo for Rust crates, nasm+gcc for legacy BIOS parts
+# Targets: all, x86_64-uefi, aarch64-uefi, aarch64-bare, i386-bios
+# All code is Rust. The only non-Rust pieces are:
+#   - bios/mbr.asm          (512-byte MBR, loads sector 1+ and jumps to it)
+#   - bios/stage2_entry.nasm (enables A20, switches to PM, copies Rust payload
+#     from 0x1200 to 0x100000, zeros BSS, calls Rust _start)
 
 CARGO    := cargo
 NASM     := nasm
-CC       := gcc
-CFLAGS   := -ffreestanding -fno-stack-protector -mno-sse -mno-mmx \
-            -fno-pic -fno-strict-aliasing -nostartfiles -Wall -Wextra -std=c11 -Os -Ibios
 BIN      := bin
 BIOS_SRC := bios
 
@@ -17,17 +17,23 @@ UEFI_ARM64_TARGET := aarch64-unknown-uefi
 # ARM64 bare-metal target
 BARE_ARM64_TARGET := aarch64-unknown-none
 
-.PHONY: all i386-bios x86_64-uefi aarch64-uefi aarch64-bare x86_64-seabios \
-        run-i386-bios run-x86_64-uefi run-aarch64-uefi run-aarch64-bare clean \
-        x86_64-uefi-rom i386-bios-rom i386-bios-rust-rom \
-        run-x86_64-uefi-rom run-i386-bios-rom run-i386-bios-rust-rom run-i386-bios-rom-pxe \
-        run-i386-bios-ipxe x86_64-seabios-clean i386-bios-rust run-i386-bios-rust
+.PHONY: all x86_64-uefi aarch64-uefi aarch64-bare clean \
+        x86_64-uefi-rom i386-bios-rom \
+        run-x86_64-uefi run-aarch64-uefi run-aarch64-bare \
+        run-x86_64-uefi-rom run-i386-bios-rom \
+        i386-bios run-i386-bios
 
-all: i386-bios x86_64-uefi aarch64-uefi aarch64-bare
+all: x86_64-uefi aarch64-uefi aarch64-bare
 
 # Create output directory
 $(BIN):
 	mkdir -p $(BIN)
+
+# ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
+# Loads 16 sectors (LBA 1-16, 8192 bytes) to 0x1000 and jumps there.
+# The 512-byte stub at 0x1000 (stage2_entry.nasm) then takes over.
+$(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN)
+	$(NASM) -f bin -o $@ $<
 
 # ── BIOS Rust payload (32-bit protected mode, loaded at 1 MB) ────
 # Requires nightly for -Zjson-target-spec and -Zbuild-std=core
@@ -46,47 +52,7 @@ $(BIN)/rust_payload.bin: $(shell find bios-rust common -name '*.rs') \
 $(BIN)/stage2_entry.bin: $(BIN)/rust_payload.bin | $(BIN)
 	cd $(BIOS_SRC) && $(NASM) -f bin -o ../$@ stage2_entry.nasm
 
-# Experimental: build the Rust-based BIOS stage2 instead of the C one
-i386-bios-rust: $(BIN)/bios.bin $(BIN)/stage2_entry.bin
-
-# ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
-# NOTE: when switching to the Rust payload, update the sector count
-# in mbr.asm (line 69: `dw 14`) to cover the full stage2_entry.bin.
-$(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN)
-	$(NASM) -f bin -o $@ $<
-
-# ── BIOS Stage-2 (C with -m16, flat binary) ──────────────────────
-S2_SRC    := $(BIOS_SRC)/stage2.c $(BIOS_SRC)/div64.c
-S2_COMMON := $(BIOS_SRC)/print.c $(BIOS_SRC)/scan.c $(BIOS_SRC)/pxe.c
-S2_BUILD  := build/stage2
-
-$(S2_BUILD):
-	mkdir -p $(S2_BUILD)
-
-$(S2_BUILD)/stage2.o: $(S2_SRC) | $(S2_BUILD)
-	$(CC) -m16 $(CFLAGS) -c $(BIOS_SRC)/stage2.c -o $(S2_BUILD)/stage2.o
-
-$(S2_BUILD)/div64.o: $(BIOS_SRC)/div64.c | $(S2_BUILD)
-	$(CC) -m16 $(CFLAGS) -c $(BIOS_SRC)/div64.c -o $(S2_BUILD)/div64.o
-
-$(S2_BUILD)/print_bios.o: $(BIOS_SRC)/print.c | $(S2_BUILD)
-	$(CC) -m16 $(CFLAGS) -c $(BIOS_SRC)/print.c -o $(S2_BUILD)/print_bios.o
-
-$(S2_BUILD)/scan_bios.o: $(BIOS_SRC)/scan.c | $(S2_BUILD)
-	$(CC) -m16 $(CFLAGS) -c $(BIOS_SRC)/scan.c -o $(S2_BUILD)/scan_bios.o
-
-$(S2_BUILD)/pxe_bios.o: $(BIOS_SRC)/pxe.c | $(S2_BUILD)
-	$(CC) -m16 $(CFLAGS) -c $(BIOS_SRC)/pxe.c -o $(S2_BUILD)/pxe_bios.o
-
-$(BIN)/stage2.bin: $(S2_BUILD)/stage2.o $(S2_BUILD)/div64.o \
-                   $(S2_BUILD)/print_bios.o $(S2_BUILD)/scan_bios.o \
-                   $(S2_BUILD)/pxe_bios.o | $(BIN)
-	ld -m elf_i386 -e _start -Ttext=0x0 -N --oformat=binary \
-		$(S2_BUILD)/stage2.o $(S2_BUILD)/print_bios.o \
-		$(S2_BUILD)/scan_bios.o $(S2_BUILD)/pxe_bios.o \
-		$(S2_BUILD)/div64.o -o $@
-
-i386-bios: $(BIN)/bios.bin $(BIN)/stage2.bin
+i386-bios: $(BIN)/bios.bin $(BIN)/stage2_entry.bin
 
 # ── x86_64 UEFI ──────────────────────────────────────────────────
 # The common crate does not need a separate -I path; Cargo handles deps
@@ -115,20 +81,15 @@ $(BIN)/rustrapper_efi.rom: $(BIN)/rustrapper.efi $(ROMWRAP_BIN) | $(BIN)
 
 x86_64-uefi-rom: $(BIN)/rustrapper_efi.rom
 
-# ── BIOS PCI Expansion ROM ────────────────────────────────
-$(BIN)/rustrapper_bios.rom: $(BIN)/stage2.bin $(ROMWRAP_BIN) | $(BIN)
-	$(CARGO) run --package romwrap -- $(BIN)/stage2.bin $@ --bios
-
-i386-bios-rom: $(BIN)/rustrapper_bios.rom
-
-# BIOS option ROM from Rust payload: the raw 32-bit PM binary wrapped
-# as a legacy BIOS option ROM. Like the C BIOS ROM, the init routine
-# at 0x34 is a no-op (xor ax,ax; retf); the payload is just data.
-# The Rust payload itself runs from disk via the stage2 entry stub.
-$(BIN)/rustrapper_bios_rust.rom: $(BIN)/rust_payload.bin $(ROMWRAP_BIN) | $(BIN)
+# ── BIOS PCI Expansion ROM (from Rust payload) ─────────────────
+# Wraps the raw 32-bit PM binary as a legacy BIOS option ROM.
+# Like other BIOS option ROMs, the 3-byte init routine at 0x34 is a
+# no-op (xor ax,ax; retf); the payload is just data. The Rust code
+# actually runs from disk via the stage2 entry stub loaded by the MBR.
+$(BIN)/rustrapper_bios.rom: $(BIN)/rust_payload.bin $(ROMWRAP_BIN) | $(BIN)
 	$(CARGO) run --package romwrap -- $(BIN)/rust_payload.bin $@ --bios
 
-i386-bios-rust-rom: $(BIN)/rustrapper_bios_rust.rom
+i386-bios-rom: $(BIN)/rustrapper_bios.rom
 
 # ── ARM64 Bare-metal ──────────────────────────────────────────────
 $(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common -name '*.rs') \
@@ -139,51 +100,19 @@ $(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common -name '*.rs') \
 
 aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf
 
-# ── BIOS disk image (MBR + stage2, no FAT32) ─────────────────────
-$(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2.bin | $(BIN)
-	dd if=/dev/zero bs=1M count=64 of=$@ 2>/dev/null
-	dd if=$(BIN)/bios.bin of=$@ conv=notrunc 2>/dev/null
-	dd if=$(BIN)/stage2.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
-
-# BIOS disk image with Rust stage2 payload
-$(BIN)/bios-rust.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
+# ── BIOS disk image (MBR + Rust stage2 entry + payload) ──────────
+$(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
 	dd if=/dev/zero bs=1M count=64 of=$@ 2>/dev/null
 	dd if=$(BIN)/bios.bin of=$@ conv=notrunc 2>/dev/null
 	dd if=$(BIN)/stage2_entry.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
 
-# ── SeaBIOS (custom build with PXE stack kept) ──────────────────
-SEABIOS_DIR := build/seabios
-SEABIOS_BIN := $(SEABIOS_DIR)/out/bios.bin
-
-$(SEABIOS_DIR):
-	git clone --depth=1 https://github.com/coreboot/seabios.git $(SEABIOS_DIR)
-
-$(SEABIOS_DIR)/.config: | $(SEABIOS_DIR)
-	$(MAKE) -C $(SEABIOS_DIR) defconfig
-
-$(SEABIOS_BIN): $(SEABIOS_DIR)/.config
-	$(MAKE) -C $(SEABIOS_DIR)
-
-x86_64-seabios: $(SEABIOS_BIN)
-
 # ── Run targets ──────────────────────────────────────────────────
-# BIOS e1000 direct driver doesn't work on QEMU due to stub I/O BAR (see AGENTS.md).
-# Use run-x86_64-uefi for QEMU testing, or real hardware for BIOS e1000.
+# All targets use -nographic (Ctrl-A X to exit). QEMU's e1000 I/O BAR is a
+# stub (see AGENTS.md gotcha), so the Rust stage2's direct e1000 driver uses
+# MMIO (PCI config via I/O ports 0xCF8/0xCFC + MMIO register access).
+
 run-i386-bios: $(BIN)/bios.img
-	@echo "Note: BIOS e1000 driver requires real hardware (QEMU I/O BAR is a stub)."
-	@echo "      Use run-x86_64-uefi for QEMU testing, or run-i386-bios-ipxe with custom SeaBIOS."
 	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw -nic user,model=e1000 -nographic
-
-run-i386-bios-rust: $(BIN)/bios-rust.img
-	qemu-system-x86_64 -drive file=$(BIN)/bios-rust.img,format=raw -nic user,model=e1000 -nographic
-
-# BIOS PXE test with custom iPXE ROM (requires custom SeaBIOS built by the
-# 'x86_64-seabios' target to keep the PXE/UNDI INT 1Ah handler resident).
-run-i386-bios-ipxe: $(BIN)/bios.img $(SEABIOS_BIN)
-	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$(BIN)/bios.img,format=raw \
-		-netdev user,id=net0 \
-		-device e1000,romfile=/tmp/ipxe/src/bin/8086100e.rom,netdev=net0 \
-		-serial stdio -display none -m 64 -no-reboot
 
 run-x86_64-uefi: $(BIN)/rustrapper.efi
 	mkdir -p EFI/BOOT
@@ -200,39 +129,10 @@ run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom
 		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0 \
 		-nographic
 
-# BIOS option ROM: stage2.bin wrapped as PCI option ROM with PCIR header.
-# The ROM is detected by SeaBIOS which calls the init routine (minimal:
-# just returns). The stage2 code uses the INT 1Ah PXE/UNDI API if a PXE
-# stack is available.  Direct e1000 I/O BAR is a QEMU stub (see AGENTS.md
-# gotcha #40), so QEMU testing requires a separate PXE stack.
-#
-# Two run modes (QEMU only, not real hardware):
-#   make run-i386-bios-rom         — uses stock SeaBIOS, no PXE (no networking)
-#   make run-i386-bios-rom-pxe     — uses custom SeaBIOS + iPXE ROM on 2nd NIC
-PXE_ROM ?= /tmp/ipxe/src/bin/8086100e.rom
 run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom
 	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw \
 		-netdev user,id=net0 \
 		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0 \
-		-nographic
-
-run-i386-bios-rom-pxe: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom $(SEABIOS_BIN)
-	@test -f $(PXE_ROM) || { echo "Error: $(PXE_ROM) not found. Build iPXE first (see Makefile comments."; exit 1; }
-	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$(BIN)/bios.img,format=raw \
-		-netdev user,id=net0 \
-		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0 \
-		-netdev user,id=net1 \
-		-device e1000,romfile=$(PXE_ROM),netdev=net1 \
-		-serial stdio -display none -m 64 -no-reboot
-
-# BIOS option ROM from Rust payload: rust_payload.bin wrapped as PCI option ROM.
-# Like run-i386-bios-rom, the init routine is a no-op; the ROM just carries
-# the Rust payload as data. The Rust code actually runs from disk via the
-# stage2 entry stub loaded by the MBR.
-run-i386-bios-rust-rom: $(BIN)/bios-rust.img $(BIN)/rustrapper_bios_rust.rom
-	qemu-system-x86_64 -drive file=$(BIN)/bios-rust.img,format=raw \
-		-netdev user,id=net0 \
-		-device e1000,romfile=$(BIN)/rustrapper_bios_rust.rom,netdev=net0 \
 		-nographic
 
 run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi
@@ -253,9 +153,6 @@ run-aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf test.img
 		-nic user,model=e1000 -nographic
 
 # ── Clean ────────────────────────────────────────────────────────
-x86_64-seabios-clean:
-	rm -rf $(SEABIOS_DIR)
-
-clean: x86_64-seabios-clean
+clean:
 	rm -rf $(BIN)/* build/
 	rm -rf target/ EFI/
