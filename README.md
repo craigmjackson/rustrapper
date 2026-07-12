@@ -12,13 +12,13 @@ ARM64 bare-metal binaries, and PCI expansion ROMs.
 ## Features
 
 - **BIOS** — 16‑bit MBR + stage2 (NASM + C `-m16`) scans drives via INT 13h
-- **BIOS (Rust, experimental)** — 32‑bit protected-mode payload (Rust `no_std`) avoids
-  the 14‑sector limit, uses VGA text mode via `-display curses`
+- **BIOS (Rust, experimental)** — 32‑bit protected-mode payload (Rust `no_std`) with menu, PCI storage scan (via I/O ports), e1000 MMIO DHCP — same feature set as the other targets
 - **BIOS network** — Direct e1000 I/O BAR driver (real hardware) or PXE/UNDI fallback via iPXE ROM
 - **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, storage scan
 - **UEFI option ROM** — PCI expansion ROM with direct e1000 MMIO driver (no UEFI protocols needed during DXE)
 - **ARM64 UEFI** — Same Rust code compiled for `aarch64-unknown-uefi`
 - **ARM64 bare‑metal** — No firmware: PL011 UART, PCI ECAM walk, AHCI probe
+- **BIOS option ROM (C and Rust)** — Legacy PCI expansion ROM from `stage2.bin` or `rust_payload.bin` via `romwrap --bios`
 - **ROM wrapper** — Rust CLI tool wraps PE/COFF into UEFI PCI option ROM (`--bios` for BIOS option ROM)
 
 ## Quick Start
@@ -47,7 +47,8 @@ make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
 | `make aarch64-uefi` | `bin/rustrapper_arm64.efi` | ARM64 UEFI application |
 | `make aarch64-bare` | `bin/rustrapper_arm64_bare.elf` | ARM64 bare‑metal |
 | `make x86_64-uefi-rom` | `bin/rustrapper_efi.rom` | PCI expansion ROM (UEFI option ROM) |
-| `make i386-bios-rom` | `bin/rustrapper_bios.rom` | PCI expansion ROM (BIOS option ROM) |
+| `make i386-bios-rom` | `bin/rustrapper_bios.rom` | PCI expansion ROM (BIOS option ROM from C stage2) |
+| `make i386-bios-rust-rom` | `bin/rustrapper_bios_rust.rom` | PCI expansion ROM (BIOS option ROM from Rust payload) |
 | `make x86_64-seabios` | `build/seabios/out/bios.bin` | Custom SeaBIOS (auto-cloned) |
 | `make x86_64-seabios-clean` | — | Remove SeaBIOS checkout |
 
@@ -55,15 +56,18 @@ make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
 
 ```bash
 make run-i386-bios                # Legacy BIOS boot (no PXE, e1000 I/O stub)
-make run-i386-bios-rust          # Legacy BIOS with Rust stage2 (VGA via curses)
+make run-i386-bios-rust          # Legacy BIOS with Rust stage2 (serial, Ctrl-A X to exit)
 make run-i386-bios-ipxe           # Legacy BIOS + PXE (custom SeaBIOS + iPXE ROM)
 make run-x86_64-uefi              # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP)
 make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM (direct e1000 MMIO)
-make run-i386-bios-rom            # Legacy BIOS with custom option ROM (SeaBIOS)
+make run-i386-bios-rom            # Legacy BIOS with C option ROM (SeaBIOS)
+make run-i386-bios-rust-rom       # Legacy BIOS with Rust option ROM (rust_payload.bin)
 make run-i386-bios-rom-pxe        # Legacy BIOS option ROM with PXE fallback (second NIC)
 make run-aarch64-uefi             # ARM64 UEFI (virtio-net-pci NIC, DHCP OFFER)
 make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 ```
+
+All BIOS targets use `-nographic` (Ctrl-A X to exit). The Rust stage2 target (`run-i386-bios-rust`) writes to both serial and VGA, so it also works with `-display curses` if you want a graphical view (Ctrl-A X won't work in curses mode — kill the process instead).
 
 ## Network Support
 
@@ -71,7 +75,9 @@ make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 |--------|-----|--------|------|
 | BIOS (direct e1000) | e1000 | PCI I/O BAR | Raw Ethernet/IP/UDP (real hardware) |
 | BIOS (PXE fallback) | Any with PXE ROM | INT 1A PXE/UNDI | Single-transmit DHCP via iPXE ROM |
+| BIOS Rust stage2 (disk) | e1000 | PCI I/O ports + MMIO | Full DHCP (DISCOVER→OFFER) |
 | BIOS (option ROM, direct) | e1000 | PCI option ROM with PCIR header | e1000 I/O BAR driver (real hardware only) |
+| BIOS (Rust option ROM) | e1000 | PCI option ROM with PCIR header | e1000 I/O BAR driver (real hardware only) |
 | BIOS (option ROM + PXE) | Two NICs | Option ROM + iPXE on second NIC | PXE fallback via INT 1A |
 | x86_64 UEFI (disk) | e1000 | SNP protocol | Full DHCP (DISCOVER/OFFER/REQUEST/ACK) |
 | x86_64 UEFI (option ROM) | e1000 | Direct MMIO + I/O port PCI scan | Full DHCP (DISCOVER→OFFER) |
@@ -91,7 +97,12 @@ make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 ├── bios-rust/          # Rust 32-bit BIOS stage2 (experimental, nightly)
 │   ├── Cargo.toml
 │   ├── link.ld         # Link at 0x100000
-│   └── src/main.rs     # _start entry, VGA text-mode driver
+│   └── src/
+│       ├── main.rs     # _start entry, menu dispatch
+│       ├── serial.rs   # COM1 driver (putc, getc, flush)
+│       ├── vga.rs      # VGA text-mode driver with scrolling
+│       ├── pci.rs      # PCI scan via I/O ports 0xCF8/0xCFC
+│       └── net.rs      # e1000 MMIO driver + DHCP (adapted from arm64-bare)
 ├── common/             # no_std Rust library (print, scan, menu)
 ├── uefi/               # Rust UEFI binary (x86_64 + ARM64)
 │   └── src/

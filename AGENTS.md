@@ -148,11 +148,11 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 ### `bios-rust/src/main.rs` — Rust BIOS stage2 entry
 
 - `#![no_std]`, `#![no_main]`, `extern "C" fn _start(boot_drive: u32) -> !` as entry point.
-- **Dual output**: VGA text-mode driver (`vga.rs`) writing directly to `0xB8000` via `write_volatile` (COL/ROW statics in BSS), and serial output (`serial.rs`) via COM1 (`0x3F8`) using inline `asm!` for `in al, dx` / `out dx, al`.
+- **Dual output**: VGA text-mode driver (`vga.rs`) writing directly to `0xB8000` via `write_volatile` (COL/ROW statics in BSS, with scrolling when row ≥ 25), and serial output (`serial.rs`) via COM1 (`0x3F8`) using inline `asm!` for `in al, dx` / `out dx, al`.
 - Both VGA and serial `putc` auto-translate `\n` → `\r\n` (matching `arm64-bare/src/uart.rs`).
 - Serial `putc` polls LSR (0x3FD) bit 5 (THRE) before writing; `flush` waits for TEMT (bit 6); `getc` polls LSR bit 0 (Data Ready) for non-blocking input.
 - Uses `common::print::init(dual_putc)` to wire the global print callback, then `common::menu::show_menu` for the `[1]/[2]` menu, and `common::scan::scan_devices` for storage scan — same pattern as `arm64-bare/src/main.rs`.
-- Presents the `[1]/[2]` menu via `common::menu::show_menu`, reading from the PS/2 keyboard (`kbd::getc`), and dispatches to `scan::scan_devices(pci::detect_device)` or `net::scan_network()`.
+- Presents the `[1]/[2]` menu via `common::menu::show_menu`, reading from serial COM1 (`serial::getc`), and dispatches to `scan::scan_devices(pci::detect_device)` or `net::scan_network()`.
 - `#[cfg(not(test))]` guards on `_start` and `#[panic_handler]` so the crate can be compiled in the host test harness.
 - Custom `link.ld` links at `0x100000` (where the entry stub copies the payload).
 
@@ -184,17 +184,11 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ### `bios-rust/src/vga.rs` — BIOS Rust VGA text-mode driver
 
-- Writes directly to `0xB8000` (VGA text buffer) via `write_volatile`.
+- Writes directly to `0xB8000` (VGA text buffer) via `read_volatile`/`write_volatile`.
 - COL/ROW statics in BSS track cursor position.
 - `putc` auto-translates `\n` → `\r\n` (writes `\r` first, then the char).
 - 80x25 text mode, attribute byte `0x07` (white on black).
-
-### `bios-rust/src/kbd.rs` — BIOS Rust PS/2 keyboard driver
-
-- Reads Set 1 scancodes from the PS/2 keyboard controller (port `0x60` data, `0x64` status).
-- `getc` polls status bit 0 (output buffer full), reads scancode from port 0x60, ignores break codes (bit 7 set), translates scancode to ASCII via `SET1_MAP` table.
-- Enter (0x1C) → `\n`, Backspace (0x0E) → `0x08`, all other printable keys from the scancode table.
-- Used as the `get_key` callback for `common::menu::show_menu`. Required because `-display curses` sends keyboard input to the PS/2 controller, not to the serial port.
+- **Scrolling**: when ROW ≥ 25, shifts all lines up by one row via `read_volatile`/`write_volatile` byte copies and clears the last row. Without scrolling, output wrapping to row 0 would overwrite earlier lines (the DHCP results would be invisible).
 
 ### `common/src/print.rs` — Shared formatting
 
@@ -222,11 +216,11 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ### `Makefile` — Build orchestration
 
-- Top-level targets: `all`, `i386-bios`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `run-*`, `clean`.
+- Top-level targets: `all`, `i386-bios`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `i386-bios-rust-rom`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
 - `i386-bios-rust` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
-- `run-i386-bios-rust` uses `-display curses` because the Rust stage2 writes to VGA text mode (no serial).
+- `run-i386-bios-rust` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
 
 ## Key Gotchas
 
@@ -327,11 +321,13 @@ make aarch64-uefi                # Build ARM64 UEFI binary
 make aarch64-bare                # Build Rust ARM64 bare-metal
 make x86_64-uefi-rom             # Build UEFI PCI expansion ROM from rustrapper.efi
 make i386-bios-rom               # Build BIOS PCI expansion ROM from stage2.bin
+make i386-bios-rust-rom          # Build BIOS PCI expansion ROM from rust_payload.bin
 make x86_64-seabios              # Build custom SeaBIOS (auto-cloned from GitHub)
 make run-i386-bios               # BIOS mode via SeaBIOS (serial output; e1000 I/O not avail)
-make run-i386-bios-rust          # BIOS with Rust stage2 (VGA via curses)
+make run-i386-bios-rust          # BIOS with Rust stage2 (serial, Ctrl-A X to exit)
 make run-i386-bios-ipxe          # BIOS PXE with custom iPXE ROM + custom SeaBIOS
-make run-i386-bios-rom           # Legacy BIOS with custom PCI expansion ROM (SeaBIOS)
+make run-i386-bios-rom           # Legacy BIOS with C PCI expansion ROM (SeaBIOS)
+make run-i386-bios-rust-rom      # Legacy BIOS with Rust PCI expansion ROM (rust_payload.bin)
 make run-i386-bios-rom-pxe       # Legacy BIOS option ROM + PXE (second NIC with iPXE ROM)
 make run-x86_64-uefi             # x86_64 UEFI via FAT dir (e1000, full DHCP)
 make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
@@ -340,6 +336,14 @@ make run-aarch64-bare            # ARM64 bare-metal + AHCI drive
 make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
 make x86_64-seabios-clean        # Remove SeaBIOS checkout
 ```
+
+### `i386-bios-rust-rom` — Rust BIOS option ROM
+
+- Wraps `bin/rust_payload.bin` (raw 32-bit PM binary) as a legacy BIOS PCI expansion ROM via `romwrap --bios`. Produces `bin/rustrapper_bios_rust.rom` (~15 blocks / ~7.7 KB for the current payload).
+- Like the C BIOS option ROM, the 3-byte init routine at 0x34 is a no-op (`xor ax,ax; retf`). SeaBIOS acknowledges the ROM and continues to boot from the disk image.
+- The Rust payload at 0x37+ is just data — the actual Rust execution comes from the MBR → stage2 entry stub → Rust code at 0x100000 on the disk, not from the ROM.
+- The `run-i386-bios-rust-rom` target boots `bin/bios-rust.img` with the ROM loaded on an e1000 NIC via `-device e1000,romfile=...`. Useful for testing that the option ROM is correctly detected by SeaBIOS.
+- Default PCI IDs are `0x8086:0x100E` (Intel e1000). Use `romwrap --vendor=... --device=...` for custom IDs.
 
 ## Targets
 
@@ -352,7 +356,8 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 | `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
 | `i386-unknown-none` (Rust BIOS) | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
-| PCI Option ROM (BIOS)           | x86-16 | BIOS (ROM)        | `bin/rustrapper_bios.rom`        |
+| PCI Option ROM (BIOS, C)        | x86-16 | BIOS (ROM)        | `bin/rustrapper_bios.rom`        |
+| PCI Option ROM (BIOS, Rust)     | x86-32 | BIOS (ROM)        | `bin/rustrapper_bios_rust.rom`   |
 
 ## Tests
 

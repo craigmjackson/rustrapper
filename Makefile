@@ -19,7 +19,8 @@ BARE_ARM64_TARGET := aarch64-unknown-none
 
 .PHONY: all i386-bios x86_64-uefi aarch64-uefi aarch64-bare x86_64-seabios \
         run-i386-bios run-x86_64-uefi run-aarch64-uefi run-aarch64-bare clean \
-        x86_64-uefi-rom i386-bios-rom run-x86_64-uefi-rom run-i386-bios-rom run-i386-bios-rom-pxe \
+        x86_64-uefi-rom i386-bios-rom i386-bios-rust-rom \
+        run-x86_64-uefi-rom run-i386-bios-rom run-i386-bios-rust-rom run-i386-bios-rom-pxe \
         run-i386-bios-ipxe x86_64-seabios-clean i386-bios-rust run-i386-bios-rust
 
 all: i386-bios x86_64-uefi aarch64-uefi aarch64-bare
@@ -120,6 +121,15 @@ $(BIN)/rustrapper_bios.rom: $(BIN)/stage2.bin $(ROMWRAP_BIN) | $(BIN)
 
 i386-bios-rom: $(BIN)/rustrapper_bios.rom
 
+# BIOS option ROM from Rust payload: the raw 32-bit PM binary wrapped
+# as a legacy BIOS option ROM. Like the C BIOS ROM, the init routine
+# at 0x34 is a no-op (xor ax,ax; retf); the payload is just data.
+# The Rust payload itself runs from disk via the stage2 entry stub.
+$(BIN)/rustrapper_bios_rust.rom: $(BIN)/rust_payload.bin $(ROMWRAP_BIN) | $(BIN)
+	$(CARGO) run --package romwrap -- $(BIN)/rust_payload.bin $@ --bios
+
+i386-bios-rust-rom: $(BIN)/rustrapper_bios_rust.rom
+
 # ── ARM64 Bare-metal ──────────────────────────────────────────────
 $(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common -name '*.rs') \
                                 arm64-bare/link.ld Cargo.toml | $(BIN)
@@ -214,6 +224,16 @@ run-i386-bios-rom-pxe: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom $(SEABIOS_BIN)
 		-netdev user,id=net1 \
 		-device e1000,romfile=$(PXE_ROM),netdev=net1 \
 		-serial stdio -display none -m 64 -no-reboot
+
+# BIOS option ROM from Rust payload: rust_payload.bin wrapped as PCI option ROM.
+# Like run-i386-bios-rom, the init routine is a no-op; the ROM just carries
+# the Rust payload as data. The Rust code actually runs from disk via the
+# stage2 entry stub loaded by the MBR.
+run-i386-bios-rust-rom: $(BIN)/bios-rust.img $(BIN)/rustrapper_bios_rust.rom
+	qemu-system-x86_64 -drive file=$(BIN)/bios-rust.img,format=raw \
+		-netdev user,id=net0 \
+		-device e1000,romfile=$(BIN)/rustrapper_bios_rust.rom,netdev=net0 \
+		-nographic
 
 run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi
 	mkdir -p EFI/BOOT
