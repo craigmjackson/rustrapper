@@ -983,7 +983,7 @@ fn scan_pci_io_handle(
     e1000_init_and_dhcp(con_out, bar0)
 }
 
-// ─── SNP-based network scan (original) ───
+// ─── SNP-based network scan ───
 
 fn dhcp_run(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,

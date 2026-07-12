@@ -2,12 +2,12 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A hybrid BIOS/UEFI bootloader that scans storage devices and network adapters —
-written in Rust, with 16‑bit BIOS stages retained in C/NASM and an experimental
-32‑bit Rust BIOS stage2.
+A hybrid BIOS/UEFI bootloader written entirely in Rust. Scans storage devices
+and network adapters from a boot menu.
 
 Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications,
-ARM64 bare-metal binaries, and PCI expansion ROMs.
+ARM64 bare-metal binaries, and PCI expansion ROMs. The only non-Rust code is
+a tiny 16-bit MBR and protected-mode entry stub in NASM (~1 KB total).
 
 ## Features
 
@@ -26,9 +26,9 @@ ARM64 bare-metal binaries, and PCI expansion ROMs.
 rustup target add x86_64-unknown-uefi aarch64-unknown-uefi aarch64-unknown-none
 
 # Install system dependencies
-# Arch:  pacman -S nasm gcc mtools dosfstools qemu-system-x86 qemu-system-aarch64
-# Debian: apt install nasm gcc mtools dosfstools qemu-system-x86 qemu-system-arm
-# Fedora: dnf install nasm gcc mtools dosfstools qemu-system-x86 qemu-system-arm
+# Arch:  pacman -S nasm mtools dosfstools qemu-system-x86 qemu-system-aarch64
+# Debian: apt install nasm mtools dosfstools qemu-system-x86 qemu-system-arm
+# Fedora: dnf install nasm mtools dosfstools qemu-system-x86 qemu-system-arm
 
 make all                          # Build everything
 make run-x86_64-uefi              # x86_64 UEFI in QEMU (e1000 NIC, full DHCP)
@@ -122,5 +122,5 @@ cargo test --workspace   # 107 tests across all crates
 
 - **Rust** with targets: `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
 - **Rust nightly** for the `i386-bios` target (needs `-Zjson-target-spec` and `-Zbuild-std=core`)
-- **BIOS**: `nasm`, `gcc`, `ld` (with `elf_i386` emulation), `objcopy`
+- **BIOS**: `nasm` and `objcopy` (for assembling the MBR/entry stub and stripping the ELF to a flat binary)
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `QEMU_EFI.fd`)

@@ -131,7 +131,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 ### `bios/mbr.asm` — 16-bit MBR stage-1
 
 - 512-byte MBR that loads 16 sectors (LBA 1-16, 8192 bytes) to physical `0x1000` and jumps to `0x0100:0x0000`.
-- The DAP (Disk Address Packet) at line 69 sets the sector count to 16 (was 14 for the original C stage2).
+- The DAP (Disk Address Packet) at line 69 sets the sector count to 16. Increase this if the entry stub + payload grows past 16 sectors.
 - "MZ" at offset 0 executes as `dec bp; pop dx`, which overwrites DL (the boot-drive value). Always set DL explicitly before `int 0x13`.
 
 ### `bios/stage2_entry.nasm` — BIOS entry stub for Rust stage2
@@ -202,7 +202,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 ### `common/src/scan.rs` — Shared device scan loop
 
 - Generic loop: for `index` in `0..MAX_DEVICES`, calls an arch-specific `detect_device` callback, prints results.
-- Architecture-specific detection is provided by `detect_device` via a function pointer or trait (not yet implemented — the current C stage2 and Rust UEFI/ARM64 targets each handle scanning independently).
+- Architecture-specific detection is provided by `detect_device` via a function pointer or trait.
 
 ### `romwrap/src/main.rs` — PCI expansion ROM wrapper
 
@@ -210,7 +210,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - ROM header at offset 0: `0xAA55` signature, init vector (0x0000 for UEFI, non-zero for BIOS), size in 512-byte blocks at offset 0x04, PCIR offset at `0x18`.
 - **PCI Data Structure (PCIR)**: `"PCIR"` signature, vendor/device IDs (default `0x8086`/`0x100E` for Intel e1000), code type `0x03` (EFI) or `0x00` (PC-AT/BIOS), indicator `0x80` (last image), revision `0x00`.
 - Total header size: 52 bytes (28 B ROM header + 24 B PCIR structure).
-- For BIOS: a 3-byte entry routine (`xor ax,ax; retf` = `0x33 0xC0 0xCB`) at offset `0x34` sets CF=0 for success and returns. Init vector points to offset `0x34`. Payload (stage2.bin) follows at offset `0x37`.
+- For BIOS: a 3-byte entry routine (`xor ax,ax; retf` = `0x33 0xC0 0xCB`) at offset `0x34` sets CF=0 for success and returns. Init vector points to offset `0x34`. Payload follows at offset `0x37`.
 - For UEFI: PE/COFF binary follows headers at offset `0x34`. Init vector is 0 (not used by UEFI firmware).
 - Output is padded to the next 512-byte boundary (file size is always a multiple of 512).
 - Supports `--vendor=` and `--device=` flags for custom PCI IDs.
@@ -220,7 +220,6 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 - Top-level targets: `all`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
-- BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
 - `i386-bios` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
 - `run-i386-bios` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
 
@@ -244,7 +243,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 13. **`cli` before Rust code in protected mode**: No IDT is set up after the protected mode switch. A hardware timer interrupt with no IDT causes a triple fault. Always `cli` before calling Rust code from the entry stub.
 14. **Inline `asm!` for serial I/O**: Use separate `asm!` blocks for the LSR poll (`in al, dx`) and data output (`out dx, al`). The poll block must NOT use `options(pure)` (I/O port reads are NOT idempotent — `pure` causes the compiler to optimize the poll loop into `jmp $`). Pass the output byte via `in("al") c` — do NOT let the compiler choose the register, as `in al, dx` clobbers AL.
 15. **BSS_ZERO_SIZE must cover actual BSS**: The entry stub zeros `BSS_ZERO_SIZE` bytes after the payload. If BSS grows (e1000 descriptor rings + packet buffers ~4.3 KB), increase `BSS_ZERO_SIZE` from `0x1000` to `0x2000`. Check with `readelf -S target/i386-unknown-none/release/bios-rust | grep .bss`.
-16. **MBR sector count must match payload**: The MBR loads 16 sectors (8192 bytes) for the Rust stage2 (was 14 for the C stage2). The Rust payload + 512 B stub is ~7.8 KB = 15 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
+16. **MBR sector count must match payload**: The MBR loads 16 sectors (8192 bytes). The entry stub + Rust payload is ~7.8 KB = 15 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
 17. **PCI Bus Master must be enabled for e1000 DMA**: SeaBIOS enables Memory Space (bit 1) but may NOT enable Bus Master (bit 2) in the PCI Command register. Without Bus Master, the e1000 can read descriptors (MMIO works) but TX descriptor write-back (DMA) silently fails — TDH advances but the status DD bit is never set. `pci_enable_bars` must always set command bits 0-2 (I/O + Memory + Bus Master), even if some are already set. Do NOT re-assign BARs if firmware already assigned them (check if BAR0 is non-zero before sizing).
 
 ### MBR
@@ -329,7 +328,7 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 | `aarch64-unknown-uefi`          | ARM64  | UEFI              | `bin/rustrapper_arm64.efi`         |
 | `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/rustrapper_arm64_bare.elf`    |
 | `x86_64-linux-gnu` (romwrap)    | Host   | —                 | `target/debug/romwrap`           |
-| `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
+| `i386-unknown-none` (BIOS)      | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | `i386-unknown-none` (Rust BIOS) | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
 | PCI Option ROM (BIOS, C)        | x86-16 | BIOS (ROM)        | `bin/rustrapper_bios.rom`        |
@@ -362,5 +361,5 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 
 - **Rust**: `rustc`, `cargo` with targets `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
 - **Rust nightly**: needed for `i386-bios` target (`-Zjson-target-spec -Zbuild-std=core`)
-- **BIOS (C/NASM)**: `gcc`, `ld` (`-m elf_i386`), `nasm`, `objcopy`
+- **BIOS**: `nasm` (assembles the MBR and entry stub), `objcopy` (strips the Rust ELF to a flat binary)
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `/usr/share/edk2/aarch64/QEMU_EFI.fd`)
