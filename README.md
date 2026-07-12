@@ -11,7 +11,7 @@ a tiny 16-bit MBR and protected-mode entry stub in NASM (~1 KB total).
 
 ## Features
 
-- **BIOS** — 16‑bit MBR + 32-bit Rust stage2 (nightly): menu, PCI storage scan, e1000 MMIO DHCP
+- **BIOS** — 16‑bit MBR + 32-bit Rust stage2: menu, PCI storage scan, e1000 MMIO DHCP
 - **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, storage scan
 - **UEFI option ROM** — PCI expansion ROM with direct e1000 MMIO driver (no UEFI protocols needed during DXE)
 - **ARM64 UEFI** — Same Rust code compiled for `aarch64-unknown-uefi`
@@ -37,14 +37,14 @@ make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
 
 ## Build Targets
 
-| Target | Binary | Description |
-|--------|--------|-------------|
-| `make i386-bios` | `bin/rust_payload.bin`, `bin/stage2_entry.bin` | 32‑bit BIOS stage2 (nightly only) |
-| `make x86_64-uefi` | `bin/rustrapper.efi` | x86_64 UEFI application |
-| `make aarch64-uefi` | `bin/rustrapper_arm64.efi` | ARM64 UEFI application |
-| `make aarch64-bare` | `bin/rustrapper_arm64_bare.elf` | ARM64 bare‑metal |
-| `make x86_64-uefi-rom` | `bin/rustrapper_efi.rom` | PCI expansion ROM (UEFI option ROM) |
-| `make i386-bios-rom` | `bin/rustrapper_bios.rom` | PCI expansion ROM (BIOS option ROM) |
+| Target                 | Binary                                         | Description                         |
+| ---------------------- | ---------------------------------------------- | ----------------------------------- |
+| `make i386-bios`       | `bin/rust_payload.bin`, `bin/stage2_entry.bin` | 32‑bit BIOS stage2                  |
+| `make x86_64-uefi`     | `bin/rustrapper.efi`                           | x86_64 UEFI application             |
+| `make aarch64-uefi`    | `bin/rustrapper_arm64.efi`                     | ARM64 UEFI application              |
+| `make aarch64-bare`    | `bin/rustrapper_arm64_bare.elf`                | ARM64 bare‑metal                    |
+| `make x86_64-uefi-rom` | `bin/rustrapper_efi.rom`                       | PCI expansion ROM (UEFI option ROM) |
+| `make i386-bios-rom`   | `bin/rustrapper_bios.rom`                      | PCI expansion ROM (BIOS option ROM) |
 
 ## Run in QEMU
 
@@ -61,13 +61,13 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 
 ## Network Support
 
-| Target | NIC | Method | DHCP |
-|--------|-----|--------|------|
-| BIOS Rust stage2 (disk) | e1000 | PCI I/O ports + MMIO | Full DHCP (DISCOVER→OFFER) |
-| BIOS (option ROM) | e1000 | PCI option ROM with PCIR header | e1000 I/O BAR driver (real hardware only) |
-| x86_64 UEFI (disk) | e1000 | SNP protocol | Full DHCP (DISCOVER/OFFER/REQUEST/ACK) |
-| x86_64 UEFI (option ROM) | e1000 | Direct MMIO + I/O port PCI scan | Full DHCP (DISCOVER→OFFER) |
-| ARM64 UEFI | virtio-net-pci | SNP protocol | Single-transmit DHCP (DISCOVER→OFFER) |
+| Target                   | NIC            | Method                          | DHCP                                      |
+| ------------------------ | -------------- | ------------------------------- | ----------------------------------------- |
+| BIOS Rust stage2 (disk)  | e1000          | PCI I/O ports + MMIO            | Full DHCP (DISCOVER→OFFER)                |
+| BIOS (option ROM)        | e1000          | PCI option ROM with PCIR header | e1000 I/O BAR driver (real hardware only) |
+| x86_64 UEFI (disk)       | e1000          | SNP protocol                    | Full DHCP (DISCOVER/OFFER/REQUEST/ACK)    |
+| x86_64 UEFI (option ROM) | e1000          | Direct MMIO + I/O port PCI scan | Full DHCP (DISCOVER→OFFER)                |
+| ARM64 UEFI               | virtio-net-pci | SNP protocol                    | Single-transmit DHCP (DISCOVER→OFFER)     |
 
 ## Project Structure
 
@@ -75,7 +75,7 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 ├── bios/               # Minimal NASM for BIOS boot
 │   ├── mbr.asm         # 512‑byte MBR stage‑1
 │   └── stage2_entry.nasm # Entry stub for Rust stage2 (A20, protected mode, payload copy)
-├── bios-rust/          # Rust 32-bit BIOS stage2 (nightly)
+├── bios-rust/          # Rust 32-bit BIOS stage2
 │   ├── Cargo.toml
 │   ├── link.ld         # Link at 0x100000
 │   ├── targets/i386-unknown-none.json
@@ -111,16 +111,15 @@ All crates are host‑testable — platform‑specific code is guarded with `#[c
 cargo test --workspace   # 107 tests across all crates
 ```
 
-| Crate | Tests | What's Tested |
-|-------|-------|---------------|
-| `common` | 29 | Hex/decimal formatting, device info, scan loop with mocks |
-| `uefi` | 24 | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol, DHCP frame parsing |
-| `arm64-bare` | 21 | PCI offset encoding, storage subclass naming |
-| `romwrap` | 33 | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases |
+| Crate        | Tests | What's Tested                                                                                |
+| ------------ | ----- | -------------------------------------------------------------------------------------------- |
+| `common`     | 29    | Hex/decimal formatting, device info, scan loop with mocks                                    |
+| `uefi`       | 24    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol, DHCP frame parsing |
+| `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
+| `romwrap`    | 33    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |
 
 ## Requirements
 
-- **Rust** with targets: `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
-- **Rust nightly** for the `i386-bios` target (needs `-Zjson-target-spec` and `-Zbuild-std=core`)
+- **Rust** with targets: `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`, `i386-bios` (needs `-Zjson-target-spec` and `-Zbuild-std=core`)
 - **BIOS**: `nasm` and `objcopy` (for assembling the MBR/entry stub and stripping the ELF to a flat binary)
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `QEMU_EFI.fd`)
