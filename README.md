@@ -5,9 +5,8 @@
 A hybrid BIOS/UEFI bootloader that scans storage devices and network adapters —
 written in Rust, with 16‑bit BIOS stages retained in C/NASM.
 
-Produces a single `bootloader.combined` disk image that boots under legacy BIOS
-and x86_64 UEFI, plus standalone ARM64 UEFI and ARM64 bare‑metal binaries. Also
-produces a PCI expansion ROM (`rustrapper_efi.rom`) for use as a UEFI option ROM.
+Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications,
+ARM64 bare-metal binaries, and PCI expansion ROMs.
 
 ## Features
 
@@ -17,7 +16,6 @@ produces a PCI expansion ROM (`rustrapper_efi.rom`) for use as a UEFI option ROM
 - **UEFI option ROM** — PCI expansion ROM with direct e1000 MMIO driver (no UEFI protocols needed during DXE)
 - **ARM64 UEFI** — Same Rust code compiled for `aarch64-unknown-uefi`
 - **ARM64 bare‑metal** — No firmware: PL011 UART, PCI ECAM walk, AHCI probe
-- **Disk image builder** — Rust CLI tool assembles MBR + stage2 + FAT32 ESP
 - **ROM wrapper** — Rust CLI tool wraps PE/COFF into UEFI PCI option ROM (`--bios` for BIOS option ROM)
 
 ## Quick Start
@@ -44,7 +42,6 @@ make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
 | `make x86_64-uefi` | `bin/rustrapper.efi` | x86_64 UEFI application |
 | `make aarch64-uefi` | `bin/rustrapper_arm64.efi` | ARM64 UEFI application |
 | `make aarch64-bare` | `bin/rustrapper_arm64_bare.elf` | ARM64 bare‑metal |
-| `make i386-bios-x86_64-uefi` | `bin/bootloader.combined` | Hybrid disk image (64 MB) |
 | `make x86_64-uefi-rom` | `bin/rustrapper_efi.rom` | PCI expansion ROM (UEFI option ROM) |
 | `make i386-bios-rom` | `bin/rustrapper_bios.rom` | PCI expansion ROM (BIOS option ROM) |
 | `make x86_64-seabios` | `build/seabios/out/bios.bin` | Custom SeaBIOS (auto-cloned) |
@@ -75,14 +72,6 @@ make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 | x86_64 UEFI (option ROM) | e1000 | Direct MMIO + I/O port PCI scan | Full DHCP (DISCOVER→OFFER) |
 | ARM64 UEFI | virtio-net-pci | SNP protocol | Single-transmit DHCP (DISCOVER→OFFER) |
 
-## Disk Image Layout
-
-```
-LBA 0:      MBR (512 bytes) with partition table at 0x1BE
-LBA 1–14:   Stage-2 (up to 7168 bytes), loaded by MBR to 0x1000
-LBA 15+:    FAT32 ESP containing EFI/BOOT/BOOTX64.EFI
-```
-
 ## Project Structure
 
 ```
@@ -106,7 +95,6 @@ LBA 15+:    FAT32 ESP containing EFI/BOOT/BOOTX64.EFI
 │       ├── uart.rs     # PL011 UART driver
 │       ├── net.rs      # e1000 MMIO driver + DHCP client (no firmware)
 │       └── main.rs     # global_asm! entry, UART/PCI init
-├── disk-image/         # CLI tool: assembles combined disk image
 ├── romwrap/            # CLI tool: wraps PE/COFF into PCI option ROM
 ├── Makefile            # Build orchestration
 └── AGENTS.md           # Full development reference & gotchas
@@ -117,7 +105,7 @@ LBA 15+:    FAT32 ESP containing EFI/BOOT/BOOTX64.EFI
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 121 tests across all crates
+cargo test --workspace   # 107 tests across all crates
 ```
 
 | Crate | Tests | What's Tested |
@@ -125,12 +113,10 @@ cargo test --workspace   # 121 tests across all crates
 | `common` | 29 | Hex/decimal formatting, device info, scan loop with mocks |
 | `uefi` | 24 | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol, DHCP frame parsing |
 | `arm64-bare` | 21 | PCI offset encoding, storage subclass naming |
-| `disk-image` | 14 | CHS geometry, MBR partition entries, size invariants |
 | `romwrap` | 33 | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases |
 
 ## Requirements
 
 - **Rust** with targets: `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
 - **BIOS**: `nasm`, `gcc`, `ld` (with `elf_i386` emulation), `objcopy`
-- **Disk image**: `mkfs.fat`, `mmd`, `mcopy` (dosfstools + mtools)
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `QEMU_EFI.fd`)

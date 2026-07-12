@@ -1,5 +1,5 @@
 # Rustrapper - Rust Bootloader
-# Targets: all, i386-bios, x86_64-uefi, aarch64-uefi, aarch64-bare, i386-bios-x86_64-uefi
+# Targets: all, i386-bios, x86_64-uefi, aarch64-uefi, aarch64-bare
 # Uses cargo for Rust crates, nasm+gcc for legacy BIOS parts
 
 CARGO    := cargo
@@ -17,12 +17,12 @@ UEFI_ARM64_TARGET := aarch64-unknown-uefi
 # ARM64 bare-metal target
 BARE_ARM64_TARGET := aarch64-unknown-none
 
-.PHONY: all i386-bios x86_64-uefi aarch64-uefi aarch64-bare i386-bios-x86_64-uefi x86_64-seabios \
+.PHONY: all i386-bios x86_64-uefi aarch64-uefi aarch64-bare x86_64-seabios \
         run-i386-bios run-x86_64-uefi run-aarch64-uefi run-aarch64-bare clean \
         x86_64-uefi-rom i386-bios-rom run-x86_64-uefi-rom run-i386-bios-rom run-i386-bios-rom-pxe \
         run-i386-bios-ipxe x86_64-seabios-clean
 
-all: i386-bios-x86_64-uefi aarch64-uefi aarch64-bare
+all: i386-bios x86_64-uefi aarch64-uefi aarch64-bare
 
 # Create output directory
 $(BIN):
@@ -107,18 +107,11 @@ $(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common -name '*.rs') \
 
 aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf
 
-# ── Combined disk image ──────────────────────────────────────────
-DISK_IMAGE_BIN := target/debug/disk-image
-
-$(DISK_IMAGE_BIN): $(shell find disk-image -name '*.rs') Cargo.toml
-	$(CARGO) build --package disk-image
-
-$(BIN)/bootloader.combined: $(BIN)/bios.bin $(BIN)/stage2.bin \
-                            $(BIN)/rustrapper.efi $(DISK_IMAGE_BIN) | $(BIN)
-	$(CARGO) run --package disk-image -- \
-		$(BIN)/bios.bin $(BIN)/stage2.bin $(BIN)/rustrapper.efi $@
-
-i386-bios-x86_64-uefi: $(BIN)/bootloader.combined
+# ── BIOS disk image (MBR + stage2, no FAT32) ─────────────────────
+$(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2.bin | $(BIN)
+	dd if=/dev/zero bs=1M count=64 of=$@ 2>/dev/null
+	dd if=$(BIN)/bios.bin of=$@ conv=notrunc 2>/dev/null
+	dd if=$(BIN)/stage2.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
 
 # ── SeaBIOS (custom build with PXE stack kept) ──────────────────
 SEABIOS_DIR := build/seabios
@@ -138,26 +131,30 @@ x86_64-seabios: $(SEABIOS_BIN)
 # ── Run targets ──────────────────────────────────────────────────
 # BIOS e1000 direct driver doesn't work on QEMU due to stub I/O BAR (see AGENTS.md).
 # Use run-x86_64-uefi for QEMU testing, or real hardware for BIOS e1000.
-run-i386-bios: $(BIN)/bootloader.combined
+run-i386-bios: $(BIN)/bios.img
 	@echo "Note: BIOS e1000 driver requires real hardware (QEMU I/O BAR is a stub)."
 	@echo "      Use run-x86_64-uefi for QEMU testing, or run-i386-bios-ipxe with custom SeaBIOS."
-	qemu-system-x86_64 -drive file=$<,format=raw -nic user,model=e1000 -nographic
+	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw -nic user,model=e1000 -nographic
 
 # BIOS PXE test with custom iPXE ROM (requires custom SeaBIOS built by the
 # 'x86_64-seabios' target to keep the PXE/UNDI INT 1Ah handler resident).
-run-i386-bios-ipxe: $(BIN)/bootloader.combined $(SEABIOS_BIN)
-	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$<,format=raw \
+run-i386-bios-ipxe: $(BIN)/bios.img $(SEABIOS_BIN)
+	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$(BIN)/bios.img,format=raw \
 		-netdev user,id=net0 \
 		-device e1000,romfile=/tmp/ipxe/src/bin/8086100e.rom,netdev=net0 \
 		-serial stdio -display none -m 64 -no-reboot
 
-run-x86_64-uefi: $(BIN)/bootloader.combined
+run-x86_64-uefi: $(BIN)/rustrapper.efi
+	mkdir -p EFI/BOOT
+	cp $(BIN)/rustrapper.efi EFI/BOOT/BOOTX64.EFI
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=$<,format=raw -nic user,model=e1000 -nographic
+		-drive file=fat:rw:.,format=raw -nic user,model=e1000 -nographic
 
-run-x86_64-uefi-rom: $(BIN)/bootloader.combined $(BIN)/rustrapper_efi.rom
+run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom
+	mkdir -p EFI/BOOT
+	cp $(BIN)/rustrapper.efi EFI/BOOT/BOOTX64.EFI
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=$(BIN)/bootloader.combined,format=raw \
+		-drive file=fat:rw:.,format=raw \
 		-netdev user,id=net0 \
 		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0 \
 		-nographic
@@ -172,15 +169,15 @@ run-x86_64-uefi-rom: $(BIN)/bootloader.combined $(BIN)/rustrapper_efi.rom
 #   make run-i386-bios-rom         — uses stock SeaBIOS, no PXE (no networking)
 #   make run-i386-bios-rom-pxe     — uses custom SeaBIOS + iPXE ROM on 2nd NIC
 PXE_ROM ?= /tmp/ipxe/src/bin/8086100e.rom
-run-i386-bios-rom: $(BIN)/bootloader.combined $(BIN)/rustrapper_bios.rom
-	qemu-system-x86_64 -drive file=$(BIN)/bootloader.combined,format=raw \
+run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom
+	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw \
 		-netdev user,id=net0 \
 		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0 \
 		-nographic
 
-run-i386-bios-rom-pxe: $(BIN)/bootloader.combined $(BIN)/rustrapper_bios.rom $(SEABIOS_BIN)
-	@test -f $(PXE_ROM) || { echo "Error: $(PXE_ROM) not found. Build iPXE first (see Makefile comments)."; exit 1; }
-	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$(BIN)/bootloader.combined,format=raw \
+run-i386-bios-rom-pxe: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom $(SEABIOS_BIN)
+	@test -f $(PXE_ROM) || { echo "Error: $(PXE_ROM) not found. Build iPXE first (see Makefile comments."; exit 1; }
+	qemu-system-x86_64 -bios $(SEABIOS_BIN) -drive file=$(BIN)/bios.img,format=raw \
 		-netdev user,id=net0 \
 		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0 \
 		-netdev user,id=net1 \

@@ -4,7 +4,6 @@ members = [
     "common",
     "uefi",
     "arm64-bare",
-    "disk-image",
     "romwrap",
 ]
 

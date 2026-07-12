@@ -2,15 +2,7 @@
 
 ## Overview
 
-Produces a single `bootloader.combined` disk image bootable under legacy BIOS and x86_64 UEFI, plus standalone ARM64 EFI and ARM64 bare-metal binaries. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP).
-
-## Layout (bootloader.combined, 64 MB disk image)
-
-| LBA | Offset   | Content                                                             |
-| --- | -------- | ------------------------------------------------------------------- |
-| 0   | `0x000`  | MBR (`bios.bin`, 512 bytes) with partition table at `0x1BE`         |
-| 1–14| `0x200`  | Stage-2 (`stage2.bin`, up to 7168 bytes), loaded by MBR to `0x1000` |
-| 15+ | `0x1E00` | FAT32 ESP containing `EFI/BOOT/BOOTX64.EFI`                         |
+Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, and PCI expansion ROMs. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP).
 
 ## Directory Structure
 
@@ -46,11 +38,7 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 │       ├── pci.rs          # PCI ECAM walk, BAR sizing/enable, AHCI probe
 │       ├── net.rs          # e1000 MMIO driver + DHCP client (no firmware)
 │       └── uart.rs         # PL011 UART driver
-├── disk-image/             # Rust CLI tool (disk image combiner)
-│   ├── Cargo.toml
-│   └── src/
-│       └── main.rs         # Assembles MBR + stage2 + FAT32 → combined image
-└── romwrap/                # Rust CLI tool (PCI expansion ROM wrapper)
+├── romwrap/                # Rust CLI tool (PCI expansion ROM wrapper)
     ├── Cargo.toml
     └── src/
         └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
@@ -150,13 +138,6 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 - Generic loop: for `index` in `0..MAX_DEVICES`, calls an arch-specific `detect_device` callback, prints results.
 - Architecture-specific detection is provided by `detect_device` via a function pointer or trait (not yet implemented — the current C stage2 and Rust UEFI/ARM64 targets each handle scanning independently).
 
-### `disk-image/src/main.rs` — Disk image builder
-
-- Takes `bios.bin` + `stage2.bin` + `rustrapper.efi` → `bootloader.combined`.
-- Calls `mkfs.fat -F32`, `mmd`, `mcopy` (mtools) externally via `std::process::Command`.
-- Writes MBR partition entry (type `0x0C` FAT32 LBA) at offset `0x1BE`.
-- Partition table entry format (16 bytes): `<status><chs_start[3]><type><chs_end[3]><lba_start[4]><sector_count[4]>`.
-
 ### `romwrap/src/main.rs` — PCI expansion ROM wrapper
 
 - Wraps a binary into a PCI expansion ROM container usable by UEFI firmware (OVMF) or legacy BIOS (SeaBIOS).
@@ -171,10 +152,9 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 
 ### `Makefile` — Build orchestration
 
-- Top-level targets: `all`, `i386-bios`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `i386-bios-x86_64-uefi`, `x86_64-uefi-rom`, `run-*`, `clean`.
+- Top-level targets: `all`, `i386-bios`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - BIOS targets compile from `bios/` using the same GCC+NASM flags as the original project.
-- mtools (`mmd`, `mcopy`) and `mkfs.fat` must be on `$PATH` for `make i386-bios-x86_64-uefi`.
 
 ## Key Gotchas
 
@@ -205,12 +185,6 @@ Produces a single `bootloader.combined` disk image bootable under legacy BIOS an
 20. **QEMU DTB at 0x4000_0000**: Load bare-metal binaries at `0x4020_0000` or higher to avoid overlap. Set in linker script / start.S.
 21. **`llvm-objcopy` for ARM64 ELF→binary**: Host `objcopy` cannot handle ARM64 ELF. Use `llvm-objcopy -O binary`.
 22. **`lld` required for ARM64 linking**: Host `ld` lacks `aarch64linux` emulation. Use `-fuse-ld=lld` with clang or `lld-link` for UEFI.
-
-### Disk-image
-
-23. **mtools required**: `mkfs.fat`, `mmd`, `mcopy` must be installed for FAT32 ESP creation. The Rust `disk-image` crate shells out to these tools.
-24. **Partition table format**: 16-byte entry at offset `0x1BE`: `u8 status`, `[u8; 3] chs_start`, `u8 type`, `[u8; 3] chs_end`, `u32 lba_start`, `u32 sector_count`. All little-endian.
-25. **Disk image size**: The MBR + stage2 occupy LBA 0–14. The FAT32 partition starts at LBA 15. `PARTITION_LBA=15` in disk-image/src/main.rs. Update when stage2 size changes.
 
 ### BIOS stage2 (C, retained as-is)
 
@@ -268,7 +242,6 @@ make i386-bios                   # Build MBR + stage2 (C/NASM)
 make x86_64-uefi                 # Build x86_64 UEFI binary
 make aarch64-uefi                # Build ARM64 UEFI binary
 make aarch64-bare                # Build Rust ARM64 bare-metal
-make i386-bios-x86_64-uefi       # Build combined disk image (requires mtools)
 make x86_64-uefi-rom             # Build UEFI PCI expansion ROM from rustrapper.efi
 make i386-bios-rom               # Build BIOS PCI expansion ROM from stage2.bin
 make x86_64-seabios              # Build custom SeaBIOS (auto-cloned from GitHub)
@@ -276,8 +249,8 @@ make run-i386-bios               # BIOS mode via SeaBIOS (serial output; e1000 I
 make run-i386-bios-ipxe          # BIOS PXE with custom iPXE ROM + custom SeaBIOS
 make run-i386-bios-rom           # Legacy BIOS with custom PCI expansion ROM (SeaBIOS)
 make run-i386-bios-rom-pxe       # Legacy BIOS option ROM + PXE (second NIC with iPXE ROM)
-make run-x86_64-uefi             # x86_64 UEFI from combined disk image
-make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM + combined disk
+make run-x86_64-uefi             # x86_64 UEFI via FAT dir (e1000, full DHCP)
+make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
 make run-aarch64-uefi            # ARM64 UEFI from FAT directory
 make run-aarch64-bare            # ARM64 bare-metal + AHCI drive
 make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
@@ -291,7 +264,6 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 | `x86_64-unknown-uefi`           | x86_64 | UEFI              | `bin/rustrapper.efi`               |
 | `aarch64-unknown-uefi`          | ARM64  | UEFI              | `bin/rustrapper_arm64.efi`         |
 | `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/rustrapper_arm64_bare.elf`    |
-| `x86_64-linux-gnu` (disk-image) | Host   | —                 | `target/debug/disk-image`        |
 | `x86_64-linux-gnu` (romwrap)    | Host   | —                 | `target/debug/romwrap`           |
 | `i386-none-elf` (BIOS)          | x86-16 | BIOS              | `bin/bios.bin`, `bin/stage2.bin` |
 | PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
@@ -302,11 +274,10 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 121 tests across all crates
+cargo test --workspace        # All 107 tests across all crates
 cargo test --package common   # 29 tests (formatting, scan loop)
 cargo test --package uefi     # 24 tests (type sizes, GUID values, constants, SNP mode layout, DHCP frame parsing)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
-cargo test --package disk-image  # 14 tests (CHS geometry, MBR partition entries)
 cargo test --package romwrap  # 33 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
 ```
 
@@ -315,10 +286,9 @@ cargo test --package romwrap  # 33 tests (PCIR layout, BIOS/UEFI code types, ent
 | `common` | 29 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping) |
 | `uefi`/`efi` | 24 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
 | `arm64-bare`/`pci` | 21 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 12 subclass codes including unassigned, unknown fallback) |
-| `disk-image` | 14 | `chs_from_lba` geometry (sector/head/cylinder boundaries), `build_mbr_partition` (bootable flag, type byte, LBA/sector count, CHS clamping at 1023/254/63), partition size invariants |
 | `romwrap` | 33 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`/`0x00`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, BIOS entry routine, block count consistency, PCIR length field matching, empty/boundary-aligned/overlapping payload sizes |
 
-**Test architecture**: `common`/`disk-image` tests run directly on the host. `uefi` tests run on the host by guarding platform-specific code with `#[cfg(not(test))]` and using `#[cfg_attr(not(test), no_std)]` / `#[cfg_attr(not(test), no_main)]` so the standard test harness can drive them. `arm64-bare` tests similarly guard the ARM64 `global_asm!` entry point and the `extern "C" fn main` behind `#[cfg(not(test))]`, exposing only pure functions (`pci_off`, `storage_name`) for host testing.
+**Test architecture**: `common` tests run directly on the host. `uefi` tests run on the host by guarding platform-specific code with `#[cfg(not(test))]` and using `#[cfg_attr(not(test), no_std)]` / `#[cfg_attr(not(test), no_main)]` so the standard test harness can drive them. `arm64-bare` tests similarly guard the ARM64 `global_asm!` entry point and the `extern "C" fn main` behind `#[cfg(not(test))]`, exposing only pure functions (`pci_off`, `storage_name`) for host testing.
 
 The `print` module separates formatting from I/O: `format_hex`/`format_dec` write to caller-provided byte buffers and return `&str`, while `print_hex`/`print_dec` call `puts` through the global `PUTC_FN` callback. Tests exercise the pure formatting functions directly, avoiding the `static mut` callback.
 
@@ -326,5 +296,4 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 
 - **Rust**: `rustc`, `cargo` with targets `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`
 - **BIOS (C/NASM)**: `gcc`, `ld` (`-m elf_i386`), `nasm`, `objcopy`
-- **Common**: `mkfs.fat`, `mmd`, `mcopy` (dosfstools + mtools)
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `/usr/share/edk2/aarch64/QEMU_EFI.fd`)
