@@ -75,6 +75,13 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 ├── bios/               # Minimal NASM for BIOS boot
 │   ├── mbr.asm         # 512‑byte MBR stage‑1
 │   └── stage2_entry.nasm # Entry stub for Rust stage2 (A20, protected mode, payload copy)
+├── common/             # no_std Rust library (print, scan, menu, e1000, dhcp)
+│   └── src/
+│       ├── menu.rs     # Shared [1]/[2] menu logic
+│       ├── print.rs    # Callback-based print (putc/puts/print_hex/print_dec)
+│       ├── scan.rs     # Generic device-scan loop
+│       ├── e1000.rs    # Direct MMIO e1000 driver (init/send/recv) — shared by all targets
+│       └── dhcp.rs     # DHCP frame build/parse, IP checksum, DhcpConfig
 ├── bios-rust/          # Rust 32-bit BIOS stage2
 │   ├── Cargo.toml
 │   ├── link.ld         # Link at 0x100000
@@ -84,19 +91,18 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 │       ├── serial.rs   # COM1 driver (putc, getc, flush)
 │       ├── vga.rs      # VGA text-mode driver with scrolling
 │       ├── pci.rs      # PCI scan via I/O ports 0xCF8/0xCFC
-│       └── net.rs      # e1000 MMIO driver + DHCP (adapted from arm64-bare)
-├── common/             # no_std Rust library (print, scan, menu)
+│       └── net.rs      # PCI + e1000 scan, DHCP (thin wrapper over common)
 ├── uefi/               # Rust UEFI binary (x86_64 + ARM64)
 │   └── src/
 │       ├── efi.rs      # Hand-typed EFI types, GUIDs, function offsets
 │       ├── scan.rs     # Storage device enumeration
-│       ├── net.rs      # SNP + direct e1000 DHCP client
+│       ├── net.rs      # SNP + direct e1000 DHCP client (uses common e1000/dhcp)
 │       └── main.rs     # efi_main entry point
 ├── arm64-bare/         # Rust ARM64 bare‑metal binary
 │   └── src/
 │       ├── pci.rs      # PCI ECAM walk, BAR sizing, AHCI probe
 │       ├── uart.rs     # PL011 UART driver
-│       ├── net.rs      # e1000 MMIO driver + DHCP client (no firmware)
+│       ├── net.rs      # PCI + e1000 scan, DHCP (thin wrapper over common)
 │       └── main.rs     # global_asm! entry, UART/PCI init
 ├── romwrap/            # CLI tool: wraps PE/COFF into PCI option ROM
 ├── Makefile            # Build orchestration
@@ -108,13 +114,13 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 107 tests across all crates
+cargo test --workspace   # 122 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
-| `common`     | 29    | Hex/decimal formatting, device info, scan loop with mocks                                    |
-| `uefi`       | 24    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol, DHCP frame parsing |
+| `common`     | 44    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse                 |
+| `uefi`       | 24    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 33    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |
 

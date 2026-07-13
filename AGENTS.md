@@ -23,27 +23,29 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │       ├── serial.rs       # COM1 driver (putc, getc, flush)
 │       ├── vga.rs          # VGA text-mode driver with scrolling
 │       ├── pci.rs          # PCI scan via I/O ports 0xCF8/0xCFC
-│       └── net.rs          # e1000 MMIO driver + DHCP (adapted from arm64-bare)
-├── common/                 # Rust no_std library
+│       └── net.rs          # PCI + e1000 scan, DHCP (thin wrapper over common)
+├── common/                 # Rust no_std library (shared by all targets)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
 │       ├── menu.rs         # Shared [1]/[2] menu logic
 │       ├── print.rs        # Callback-based print (putc/puts/print_hex/print_dec)
-│       └── scan.rs         # Generic device-scan loop
+│       ├── scan.rs         # Generic device-scan loop
+│       ├── e1000.rs        # Direct MMIO e1000 driver (init/send/recv) — used by all 3 targets
+│       └── dhcp.rs         # DHCP frame build/parse, IP checksum, DhcpConfig
 ├── uefi/                   # Rust UEFI binary (x86_64 + ARM64)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs         # efi_main entry point
 │       ├── efi.rs          # Hand-typed EFI types, GUIDs, Boot Services offsets
 │       ├── scan.rs         # UEFI device scan (LocateHandleBuffer + OpenProtocol)
-│       └── net.rs          # DHCP, SNP send/receive, IP/ARP parsing
+│       └── net.rs          # SNP + 4-tier e1000 DHCP (uses common::e1000 + common::dhcp)
 ├── arm64-bare/             # Rust ARM64 bare-metal binary (no firmware)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs         # Entry (global_asm! start), UART init, PCI scan
 │       ├── pci.rs          # PCI ECAM walk, BAR sizing/enable, AHCI probe
-│       ├── net.rs          # e1000 MMIO driver + DHCP client (no firmware)
+│       ├── net.rs          # PCI + e1000 scan, DHCP (thin wrapper over common)
 │       └── uart.rs         # PL011 UART driver
 ├── romwrap/                # Rust CLI tool (PCI expansion ROM wrapper)
     ├── Cargo.toml
@@ -84,16 +86,15 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ### `uefi/src/net.rs` — UEFI network scan and DHCP
 
+- DHCP frame build/parse and the direct MMIO e1000 driver live in `common::e1000` and `common::dhcp` (shared with BIOS and ARM64 bare-metal). This file contains only the UEFI-specific glue.
 - `print_network_info` was removed (dead code). All NIC detection uses `scan_e1000_devices` with a 4-tier fallback chain.
 - `pci_read_config32` is cross-platform: x86_64 uses I/O ports (`outl`/`inl` at `0xCF8`/`0xCFC`); ARM64 uses ECAM MMIO at `0x4010_0000_0000`.
-- `e1000_init_and_dhcp` initializes e1000 and runs DHCP via `DirectMmioE1000` (previously a stub that only printed and returned None).
-- `DirectMmioE1000` is the only e1000 driver used; `PciIoHandle` and `scan_root_bridge` were removed (dead code).
+- `DirectMmioE1000` is a thin wrapper around `common::e1000` (~30 lines): `init()` calls `common::e1000::init`, `send()` calls `common::e1000::send`, `dhcp_run()` builds the DISCOVER via `common::dhcp::build_discover`, sends, receives via `common::e1000::try_receive`, and parses via `common::dhcp::parse_response`. The output adapter for `con_out` lives in `print_mac`/`print_ip`/`w16`/`put_dec` helpers.
 - SNP driver start: accepts both `EFI_SUCCESS`, `EFI_ALREADY_STARTED`, and the ARM64 firmware's error-bit-encoded variant (`0x8000000000000014`). ARM64 virtio SNP returns the latter.
 - SNP initialize: failure is non-fatal. ARM64 virtio SNP returns `EFI_UNSUPPORTED` (with error bit).
-- `dhcp_run` sends a single DHCPDISCOVER and waits for an OFFER — the ARM64 virtio SNP only supports one transmit per session (no buffer recycling without `Initialize`). x86_64 e1000 works normally with full DISCOVER→OFFER→REQUEST→ACK.
-- `send_udp_dhcp` builds Ethernet/IP/UDP/DHCP frame from scratch and calls `SNP.Transmit`.
+- `send_udp_dhcp` builds the Ethernet/IP/UDP/DHCP frame via `common::dhcp::build_eth_ip_udp` and calls `SNP.Transmit`.
 - `try_receive` calls `SNP.Receive` with non-null `SrcAddr`, `DestAddr`, and `Protocol` output pointers; some firmware requires them.
-- `parse_dhcp_response` validates IP/UDP headers, DHCP magic cookie, transaction ID, MAC match, and extracts IP/subnet/gateway from DHCP options.
+- The ARM64 virtio SNP only supports one transmit per session (no buffer recycling without `Initialize`), so `send_udp_dhcp` sends one DHCPDISCOVER and accepts the OFFER as final. x86_64 e1000 works normally with full DISCOVER→OFFER→REQUEST→ACK.
 
 ### `arm64-bare/src/main.rs` — ARM64 bare-metal entry
 
@@ -106,14 +107,22 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ### `arm64-bare/src/net.rs` — ARM64 bare-metal e1000 NIC + DHCP
 
-- Direct MMIO driver for the Intel 82540EM (`e1000`) emulated NIC — no firmware/UEFI involved, unlike the UEFI DHCP path in `uefi/src/net.rs`.
+- Thin wrapper around `common::e1000` and `common::dhcp`. All e1000 register access, descriptor ring setup, and DHCP frame build/parse are in `common/`; this file only handles the PCI scan, output, and glue.
+- `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the PL011 UART.
+- `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
+- `print_mac` and `print_ip` are tiny local helpers that format MAC/IP to the global print sink.
+- Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
+
+### e1000 / DHCP details (shared `common::e1000` and `common::dhcp`)
+
+The following details apply to the common e1000 driver used by all three targets (BIOS, ARM64, UEFI DirectMmioE1000):
+
 - Descriptor rings (`RxDescs`/`TxDescs`) are `#[repr(align(16))]` wrapper structs around `#[repr(C, packed)]` descriptor arrays; QEMU's e1000 requires 16-byte-aligned ring base addresses for `RDBAL`/`TDBAL`.
 - **`RDLEN`/`TDLEN` minimum is 128 bytes** on QEMU's e1000 model — rings smaller than 8 descriptors (16 bytes each) are silently rejected (register reads back as the last valid value, not what was written).
 - **`RDT` must be set to `NUM_RX_DESC - 1` after init**, not `0`. `RDH == RDT` means zero descriptors are owned by hardware (empty ring) — a very easy off-by-one that results in silently receiving nothing.
 - All RX descriptors point at a single shared `RX_BUF` (2048 bytes); fine for the single in-flight DHCP transaction this driver performs, but would corrupt data under concurrent multi-packet traffic.
 - DHCP RX polling must be RAM-only status checks (`RX_DESCS.0[idx].status & RX_STATUS_DD`), not MMIO register polling (`reg_read32(base, REG_RDH)`) in a tight loop — repeated MMIO reads under QEMU TCG are drastically slower than cached RAM reads and can make a poll loop take far longer than intended for the same iteration count.
 - The RX poll loop needs roughly 100 million iterations (~1 second of wall time) for QEMU's slirp (`-nic user`) DHCP server to respond; smaller counts (e.g. 2 million, ~0.1s) reliably miss the OFFER even though the packet is delivered on the wire (verified with `-object filter-dump,netdev=net0,file=...` producing a valid pcap showing both DISCOVER and OFFER).
-- Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
 
 ### `arm64-bare/src/pci.rs` — PCI/AHCI probe
 
@@ -169,12 +178,10 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ### `bios-rust/src/net.rs` — BIOS Rust e1000 NIC + DHCP
 
-- Direct MMIO driver for the Intel 82540EM (`e1000`) emulated NIC — same logic as `arm64-bare/src/net.rs` but using `u32` addresses instead of `u64` (32-bit target).
-- Uses `core::ptr::read_volatile`/`write_volatile` with `&raw const`/`&raw mut` for packed struct descriptor field access (avoiding "reference to field of packed struct is unaligned" errors).
-- `e1000_init` resets NIC, reads MAC, sets up RX/TX descriptor rings, enables RCTL/TCTL. Explicitly writes `REG_RDBAH`/`REG_TDBAH` to 0 (high 32 bits of ring base address).
-- `e1000_send` copies frame to TX_BUF, fills TX descriptor with EOP|IFCS|RS, rings TDT, polls status DD bit via `read_volatile`.
-- `dhcp_run` sends a single DHCPDISCOVER and polls for OFFER (100M iterations, ~1 second).
-- `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, inits e1000, runs DHCP, prints IP/subnet/gateway.
+- Thin wrapper around `common::e1000` and `common::dhcp`. All e1000 register access, descriptor ring setup, and DHCP frame build/parse are in `common/`; this file only handles the PCI scan, output, and glue.
+- `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the global print sink (serial + VGA).
+- `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
+- `print_mac` and `print_ip` are tiny local helpers (12 and 9 lines) that format MAC/IP to the global print sink.
 
 ### `bios-rust/src/serial.rs` — BIOS Rust serial driver
 
@@ -203,6 +210,24 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 - Generic loop: for `index` in `0..MAX_DEVICES`, calls an arch-specific `detect_device` callback, prints results.
 - Architecture-specific detection is provided by `detect_device` via a function pointer or trait.
+
+### `common/src/e1000.rs` — Direct MMIO e1000 driver (shared by all targets)
+
+- Register offsets as `u64` constants (`REG_CTRL`, `REG_STATUS`, `REG_RDBAL`, etc.) — works on both 32-bit and 64-bit targets (32-bit targets cast the BAR0 `u32` to `u64` at the call site).
+- `reg_read32(base, reg)`, `reg_write32(base, reg, val)` — raw MMIO via `read_volatile`/`write_volatile` on `(base + reg) as *const u32`.
+- `read_mac(base) -> [u8; 6]` — reads the MAC from the Receive Address registers.
+- `init(base) -> Option<[u8; 6]>` — reset, wait for link, set MAC, clear multicast, set up RX/TX descriptor rings and RCTL/TCTL, return MAC on success or `None` on failure.
+- `send(base, data: &[u8]) -> bool` — copy frame to `TX_BUF`, fill descriptor with `EOP|IFCS|RS`, ring TDT, poll status DD bit.
+- `try_receive(base, buf: &mut [u8; 1514], timeout_iters: u64) -> Option<usize>` — poll RX descriptors for DD, copy to `buf`, re-arm, return length.
+- Descriptor rings (`RxDescs`/`TxDescs`) are `#[repr(align(16))]` wrapper structs around `#[repr(C, packed)]` descriptor arrays; field access uses `&raw const/&raw mut` + `addr_of!` to avoid "reference to field of packed struct is unaligned" errors on all targets.
+
+### `common/src/dhcp.rs` — DHCP frame build/parse (shared by all targets)
+
+- `DhcpConfig` struct: `yiaddr`, `subnet`, `gateway` — the result of a successful DHCP exchange.
+- `ip_checksum(buf) -> u16` — standard Internet checksum (one's complement of one's complement sum of 16-bit words).
+- `build_discover(xid, mac) -> [u8; 300]` — DHCPDISCOVER payload with magic cookie 0x63825363, option 53=1 (DISCOVER), option 55=param request list (1/3/6), option 255=end.
+- `build_eth_ip_udp(mac, dhcp_payload, dhcp_len, frame) -> usize` — wraps the DHCP payload in Ethernet + IPv4 + UDP headers (including IP checksum), returns total frame length.
+- `parse_response(buf, len, xid, mac) -> Option<DhcpConfig>` — validates EtherType, IP protocol, UDP offset, magic cookie, transaction ID, MAC match, then walks options for type 53 (OFFER or ACK), type 1 (subnet), type 3 (gateway).
 
 ### `romwrap/src/main.rs` — PCI expansion ROM wrapper
 
@@ -339,9 +364,9 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 107 tests across all crates
-cargo test --package common   # 29 tests (formatting, scan loop)
-cargo test --package uefi     # 24 tests (type sizes, GUID values, constants, SNP mode layout, DHCP frame parsing)
+cargo test --workspace        # All 122 tests across all crates
+cargo test --package common   # 44 tests (formatting, scan loop, DHCP build/parse)
+cargo test --package uefi     # 24 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
 cargo test --package romwrap  # 33 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
 ```
