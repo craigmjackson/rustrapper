@@ -73,6 +73,8 @@ pub fn scan_network() {
                     print_ip(&cfg.gateway);
                 }
                 putc(b'\n');
+
+                common::netio::dns_resolve_and_print(bar0_u64, &mac, &cfg);
             }
             None => {
                 puts("FAILED\n");

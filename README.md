@@ -11,8 +11,8 @@ a tiny 16-bit MBR and protected-mode entry stub in NASM (~1 KB total).
 
 ## Features
 
-- **BIOS** — 16‑bit MBR + 32-bit Rust stage2: menu, PCI storage scan, e1000 MMIO DHCP
-- **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, storage scan
+- **BIOS** — 16‑bit MBR + 32-bit Rust stage2: menu, PCI storage scan, e1000 MMIO DHCP + DNS lookup
+- **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, ARP resolve, DNS lookup, storage scan
 - **UEFI option ROM** — PCI expansion ROM with direct e1000 MMIO driver (no UEFI protocols needed during DXE)
 - **ARM64 UEFI** — Same Rust code compiled for `aarch64-unknown-uefi`
 - **ARM64 bare‑metal** — No firmware: PL011 UART, PCI ECAM walk, AHCI probe
@@ -75,13 +75,16 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 ├── bios/               # Minimal NASM for BIOS boot
 │   ├── mbr.asm         # 512‑byte MBR stage‑1
 │   └── stage2_entry.nasm # Entry stub for Rust stage2 (A20, protected mode, payload copy)
-├── common/             # no_std Rust library (print, scan, menu, e1000, dhcp)
+├── common/             # no_std Rust library (print, scan, menu, e1000, dhcp, arp, dns, netio)
 │   └── src/
 │       ├── menu.rs     # Shared [1]/[2] menu logic
-│       ├── print.rs    # Callback-based print (putc/puts/print_hex/print_dec)
+│       ├── print.rs    # Callback-based print (putc/puts/print_hex/print_dec/print_ip)
 │       ├── scan.rs     # Generic device-scan loop
 │       ├── e1000.rs    # Direct MMIO e1000 driver (init/send/recv) — shared by all targets
-│       └── dhcp.rs     # DHCP frame build/parse, IP checksum, DhcpConfig
+│       ├── arp.rs      # ARP request build + reply parse
+│       ├── dns.rs      # DNS query build + response parse + unicast UDP frame build
+│       ├── netio.rs    # e1000 glue: ARP resolve + DNS lookup + dns_resolve_and_print
+│       └── dhcp.rs     # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server)
 ├── bios-rust/          # Rust 32-bit BIOS stage2
 │   ├── Cargo.toml
 │   ├── link.ld         # Link at 0x100000
@@ -114,12 +117,12 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 122 tests across all crates
+cargo test --workspace   # 149 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
-| `common`     | 44    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse                 |
+| `common`     | 71    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check |
 | `uefi`       | 24    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 33    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

@@ -202,6 +202,8 @@ fn scan_pci_direct(
                             if cfg.gateway == [0, 0, 0, 0] { w16(con_out, "(none)"); }
                             else { print_ip(con_out, &cfg.gateway); }
                             w16(con_out, "\r\n");
+
+                            dns_resolve_e1000(con_out, e1000.base, &mac, &cfg);
                             return Some(cfg);
                         }
                         None => {
@@ -325,6 +327,8 @@ fn e1000_init_and_dhcp(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, bar0: u64) -> Opti
     w16(con_out, ".");
     put_dec(con_out, gw_bytes[3] as u64);
     w16(con_out, "\r\n");
+
+    dns_resolve_e1000(con_out, bar0 as u64, &mac, &config);
 
     Some(config)
 }
@@ -735,6 +739,213 @@ fn try_receive(
     common::dhcp::parse_response(&frame, buffer_size as usize, xid, mac)
 }
 
+// ─── SNP-based ARP and DNS (for x86_64 UEFI with full SNP support) ───
+
+/// Restart the SNP adapter to recycle TX/RX buffers. The ARM64 virtio SNP
+/// driver doesn't support `Initialize` (returns `EFI_UNSUPPORTED`), so
+/// TX buffers are never recycled — the ring fills up after a few transmits.
+/// Calling `Stop` + `Start` + `Initialize` fully restarts the driver.
+fn restart_snp(snp: &EFI_SIMPLE_NETWORK_PROTOCOL) {
+    unsafe {
+        (snp.shutdown)(snp as *const _ as *mut _);
+        (snp.stop)(snp as *const _ as *mut _);
+        (snp.start)(snp as *const _ as *mut _);
+        (snp.initialize)(snp as *const _ as *mut _, 0, 0);
+    }
+}
+
+fn send_raw_snp(snp: &EFI_SIMPLE_NETWORK_PROTOCOL, data: &[u8]) -> bool {
+    let mut frame = [0u8; 1514];
+    let len = data.len().min(1514);
+    frame[..len].copy_from_slice(&data[..len]);
+    let st = unsafe {
+        (snp.transmit)(
+            snp as *const _ as *mut _,
+            0,
+            len as UINTN,
+            frame.as_mut_ptr() as *mut c_void,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    st == EFI_SUCCESS
+}
+
+fn try_receive_raw_snp(snp: &EFI_SIMPLE_NETWORK_PROTOCOL, buf: &mut [u8; 1514]) -> Option<usize> {
+    let mut header_size: UINTN = 0;
+    let mut buffer_size: UINTN = 1514;
+    let mut src_addr = EFI_MAC_ADDRESS { addr: [0u8; 32] };
+    let mut dst_addr = EFI_MAC_ADDRESS { addr: [0u8; 32] };
+    let mut protocol: u16 = 0;
+
+    let st = unsafe {
+        (snp.receive)(
+            snp as *const _ as *mut _,
+            &mut header_size,
+            &mut buffer_size,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut src_addr,
+            &mut dst_addr,
+            &mut protocol,
+        )
+    };
+
+    if st != EFI_SUCCESS {
+        return None;
+    }
+    Some(buffer_size as usize)
+}
+
+fn arp_resolve_snp(
+    snp: &EFI_SIMPLE_NETWORK_PROTOCOL,
+    mac: &[u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+) -> Option<[u8; 6]> {
+    let mut frame = [0u8; 1514];
+    let len = common::arp::build_request(mac, src_ip, dst_ip, &mut frame);
+    if !send_raw_snp(snp, &frame[..len]) {
+        return None;
+    }
+    let mut buf = [0u8; 1514];
+    for _ in 0..500000 {
+        if let Some(len) = try_receive_raw_snp(snp, &mut buf) {
+            if let Some(m) = common::arp::parse_reply(&buf, len, dst_ip) {
+                return Some(m);
+            }
+        }
+        for _ in 0..20 { core::hint::spin_loop(); }
+    }
+    None
+}
+
+fn dns_lookup_snp(
+    snp: &EFI_SIMPLE_NETWORK_PROTOCOL,
+    mac: &[u8; 6],
+    src_ip: [u8; 4],
+    dst_mac: &[u8; 6],
+    dst_ip: [u8; 4],
+    name: &str,
+) -> Option<[u8; 4]> {
+    let id: u16 = 0x1234;
+    let src_port: u16 = 0x3039;
+    let mut query = [0u8; 256];
+    let query_len = common::dns::build_query(id, name, &mut query);
+    if query_len == 0 {
+        return None;
+    }
+    let mut frame = [0u8; 1514];
+    let frame_len = common::dns::build_frame(
+        mac, src_ip, dst_mac, dst_ip, src_port, &query, query_len, &mut frame,
+    );
+    restart_snp(snp);
+    if !send_raw_snp(snp, &frame[..frame_len]) {
+        return None;
+    }
+    let mut buf = [0u8; 1514];
+    for _ in 0..500000 {
+        if let Some(len) = try_receive_raw_snp(snp, &mut buf) {
+            if let Some(ip) = common::dns::parse_response(&buf, len, id) {
+                return Some(ip);
+            }
+        }
+        for _ in 0..20 { core::hint::spin_loop(); }
+    }
+    None
+}
+
+/// DNS resolve + print for the SNP path. Uses con_out for output.
+fn dns_resolve_snp(
+    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    snp: &EFI_SIMPLE_NETWORK_PROTOCOL,
+    mac: &[u8; 6],
+    cfg: &common::dhcp::DhcpConfig,
+) {
+    if cfg.dns == [0u8; 4] {
+        w16(con_out, "  DNS: (none)\r\n");
+        return;
+    }
+    w16(con_out, "  DNS server: ");
+    print_ip(con_out, &cfg.dns);
+    w16(con_out, "\r\n");
+
+    let next_hop = if common::netio::same_subnet(cfg.yiaddr, cfg.dns, cfg.subnet) {
+        cfg.dns
+    } else if cfg.gateway != [0u8; 4] {
+        cfg.gateway
+    } else {
+        w16(con_out, "  Cannot resolve: no gateway\r\n");
+        return;
+    };
+
+    w16(con_out, "  ARP ");
+    print_ip(con_out, &next_hop);
+    w16(con_out, "...");
+    match arp_resolve_snp(snp, mac, cfg.yiaddr, next_hop) {
+        Some(dst_mac) => {
+            w16(con_out, "OK\r\n");
+            w16(con_out, "  DNS: google.com...");
+            let result = dns_lookup_snp(snp, mac, cfg.yiaddr, &dst_mac, cfg.dns, "google.com");
+            match result {
+                Some(ip) => {
+                    w16(con_out, "OK\r\n");
+                    w16(con_out, "  google.com: ");
+                    print_ip(con_out, &ip);
+                    w16(con_out, "\r\n");
+                }
+                None => w16(con_out, "FAILED\r\n"),
+            }
+        }
+        None => w16(con_out, "FAILED\r\n"),
+    }
+}
+
+/// DNS resolve + print for the direct e1000 path. Uses con_out for output.
+fn dns_resolve_e1000(
+    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    base: u64,
+    mac: &[u8; 6],
+    cfg: &common::dhcp::DhcpConfig,
+) {
+    if cfg.dns == [0u8; 4] {
+        w16(con_out, "  DNS: (none)\r\n");
+        return;
+    }
+    w16(con_out, "  DNS server: ");
+    print_ip(con_out, &cfg.dns);
+    w16(con_out, "\r\n");
+
+    let next_hop = if common::netio::same_subnet(cfg.yiaddr, cfg.dns, cfg.subnet) {
+        cfg.dns
+    } else if cfg.gateway != [0u8; 4] {
+        cfg.gateway
+    } else {
+        w16(con_out, "  Cannot resolve: no gateway\r\n");
+        return;
+    };
+
+    w16(con_out, "  ARP ");
+    print_ip(con_out, &next_hop);
+    w16(con_out, "...");
+    match common::netio::arp_resolve_e1000(base, mac, cfg.yiaddr, next_hop) {
+        Some(dst_mac) => {
+            w16(con_out, "OK\r\n");
+            w16(con_out, "  DNS: google.com...");
+            match common::netio::dns_lookup_e1000(base, mac, cfg.yiaddr, &dst_mac, cfg.dns, "google.com") {
+                Some(ip) => {
+                    w16(con_out, "OK\r\n");
+                    w16(con_out, "  google.com: ");
+                    print_ip(con_out, &ip);
+                    w16(con_out, "\r\n");
+                }
+                None => w16(con_out, "FAILED\r\n"),
+            }
+        }
+        None => w16(con_out, "FAILED\r\n"),
+    }
+}
+
 // ─── Public API ───
 
 pub fn scan_network_devices(
@@ -817,6 +1028,8 @@ pub fn scan_network_devices(
                     if cfg.gateway == [0,0,0,0] { w16(con_out, "(none)"); }
                     else { print_ip(con_out, &cfg.gateway); }
                     w16(con_out, "\r\n");
+
+                    dns_resolve_snp(con_out, snp, &mac, &cfg);
                 }
                 None => {
                     w16(con_out, "FAILED\r\n");

@@ -86,6 +86,17 @@ pub fn print_dec(val: u64) {
     puts(s);
 }
 
+/// Print an IPv4 address as `A.B.C.D` to the global print sink.
+pub fn print_ip(ip: &[u8; 4]) {
+    print_dec(ip[0] as u64);
+    putc(b'.');
+    print_dec(ip[1] as u64);
+    putc(b'.');
+    print_dec(ip[2] as u64);
+    putc(b'.');
+    print_dec(ip[3] as u64);
+}
+
 pub fn print_fmt(args: fmt::Arguments<'_>) {
     let _ = UartWriter.write_fmt(args);
 }

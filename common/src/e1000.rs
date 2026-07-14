@@ -175,11 +175,11 @@ pub fn init(base: u64) -> Option<[u8; 6]> {
             let desc = &raw mut RX_DESCS.0[i];
             write_volatile(core::ptr::addr_of_mut!((*desc).addr), rx_buf_addr);
         }
-        let tx_desc = &raw mut TX_DESCS.0[0];
-        write_volatile(
-            core::ptr::addr_of_mut!((*tx_desc).addr),
-            core::ptr::addr_of!(TX_BUF) as *const u8 as u64,
-        );
+        let tx_buf_addr = core::ptr::addr_of!(TX_BUF) as *const u8 as u64;
+        for i in 0..NUM_TX_DESC {
+            let desc = &raw mut TX_DESCS.0[i];
+            write_volatile(core::ptr::addr_of_mut!((*desc).addr), tx_buf_addr);
+        }
     }
 
     #[cfg(not(test))]
@@ -224,10 +224,14 @@ pub fn init(base: u64) -> Option<[u8; 6]> {
 }
 
 /// Send a frame via the e1000. Returns true on successful transmit.
+/// Uses the TX descriptor at the current TDT index so multiple sequential
+/// sends work correctly (each send advances TDT by 1).
 pub fn send(base: u64, data: &[u8]) -> bool {
     if data.len() > 2048 {
         return false;
     }
+
+    let tdt = (reg_read32(base, REG_TDT) as usize) % NUM_TX_DESC;
 
     #[cfg(not(test))]
     unsafe {
@@ -235,19 +239,18 @@ pub fn send(base: u64, data: &[u8]) -> bool {
         for i in 0..data.len() {
             *buf.add(i) = data[i];
         }
-        let desc = &raw mut TX_DESCS.0[0];
+        let desc = &raw mut TX_DESCS.0[tdt];
         write_volatile(core::ptr::addr_of_mut!((*desc).length), data.len() as u16);
         write_volatile(core::ptr::addr_of_mut!((*desc).cmd), CMD_EOP | CMD_IFCS | CMD_RS);
         write_volatile(core::ptr::addr_of_mut!((*desc).status), 0u8);
     }
 
-    let old_tdt = reg_read32(base, REG_TDT);
-    reg_write32(base, REG_TDT, old_tdt.wrapping_add(1));
+    reg_write32(base, REG_TDT, ((tdt + 1) % NUM_TX_DESC) as u32);
 
     for _ in 0..2000000 {
         #[cfg(not(test))]
         let status = unsafe {
-            let desc = &raw const TX_DESCS.0[0];
+            let desc = &raw const TX_DESCS.0[tdt];
             read_volatile(core::ptr::addr_of!((*desc).status))
         };
         #[cfg(test)]
@@ -260,7 +263,7 @@ pub fn send(base: u64, data: &[u8]) -> bool {
 
     #[cfg(not(test))]
     let ok = unsafe {
-        let desc = &raw const TX_DESCS.0[0];
+        let desc = &raw const TX_DESCS.0[tdt];
         read_volatile(core::ptr::addr_of!((*desc).status)) & TX_STATUS_DD != 0
     };
     #[cfg(test)]

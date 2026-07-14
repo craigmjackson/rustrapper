@@ -29,10 +29,13 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │   └── src/
 │       ├── lib.rs
 │       ├── menu.rs         # Shared [1]/[2] menu logic
-│       ├── print.rs        # Callback-based print (putc/puts/print_hex/print_dec)
+│       ├── print.rs        # Callback-based print (putc/puts/print_hex/print_dec/print_ip)
 │       ├── scan.rs         # Generic device-scan loop
 │       ├── e1000.rs        # Direct MMIO e1000 driver (init/send/recv) — used by all 3 targets
-│       └── dhcp.rs         # DHCP frame build/parse, IP checksum, DhcpConfig
+│       ├── arp.rs          # ARP request build + reply parse
+│       ├── dns.rs          # DNS query build + response parse + unicast UDP frame build
+│       ├── netio.rs        # e1000 glue: ARP resolve + DNS lookup + dns_resolve_and_print
+│       └── dhcp.rs         # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server)
 ├── uefi/                   # Rust UEFI binary (x86_64 + ARM64)
 │   ├── Cargo.toml
 │   └── src/
@@ -139,7 +142,7 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `bios/mbr.asm` — 16-bit MBR stage-1
 
-- 512-byte MBR that loads 16 sectors (LBA 1-16, 8192 bytes) to physical `0x1000` and jumps to `0x0100:0x0000`.
+- 512-byte MBR that loads 32 sectors (LBA 1-32, 16384 bytes) to physical `0x1000` and jumps to `0x0100:0x0000`.
 - The DAP (Disk Address Packet) at line 69 sets the sector count to 16. Increase this if the entry stub + payload grows past 16 sectors.
 - "MZ" at offset 0 executes as `dec bp; pop dx`, which overwrites DL (the boot-drive value). Always set DL explicitly before `int 0x13`.
 
@@ -223,11 +226,31 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `common/src/dhcp.rs` — DHCP frame build/parse (shared by all targets)
 
-- `DhcpConfig` struct: `yiaddr`, `subnet`, `gateway` — the result of a successful DHCP exchange.
+- `DhcpConfig` struct: `yiaddr`, `subnet`, `gateway`, `dns` — the result of a successful DHCP exchange.
 - `ip_checksum(buf) -> u16` — standard Internet checksum (one's complement of one's complement sum of 16-bit words).
 - `build_discover(xid, mac) -> [u8; 300]` — DHCPDISCOVER payload with magic cookie 0x63825363, option 53=1 (DISCOVER), option 55=param request list (1/3/6), option 255=end.
 - `build_eth_ip_udp(mac, dhcp_payload, dhcp_len, frame) -> usize` — wraps the DHCP payload in Ethernet + IPv4 + UDP headers (including IP checksum), returns total frame length.
-- `parse_response(buf, len, xid, mac) -> Option<DhcpConfig>` — validates EtherType, IP protocol, UDP offset, magic cookie, transaction ID, MAC match, then walks options for type 53 (OFFER or ACK), type 1 (subnet), type 3 (gateway).
+- `parse_response(buf, len, xid, mac) -> Option<DhcpConfig>` — validates EtherType, IP protocol, UDP offset, magic cookie, transaction ID, MAC match, then walks options for type 53 (OFFER or ACK), type 1 (subnet), type 3 (gateway), type 6 (DNS server).
+
+### `common/src/arp.rs` — ARP request build and reply parse
+
+- `build_request(src_mac, src_ip, dst_ip, frame) -> usize` — builds a broadcast Ethernet + ARP request frame (42 bytes).
+- `parse_reply(buf, len, target_ip) -> Option<[u8; 6]>` — validates EtherType 0x0806, ARP reply oper, sender IP match, returns sender MAC.
+- Used by `common::netio::arp_resolve_e1000` and UEFI's `arp_resolve_snp` to resolve the next-hop MAC before sending unicast DNS queries.
+
+### `common/src/dns.rs` — DNS query build, unicast frame build, and response parse
+
+- `build_query(id, name, buf) -> usize` — encodes a domain name as DNS labels into a standard query (flags 0x0100, QTYPE A, QCLASS IN). Returns bytes written.
+- `build_frame(src_mac, src_ip, dst_mac, dst_ip, src_port, query, query_len, frame) -> usize` — wraps a DNS query in Ethernet + IPv4 + UDP headers (unicast, with IP checksum). Dst port is 53.
+- `parse_response(buf, len, id) -> Option<[u8; 4]>` — validates EtherType, IP/UDP, DNS transaction ID, rcode=0, ancount>0, skips question section (handling name compression), returns first A-record IP (4 bytes).
+- `skip_name(buf, len, off) -> Option<usize>` — skips a DNS name (handles both label sequences and 0xC0 compression pointers).
+
+### `common/src/netio.rs` — e1000-based ARP resolve and DNS lookup glue
+
+- `same_subnet(ip1, ip2, mask) -> bool` — checks if two IPs are on the same subnet.
+- `arp_resolve_e1000(base, src_mac, src_ip, dst_ip) -> Option<[u8; 6]>` — sends ARP request via e1000, polls for reply (20 retries × 50M iters each). Used by BIOS and ARM64 bare-metal.
+- `dns_lookup_e1000(base, src_mac, src_ip, dst_mac, dst_ip, name) -> Option<[u8; 4]>` — sends DNS query via e1000, polls for response (20 retries × 100M iters each).
+- `dns_resolve_and_print(base, mac, cfg)` — full flow: print DNS server, determine next-hop (on-subnet DNS or gateway), ARP resolve, query google.com, print result. Uses `common::print` for output (shared by BIOS and ARM64 bare-metal). Guarded with `#[cfg(not(test))]` because it depends on `e1000::try_receive`.
 
 ### `romwrap/src/main.rs` — PCI expansion ROM wrapper
 
@@ -268,8 +291,12 @@ The following details apply to the common e1000 driver used by all three targets
 13. **`cli` before Rust code in protected mode**: No IDT is set up after the protected mode switch. A hardware timer interrupt with no IDT causes a triple fault. Always `cli` before calling Rust code from the entry stub.
 14. **Inline `asm!` for serial I/O**: Use separate `asm!` blocks for the LSR poll (`in al, dx`) and data output (`out dx, al`). The poll block must NOT use `options(pure)` (I/O port reads are NOT idempotent — `pure` causes the compiler to optimize the poll loop into `jmp $`). Pass the output byte via `in("al") c` — do NOT let the compiler choose the register, as `in al, dx` clobbers AL.
 15. **BSS_ZERO_SIZE must cover actual BSS**: The entry stub zeros `BSS_ZERO_SIZE` bytes after the payload. If BSS grows (e1000 descriptor rings + packet buffers ~4.3 KB), increase `BSS_ZERO_SIZE` from `0x1000` to `0x2000`. Check with `readelf -S target/i386-unknown-none/release/bios-rust | grep .bss`.
-16. **MBR sector count must match payload**: The MBR loads 16 sectors (8192 bytes). The entry stub + Rust payload is ~7.8 KB = 15 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
+16. **MBR sector count must match payload**: The MBR loads 32 sectors (16384 bytes). The entry stub + Rust payload is ~10.8 KB = 22 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
 17. **PCI Bus Master must be enabled for e1000 DMA**: SeaBIOS enables Memory Space (bit 1) but may NOT enable Bus Master (bit 2) in the PCI Command register. Without Bus Master, the e1000 can read descriptors (MMIO works) but TX descriptor write-back (DMA) silently fails — TDH advances but the status DD bit is never set. `pci_enable_bars` must always set command bits 0-2 (I/O + Memory + Bus Master), even if some are already set. Do NOT re-assign BARs if firmware already assigned them (check if BAR0 is non-zero before sizing).
+
+18. **e1000 TX descriptor index must track TDT**: The `send` function uses the TX descriptor at the current TDT index (not always descriptor 0). After each send, TDT advances by 1, so the next send must use the next descriptor. All TX descriptors' `addr` fields are set to `TX_BUF` during init. Always using descriptor 0 while incrementing TDT causes the second send to fail silently — hardware processes the wrong descriptor (the one at TDH, not 0) while software polls descriptor 0's DD bit forever.
+
+19. **ARP resolve required before unicast DNS**: DHCP gives us the DNS server IP but not its MAC. To send a unicast DNS query, we must first ARP resolve the next-hop MAC (DNS server if on-subnet, gateway if off-subnet). The flow is: DHCP → ARP request → ARP reply → DNS query → DNS response. Each step uses a separate e1000 send/receive cycle. The e1000 RX ring must be re-armed after each receive (done automatically by `try_receive`).
 
 ### MBR
 
@@ -278,7 +305,7 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### ARM64 / UEFI
 
-11. **ARM64 UEFI SNP single-transmit limit**: The ARM64 virtio SNP driver only supports one `Transmit` per session because `Initialize` returns `EFI_UNSUPPORTED` (no buffer recycling). Send DHCPDISCOVER and accept the OFFER as final — do not attempt REQUEST/ACK. x86_64 e1000 supports the full handshake.
+11. **ARM64 UEFI SNP single-transmit limit**: The ARM64 virtio SNP driver only supports a few `Transmit` calls per session because `Initialize` returns `EFI_UNSUPPORTED` (no buffer recycling). After DHCP + ARP (2 transmits), the DNS query (3rd transmit) fails with a non-`EFI_SUCCESS` status. Fix: call `SNP.Shutdown` + `SNP.Stop` + `SNP.Start` + `SNP.Initialize` before the DNS transmit to fully restart the driver and recycle TX buffers. `SNP.Reset` alone does NOT fix this. See `restart_snp` in `uefi/src/net.rs`. x86_64 e1000 supports unlimited transmits.
 12. **ARM64 EDK2 error bit**: ARM64 firmware encodes EFI errors with bit 63 set (`0x8000000000000014` for `EFI_ALREADY_STARTED`). Always check both the plain constant and the error-bit variant when comparing status codes on ARM64.
 13. **`virtio-net-pci` is the only ARM64 SNP NIC**: QEMU `qemu-system-aarch64` EDK2 firmware only detects SNP via `virtio-net-pci`. All other models (e1000, e1000e, rtl8139, etc.) return "No network adapters found".
 14. **`EFI_OPEN_PROTOCOL_GET_PROTOCOL`**: Use `0x00000002` instead of `BY_HANDLE_PROTOCOL` (`0x00000001`) for SNP on ARM64 to avoid agent handle tracking issues.
@@ -364,16 +391,16 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 122 tests across all crates
-cargo test --package common   # 44 tests (formatting, scan loop, DHCP build/parse)
-cargo test --package uefi     # 24 tests (type sizes, GUID values, constants, SNP mode layout)
+cargo test --workspace        # All 149 tests across all crates
+cargo test --package common   # 71 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check)
+cargo test --package uefi     # 33 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
-cargo test --package romwrap  # 33 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
+cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
 ```
 
 | Crate | Tests | What's tested |
 |-------|-------|---------------|
-| `common` | 29 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping) |
+| `common` | 71 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask) |
 | `uefi`/`efi` | 24 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
 | `arm64-bare`/`pci` | 21 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 12 subclass codes including unassigned, unknown fallback) |
 | `romwrap` | 33 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`/`0x00`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, BIOS entry routine, block count consistency, PCIR length field matching, empty/boundary-aligned/overlapping payload sizes |

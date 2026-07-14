@@ -11,12 +11,14 @@
 //! - `parse_response` rejects non-UDP, bad magic cookie, too-short packets
 //! - `parse_response` rejects non-OFFER/ACK messages
 
-/// A successful DHCP result: the IP address we were assigned, plus subnet and gateway.
+/// A successful DHCP result: the IP address we were assigned, plus subnet,
+/// gateway, and DNS server.
 #[derive(Clone, Copy)]
 pub struct DhcpConfig {
     pub yiaddr: [u8; 4],
     pub subnet: [u8; 4],
     pub gateway: [u8; 4],
+    pub dns: [u8; 4],
 }
 
 /// Compute the standard Internet checksum (one's complement of the one's
@@ -173,6 +175,7 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
 
     let mut subnet = [255u8; 4];
     let mut gateway = [0u8; 4];
+    let mut dns = [0u8; 4];
     let mut dhcp_msg_type = 0u8;
     let mut off = dhcp_off + 240;
 
@@ -192,6 +195,8 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
             subnet.copy_from_slice(&buf[off + 2..off + 6]);
         } else if opt_type == 3 && opt_len >= 4 {
             gateway.copy_from_slice(&buf[off + 2..off + 6]);
+        } else if opt_type == 6 && opt_len >= 4 {
+            dns.copy_from_slice(&buf[off + 2..off + 6]);
         }
         off += 2 + opt_len;
     }
@@ -206,6 +211,7 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
         yiaddr,
         subnet,
         gateway,
+        dns,
     })
 }
 
@@ -310,6 +316,13 @@ mod tests {
     /// Returns a fixed-size array (no Vec in no_std).
     fn build_response_frame(xid: u32, m: &[u8; 6], yiaddr: [u8; 4],
                             msg_type: u8, include_subnet: bool, include_gateway: bool) -> [u8; 342] {
+        build_response_frame_opts(xid, m, yiaddr, msg_type, include_subnet, include_gateway, false)
+    }
+
+    /// Build a response frame with optional DNS option (option 6).
+    fn build_response_frame_opts(xid: u32, m: &[u8; 6], yiaddr: [u8; 4],
+                                 msg_type: u8, include_subnet: bool, include_gateway: bool,
+                                 include_dns: bool) -> [u8; 342] {
         let mut frame = [0u8; 342];
         let mut pos = 0;
         // Ethernet: dst = us, src = server MAC
@@ -373,6 +386,11 @@ mod tests {
             frame[o + 2..o + 6].copy_from_slice(&[10, 0, 0, 1]);
             o += 6;
         }
+        if include_dns {
+            frame[o] = 6; frame[o + 1] = 4;
+            frame[o + 2..o + 6].copy_from_slice(&[10, 0, 0, 2]);
+            o += 6;
+        }
         frame[o] = 255; // end
         frame
     }
@@ -385,6 +403,15 @@ mod tests {
         assert_eq!(cfg.yiaddr, [10, 0, 2, 15]);
         assert_eq!(cfg.subnet, [255, 255, 255, 0]);
         assert_eq!(cfg.gateway, [10, 0, 0, 1]);
+        assert_eq!(cfg.dns, [0, 0, 0, 0]); // absent → default 0
+    }
+
+    #[test]
+    fn test_parse_response_dns() {
+        let m = mac();
+        let frame = build_response_frame_opts(0x12345678, &m, [10, 0, 2, 15], 2, true, true, true);
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(cfg.dns, [10, 0, 0, 2]);
     }
 
     #[test]
@@ -395,6 +422,7 @@ mod tests {
         assert_eq!(cfg.yiaddr, [10, 0, 2, 15]);
         assert_eq!(cfg.subnet, [255, 255, 255, 0]);
         assert_eq!(cfg.gateway, [0, 0, 0, 0]); // absent → default 0
+        assert_eq!(cfg.dns, [0, 0, 0, 0]); // absent → default 0
     }
 
     #[test]
