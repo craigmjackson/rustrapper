@@ -36,16 +36,16 @@ $(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN)
 	$(NASM) -f bin -o $@ $<
 
 # ── BIOS Rust payload (32-bit protected mode, loaded at 1 MB) ────
-# Requires nightly for -Zjson-target-spec and -Zbuild-std=core
+# Requires nightly for -Zjson-target-spec -Zbuild-std=core
 BIOS_RUST_TARGET := $(CURDIR)/targets/i386-unknown-none.json
 CARGO_NIGHTLY    := cargo +nightly
 
-$(BIN)/rust_payload.bin: $(shell find bios-rust common -name '*.rs') \
-                         bios-rust/link.ld Cargo.toml $(BIOS_RUST_TARGET) | $(BIN)
-	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-arg=-T$(CURDIR)/bios-rust/link.ld -C link-arg=-N" \
+$(BIN)/rust_payload.bin: $(shell find bios common -name '*.rs') \
+                         bios/link.ld Cargo.toml $(BIOS_RUST_TARGET) | $(BIN)
+	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-arg=-T$(CURDIR)/bios/link.ld -C link-arg=-N" \
 		$(CARGO_NIGHTLY) build -Zjson-target-spec -Zbuild-std=core \
-		--target $(BIOS_RUST_TARGET) --package bios-rust --release
-	objcopy -O binary target/i386-unknown-none/release/bios-rust $@
+		--target $(BIOS_RUST_TARGET) --package bios --release
+	objcopy -O binary target/i386-unknown-none/release/bios $@
 
 # Combined stage2 = entry stub + Rust payload (assembled by NASM, which
 # incbins the payload so it can compute copy offsets at assembly time)

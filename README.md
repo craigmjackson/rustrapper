@@ -82,10 +82,12 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 │       ├── scan.rs     # Generic device-scan loop
 │       ├── e1000.rs    # Direct MMIO e1000 driver (init/send/recv) — shared by all targets
 │       └── dhcp.rs     # DHCP frame build/parse, IP checksum, DhcpConfig
-├── bios-rust/          # Rust 32-bit BIOS stage2
+├── bios/               # BIOS stage2 — Rust (nightly) + minimal NASM
 │   ├── Cargo.toml
 │   ├── link.ld         # Link at 0x100000
 │   ├── targets/i386-unknown-none.json
+│   ├── mbr.asm         # 512‑byte MBR stage‑1
+│   ├── stage2_entry.nasm # Entry stub for Rust stage2 (A20, protected mode, payload copy)
 │   └── src/
 │       ├── main.rs     # _start entry, menu dispatch
 │       ├── serial.rs   # COM1 driver (putc, getc, flush)

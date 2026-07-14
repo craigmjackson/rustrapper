@@ -11,12 +11,13 @@
 //! - `parse_response` rejects non-UDP, bad magic cookie, too-short packets
 //! - `parse_response` rejects non-OFFER/ACK messages
 
-/// A successful DHCP result: the IP address we were assigned, plus subnet and gateway.
+/// A successful DHCP result: the IP address we were assigned, plus subnet, gateway, and nameserver.
 #[derive(Clone, Copy)]
 pub struct DhcpConfig {
     pub yiaddr: [u8; 4],
     pub subnet: [u8; 4],
     pub gateway: [u8; 4],
+    pub nameserver: [u8; 4],
 }
 
 /// Compute the standard Internet checksum (one's complement of the one's
@@ -173,6 +174,7 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
 
     let mut subnet = [255u8; 4];
     let mut gateway = [0u8; 4];
+    let mut nameserver = [0u8; 4];
     let mut dhcp_msg_type = 0u8;
     let mut off = dhcp_off + 240;
 
@@ -192,6 +194,8 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
             subnet.copy_from_slice(&buf[off + 2..off + 6]);
         } else if opt_type == 3 && opt_len >= 4 {
             gateway.copy_from_slice(&buf[off + 2..off + 6]);
+        } else if opt_type == 6 && opt_len >= 4 && nameserver == [0u8; 4] {
+            nameserver.copy_from_slice(&buf[off + 2..off + 6]);
         }
         off += 2 + opt_len;
     }
@@ -206,7 +210,397 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
         yiaddr,
         subnet,
         gateway,
+        nameserver,
     })
+}
+
+/// Encode a domain name into DNS wire format (label list terminated by 0x00).
+/// Returns Some((encoded_bytes, actual_length)) or None if the name is too long.
+fn encode_domain(name: &str) -> Option<([u8; 256], usize)> {
+    let mut buf = [0u8; 256];
+    let mut off = 0;
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        buf[off] = label.len() as u8;
+        off += 1;
+        for byte in label.as_bytes() {
+            buf[off] = *byte;
+            off += 1;
+        }
+    }
+    buf[off] = 0; // root label terminator
+    off += 1;
+    Some((buf, off))
+}
+
+/// Parse a DNS response and return the first A record (IPv4) address.
+/// Expects `buf` to start with an Ethernet header (skips Ethernet + IPv4 + UDP).
+/// Returns None if the response is invalid or contains no A records.
+pub fn parse_dns_response(buf: &[u8], len: usize, txid: u16) -> Option<[u8; 4]> {
+    if len < 42 {
+        return None;
+    }
+    // Skip Ethernet header (14 bytes)
+    if buf[12] != 0x08 || buf[13] != 0x00 {
+        return None;
+    }
+    let ip_off = 14;
+    let ip_hdr_len = (buf[ip_off] & 0x0F) as usize * 4;
+    if ip_hdr_len < 20 {
+        return None;
+    }
+    if buf[ip_off + 9] != 17 {
+        return None;
+    } // not UDP
+    let udp_off = ip_off + ip_hdr_len;
+    let dns_off = udp_off + 8;
+    if dns_off + 12 > len {
+        return None;
+    }
+    let pkt_txid = u16::from_be_bytes([buf[dns_off], buf[dns_off + 1]]);
+    if pkt_txid != txid {
+        return None;
+    }
+    let rcode = buf[dns_off + 2] & 0x0F;
+    if rcode != 0 {
+        return None;
+    }
+    let ancount = u16::from_be_bytes([buf[dns_off + 6], buf[dns_off + 7]]) as usize;
+    if ancount == 0 {
+        return None;
+    }
+    // Skip past the question section (DNS header is 12 bytes)
+    let mut off = dns_off + 12;
+    // Skip name (walk until 0x00 label)
+    while off < len {
+        let label_len = buf[off];
+        if label_len == 0 {
+            off += 1;
+            break;
+        }
+        if label_len & 0xC0 == 0xC0 {
+            // Compression pointer — skip 2 bytes
+            off += 2;
+            break;
+        }
+        if label_len & 0xC0 != 0 {
+            return None; // invalid label type
+        }
+        off += 1 + label_len as usize;
+    }
+    // Question: type (2) + class (2)
+    if off + 4 > len {
+        return None;
+    }
+    off += 4;
+
+    // Walk answer records
+    for _ in 0..ancount {
+        if off >= len {
+            return None;
+        }
+        // Skip name (may use compression)
+        if buf[off] & 0xC0 == 0xC0 {
+            off += 2;
+        } else {
+            while off < len {
+                let ll = buf[off];
+                if ll == 0 {
+                    off += 1;
+                    break;
+                }
+                off += 1 + ll as usize;
+            }
+        }
+        // type (2) + class (2) + ttl (4) + rdlength (2)
+        if off + 10 > len {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([buf[off], buf[off + 1]]);
+        off += 10;
+        let rdlength = u16::from_be_bytes([buf[off - 2], buf[off - 1]]) as usize;
+        if rtype != 1 {
+            // Not an A record, skip
+            off += rdlength;
+            continue;
+        }
+        if off + rdlength > len {
+            return None;
+        }
+        let mut addr = [0u8; 4];
+        addr.copy_from_slice(&buf[off..off + rdlength]);
+        return Some(addr);
+    }
+    None
+}
+
+/// Build a DNS query for an A record of the given domain name.
+/// Returns the encoded packet or None if the name is too long.
+pub fn build_dns_query(name: &str, txid: u16) -> Option<[u8; 256]> {
+    let (encoded, elen) = encode_domain(name)?;
+    let mut pkt = [0u8; 256];
+
+    // Header
+    pkt[0..2].copy_from_slice(&txid.to_be_bytes());
+    pkt[2] = 0x01; pkt[3] = 0x00; // flags: standard query, recursion desired
+    pkt[4] = 0x00; pkt[5] = 0x01; // qdcount = 1
+    // ancount, nscount, arcount = 0 (already zero)
+
+    // Question: encoded domain + type A (1) + class IN (1)
+    let qoff = 12;
+    pkt[qoff..qoff + elen].copy_from_slice(&encoded[..elen]);
+    let qend = qoff + elen;
+    pkt[qend] = 0x00; pkt[qend + 1] = 0x01; // type = A
+    pkt[qend + 2] = 0x00; pkt[qend + 3] = 0x01; // class = IN
+
+    Some(pkt)
+}
+
+/// Send a DNS query via raw e1000 MMIO and return the resolved IPv4 address.
+/// Uses the provided NIC base address, MAC, our IP, ARP target, and nameserver IP.
+/// Returns None on timeout or parse failure.
+#[cfg(not(test))]
+pub fn dns_lookup_via_e1000(
+    nic_base: u64,
+    mac: &[u8; 6],
+    our_ip: &[u8; 4],
+    arp_target: &[u8; 4],
+    nameserver: &[u8; 4],
+    domain: &str,
+) -> Option<[u8; 4]> {
+    let txid: u16 = 0x1234;
+    let query = build_dns_query(domain, txid)?;
+    let qlen = query.len();
+
+    // Find first non-zero byte to determine actual query length
+    let mut actual_len = qlen;
+    for i in (0..qlen).rev() {
+        if query[i] != 0 {
+            actual_len = i + 1;
+            break;
+        }
+    }
+
+    // Try ARP first, fall back to broadcast MAC for QEMU slirp
+    let dst_mac = match arp_resolve(nic_base, mac, our_ip, arp_target) {
+        Some(m) => m,
+        None => {
+            if arp_target[0] == 10 && arp_target[1] == 0 && arp_target[2] == 2 {
+                [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let mut frame = [0u8; 1514];
+    let frame_len = build_dns_frame_with_mac(
+        &dst_mac,
+        mac,
+        our_ip,
+        nameserver,
+        &query[..actual_len],
+        actual_len,
+        &mut frame,
+    );
+
+    if !super::e1000::send(nic_base, &frame[..frame_len]) {
+        return None;
+    }
+
+    let mut buf = [0u8; 1514];
+    for _ in 0..10_000_000 {
+        if let Some(copy_len) = super::e1000::try_receive(nic_base, &mut buf, 1) {
+            if let Some(ip) = parse_dns_response(&buf, copy_len, txid) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+/// ARP request frame layout:
+/// Ethernet dst: broadcast
+/// Ethernet src: our MAC
+/// EtherType: 0x0806 (ARP)
+/// ARP: hw_type=1, proto=0x0800, hw_len=6, proto_len=4, op=1 (request)
+/// Sender MAC + IP
+/// Target MAC (zero) + IP
+fn build_arp_request(mac: &[u8; 6], our_ip: &[u8; 4], target_ip: &[u8; 4], frame: &mut [u8; 1514]) -> usize {
+    let mut pos = 0;
+    // Ethernet header
+    frame[pos..pos + 6].fill(0xFF); pos += 6;
+    frame[pos..pos + 6].copy_from_slice(mac); pos += 6;
+    frame[pos] = 0x08; frame[pos + 1] = 0x06; pos += 2; // EtherType ARP
+
+    // ARP payload
+    let arp_off = pos;
+    frame[arp_off + 0..arp_off + 2].copy_from_slice(&[0x00, 0x01]); pos += 2; // hw type = Ethernet
+    frame[arp_off + 2..arp_off + 4].copy_from_slice(&[0x08, 0x00]); pos += 2; // proto = IPv4
+    frame[arp_off + 4] = 0x06; pos += 1; // hw len = 6
+    frame[arp_off + 5] = 0x04; pos += 1; // proto len = 4
+    frame[arp_off + 6..arp_off + 8].copy_from_slice(&[0x00, 0x01]); pos += 2; // op = request
+    frame[arp_off + 8..arp_off + 14].copy_from_slice(mac); pos += 6; // sender MAC
+    frame[arp_off + 14..arp_off + 18].copy_from_slice(our_ip); pos += 4; // sender IP
+    frame[arp_off + 18..arp_off + 24].fill(0); pos += 6; // target MAC (zero)
+    frame[arp_off + 24..arp_off + 28].copy_from_slice(target_ip); pos += 4; // target IP
+    pos
+}
+
+/// Parse an ARP reply and extract the sender's MAC address and IP.
+/// Returns None if not an ARP reply.
+fn parse_arp_reply(buf: &[u8], len: usize) -> Option<([u8; 6], [u8; 4])> {
+    if len < 42 {
+        return None;
+    }
+    // Check EtherType = ARP
+    if buf[12] != 0x08 || buf[13] != 0x06 {
+        return None;
+    }
+    let arp_off = 14;
+    // hw type = 1, proto = 0x0800
+    if buf[arp_off] != 0x00 || buf[arp_off + 1] != 0x01 {
+        return None;
+    }
+    if buf[arp_off + 2] != 0x08 || buf[arp_off + 3] != 0x00 {
+        return None;
+    }
+    // op = 2 (reply)
+    if buf[arp_off + 6] != 0x00 || buf[arp_off + 7] != 0x02 {
+        return None;
+    }
+    // sender MAC is at offset 8 in ARP payload
+    let sender_mac: [u8; 6] = [
+        buf[arp_off + 8], buf[arp_off + 9], buf[arp_off + 10],
+        buf[arp_off + 11], buf[arp_off + 12], buf[arp_off + 13],
+    ];
+    // sender IP is at offset 14 in ARP payload
+    let sender_ip: [u8; 4] = [
+        buf[arp_off + 14], buf[arp_off + 15],
+        buf[arp_off + 16], buf[arp_off + 17],
+    ];
+    Some((sender_mac, sender_ip))
+}
+
+/// Resolve a target IP to a MAC address via ARP.
+/// Sends an ARP request and polls for the reply.
+/// Returns the resolved MAC or None on timeout.
+#[cfg(not(test))]
+fn arp_resolve(
+    nic_base: u64,
+    mac: &[u8; 6],
+    our_ip: &[u8; 4],
+    target_ip: &[u8; 4],
+) -> Option<[u8; 6]> {
+    let mut frame = [0u8; 1514];
+    let frame_len = build_arp_request(mac, our_ip, target_ip, &mut frame);
+
+    if !super::e1000::send(nic_base, &frame[..frame_len]) {
+        return None;
+    }
+
+    let mut buf = [0u8; 1514];
+    for _ in 0..1_000_000 {
+        if let Some(len) = super::e1000::try_receive(nic_base, &mut buf, 100) {
+            if len >= 42 && buf[12] == 0x08 && buf[13] == 0x06 {
+                if let Some((sender_mac, _sender_ip)) = parse_arp_reply(&buf, len) {
+                    return Some(sender_mac);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build an Ethernet/IPv4/UDP/DNS frame with a specific destination MAC.
+pub fn build_dns_frame_with_mac(
+    dst_mac: &[u8; 6],
+    src_mac: &[u8; 6],
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    dns_payload: &[u8],
+    dns_len: usize,
+    frame: &mut [u8; 1514],
+) -> usize {
+    // Ethernet header — unicast to nameserver
+    frame[0..6].copy_from_slice(dst_mac);
+    frame[6..12].copy_from_slice(src_mac);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+
+    // IPv4 header
+    let ip_off = 14;
+    let ip_total_len = 20 + 8 + dns_len;
+    frame[ip_off] = 0x45;
+    frame[ip_off + 1] = 0x00;
+    frame[ip_off + 2..ip_off + 4].copy_from_slice(&(ip_total_len as u16).to_be_bytes());
+    frame[ip_off + 8] = 64; // TTL
+    frame[ip_off + 9] = 17; // protocol = UDP
+    frame[ip_off + 12..ip_off + 16].copy_from_slice(src_ip); // src IP = our assigned IP
+    frame[ip_off + 16..ip_off + 20].copy_from_slice(dst_ip); // dst = nameserver
+
+    let cksum = ip_checksum(&frame[ip_off..ip_off + 20]);
+    frame[ip_off + 10..ip_off + 12].copy_from_slice(&cksum.to_be_bytes());
+
+    // UDP header — ephemeral src port, dst port 53 (DNS)
+    let udp_off = ip_off + 20;
+    let udp_len = 8 + dns_len;
+    frame[udp_off..udp_off + 2].copy_from_slice(&[0x12, 0x34]); // src port = txid (ephemeral)
+    frame[udp_off + 2..udp_off + 4].copy_from_slice(&[0x00, 0x35]); // dst port 53
+    frame[udp_off + 4..udp_off + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // UDP checksum = 0 (optional)
+
+    // DNS payload
+    let dhcp_off = udp_off + 8;
+    frame[dhcp_off..dhcp_off + dns_len].copy_from_slice(&dns_payload[..dns_len]);
+
+    dhcp_off + dns_len
+}
+
+/// Build an Ethernet/IPv4/UDP/DNS frame into `frame`. Returns total frame length.
+pub fn build_dns_frame(
+    src_mac: &[u8; 6],
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    dns_payload: &[u8],
+    dns_len: usize,
+    frame: &mut [u8; 1514],
+) -> usize {
+    // Ethernet header — broadcast dst for DNS (or use unicast to nameserver)
+    frame[0..6].fill(0xFF); // broadcast
+    frame[6..12].copy_from_slice(src_mac);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+
+    // IPv4 header
+    let ip_off = 14;
+    let ip_total_len = 20 + 8 + dns_len;
+    frame[ip_off] = 0x45;
+    frame[ip_off + 1] = 0x00;
+    frame[ip_off + 2..ip_off + 4].copy_from_slice(&(ip_total_len as u16).to_be_bytes());
+    frame[ip_off + 8] = 64; // TTL
+    frame[ip_off + 9] = 17; // protocol = UDP
+    frame[ip_off + 12..ip_off + 16].copy_from_slice(src_ip); // src IP = our assigned IP
+    frame[ip_off + 16..ip_off + 20].copy_from_slice(dst_ip); // dst = nameserver
+
+    let cksum = ip_checksum(&frame[ip_off..ip_off + 20]);
+    frame[ip_off + 10..ip_off + 12].copy_from_slice(&cksum.to_be_bytes());
+
+    // UDP header — ephemeral src port, dst port 53 (DNS)
+    let udp_off = ip_off + 20;
+    let udp_len = 8 + dns_len;
+    frame[udp_off..udp_off + 2].copy_from_slice(&[0x12, 0x34]); // src port = txid (ephemeral)
+    frame[udp_off + 2..udp_off + 4].copy_from_slice(&[0x00, 0x35]); // dst port 53
+    frame[udp_off + 4..udp_off + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    // UDP checksum = 0 (optional)
+
+    // DNS payload
+    let dhcp_off = udp_off + 8;
+    frame[dhcp_off..dhcp_off + dns_len].copy_from_slice(&dns_payload[..dns_len]);
+
+    dhcp_off + dns_len
 }
 
 #[cfg(test)]
@@ -309,7 +703,8 @@ mod tests {
     /// Build a minimal OFFER/ACK response frame for testing parse_response.
     /// Returns a fixed-size array (no Vec in no_std).
     fn build_response_frame(xid: u32, m: &[u8; 6], yiaddr: [u8; 4],
-                            msg_type: u8, include_subnet: bool, include_gateway: bool) -> [u8; 342] {
+                            msg_type: u8, include_subnet: bool, include_gateway: bool,
+                            include_nameserver: bool) -> [u8; 342] {
         let mut frame = [0u8; 342];
         let mut pos = 0;
         // Ethernet: dst = us, src = server MAC
@@ -373,6 +768,11 @@ mod tests {
             frame[o + 2..o + 6].copy_from_slice(&[10, 0, 0, 1]);
             o += 6;
         }
+        if include_nameserver {
+            frame[o] = 6; frame[o + 1] = 4;
+            frame[o + 2..o + 6].copy_from_slice(&[8, 8, 8, 8]);
+            o += 6;
+        }
         frame[o] = 255; // end
         frame
     }
@@ -380,17 +780,18 @@ mod tests {
     #[test]
     fn test_parse_response_offer() {
         let m = mac();
-        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, true, true);
+        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, true, true, false);
         let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
         assert_eq!(cfg.yiaddr, [10, 0, 2, 15]);
         assert_eq!(cfg.subnet, [255, 255, 255, 0]);
         assert_eq!(cfg.gateway, [10, 0, 0, 1]);
+        assert_eq!(cfg.nameserver, [0, 0, 0, 0]); // absent → default 0
     }
 
     #[test]
     fn test_parse_response_ack() {
         let m = mac();
-        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 5, true, false);
+        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 5, true, false, false);
         let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
         assert_eq!(cfg.yiaddr, [10, 0, 2, 15]);
         assert_eq!(cfg.subnet, [255, 255, 255, 0]);
@@ -398,16 +799,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_response_nameserver() {
+        let m = mac();
+        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 5, true, true, true);
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(cfg.nameserver, [8, 8, 8, 8]);
+    }
+
+    #[test]
     fn test_parse_response_rejects_mismatched_xid() {
         let m = mac();
-        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false);
+        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false, false);
         assert!(parse_response(&frame, frame.len(), 0xDEADBEEF, &m).is_none());
     }
 
     #[test]
     fn test_parse_response_rejects_mismatched_mac() {
         let m = mac();
-        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false);
+        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false, false);
         let other_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         assert!(parse_response(&frame, frame.len(), 0x12345678, &other_mac).is_none());
     }
@@ -416,7 +825,7 @@ mod tests {
     fn test_parse_response_rejects_non_offer_ack() {
         let m = mac();
         // msg_type = 1 (DISCOVER) → not OFFER/ACK → reject
-        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 1, false, false);
+        let frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 1, false, false, false);
         assert!(parse_response(&frame, frame.len(), 0x12345678, &m).is_none());
     }
 
@@ -430,7 +839,7 @@ mod tests {
     #[test]
     fn test_parse_response_rejects_bad_ethertype() {
         let m = mac();
-        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false);
+        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false, false);
         frame[12] = 0x86; // ARP, not IPv4
         assert!(parse_response(&frame, frame.len(), 0x12345678, &m).is_none());
     }
@@ -438,7 +847,7 @@ mod tests {
     #[test]
     fn test_parse_response_rejects_non_udp() {
         let m = mac();
-        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false);
+        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false, false);
         frame[23] = 6; // TCP, not UDP
         assert!(parse_response(&frame, frame.len(), 0x12345678, &m).is_none());
     }
@@ -446,9 +855,137 @@ mod tests {
     #[test]
     fn test_parse_response_rejects_bad_magic() {
         let m = mac();
-        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false);
+        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, false, false, false);
         // Corrupt magic cookie (at dhcp_off + 236 = 42 + 236 = 278)
         frame[278] = 0xFF;
         assert!(parse_response(&frame, frame.len(), 0x12345678, &m).is_none());
+    }
+
+    #[test]
+    fn test_encode_domain() {
+        let (encoded, _len) = encode_domain("google.com").unwrap();
+        assert_eq!(encoded[0], 6); // "google" length
+        assert!(&encoded[1..7] == b"google");
+        assert_eq!(encoded[7], 3); // "com" length
+        assert!(&encoded[8..11] == b"com");
+        assert_eq!(encoded[11], 0); // root label
+    }
+
+    #[test]
+    fn test_build_dns_query_layout() {
+        let pkt = build_dns_query("google.com", 0x1234).unwrap();
+        // Transaction ID
+        assert_eq!(u16::from_be_bytes([pkt[0], pkt[1]]), 0x1234);
+        // Flags: standard query, recursion desired
+        assert_eq!(u16::from_be_bytes([pkt[2], pkt[3]]), 0x0100);
+        // qdcount = 1
+        assert_eq!(u16::from_be_bytes([pkt[4], pkt[5]]), 1);
+        // ancount, nscount, arcount = 0
+        assert_eq!(u16::from_be_bytes([pkt[6], pkt[7]]), 0);
+        assert_eq!(u16::from_be_bytes([pkt[8], pkt[9]]), 0);
+        assert_eq!(u16::from_be_bytes([pkt[10], pkt[11]]), 0);
+        // Question: google.com type A class IN
+        let qoff = 12;
+        assert_eq!(pkt[qoff], 6);
+        assert!(&pkt[qoff + 1..qoff + 7] == b"google");
+        assert_eq!(pkt[qoff + 7], 3);
+        assert!(&pkt[qoff + 8..qoff + 11] == b"com");
+        assert_eq!(pkt[qoff + 11], 0); // root label
+        assert_eq!(u16::from_be_bytes([pkt[qoff + 12], pkt[qoff + 13]]), 1); // type A
+        assert_eq!(u16::from_be_bytes([pkt[qoff + 14], pkt[qoff + 15]]), 1); // class IN
+    }
+
+    /// Build a minimal DNS response frame for testing parse_dns_response.
+    fn build_dns_response_frame(txid: u16, src_mac: &[u8; 6], answers: &[[u8; 4]]) -> [u8; 342] {
+        let mut frame = [0u8; 342];
+        let mut pos = 0;
+        // Ethernet: dst = us, src = server
+        frame[pos..pos + 6].copy_from_slice(src_mac); pos += 6;
+        frame[pos..pos + 6].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x35, 0x57]); pos += 6;
+        frame[pos..pos + 2].copy_from_slice(&[0x08, 0x00]); pos += 2;
+        // IPv4
+        let ip_off = pos;
+        frame[pos] = 0x45; pos += 1;
+        frame[pos] = 0x00; pos += 1;
+        let total_len: u16 = 20 + 8 + 256;
+        frame[pos..pos + 2].copy_from_slice(&total_len.to_be_bytes()); pos += 2;
+        frame[pos..pos + 4].copy_from_slice(&[0; 4]); pos += 4;
+        frame[pos] = 64; pos += 1;
+        frame[pos] = 17; pos += 1; // UDP
+        frame[pos..pos + 2].copy_from_slice(&[0; 2]); pos += 2; // checksum
+        frame[pos..pos + 4].copy_from_slice(&[10, 0, 0, 2]); pos += 4; // src
+        frame[pos..pos + 4].copy_from_slice(&[8, 8, 8, 8]); pos += 4; // dst (nameserver)
+        let cksum = ip_checksum(&frame[ip_off..ip_off + 20]);
+        frame[ip_off + 10..ip_off + 12].copy_from_slice(&cksum.to_be_bytes());
+        // UDP
+        frame[pos..pos + 2].copy_from_slice(&[0x00, 0x35]); pos += 2; // src 53
+        frame[pos..pos + 2].copy_from_slice(&[0x00, 0x35]); pos += 2; // dst 53
+        let udp_len: u16 = total_len - 20;
+        frame[pos..pos + 2].copy_from_slice(&udp_len.to_be_bytes()); pos += 2;
+        frame[pos..pos + 2].copy_from_slice(&[0; 2]); pos += 2; // checksum
+        // DNS
+        let dns_off = pos;
+        frame[dns_off..dns_off + 2].copy_from_slice(&txid.to_be_bytes());
+        frame[dns_off + 2] = 0x81; frame[dns_off + 3] = 0x80; // response, no error
+        let ancount = answers.len() as u16;
+        frame[dns_off + 6..dns_off + 8].copy_from_slice(&ancount.to_be_bytes());
+        // Question (same as query, skip the 12-byte header)
+        let qoff = dns_off + 12;
+        let query = build_dns_query("google.com", txid).unwrap();
+        let qlen = query.len();
+        let mut actual_q = qlen - 12; // skip header
+        for i in ((12)..qlen).rev() {
+            if query[i] != 0 { actual_q = i + 1 - 12; break; }
+        }
+        frame[qoff..qoff + actual_q].copy_from_slice(&query[12..12 + actual_q]);
+        // Answers
+        let mut aoff = qoff + actual_q;
+        for addr in answers {
+            // Name: compression pointer to question (offset 0xc = 12)
+            frame[aoff] = 0xC0; frame[aoff + 1] = 0x0C; aoff += 2;
+            // type A
+            frame[aoff] = 0x00; frame[aoff + 1] = 0x01; aoff += 2;
+            // class IN
+            frame[aoff] = 0x00; frame[aoff + 1] = 0x01; aoff += 2;
+            // TTL
+            frame[aoff..aoff + 4].copy_from_slice(&[0, 0, 0, 60]); aoff += 4;
+            // rdlength = 4
+            frame[aoff] = 0x00; frame[aoff + 1] = 0x04; aoff += 2;
+            // rdata = IP address
+            frame[aoff..aoff + 4].copy_from_slice(addr); aoff += 4;
+        }
+        frame
+    }
+
+    #[test]
+    fn test_parse_dns_response_wrong_txid() {
+        let m = [0x52, 0x54, 0x00, 0x12, 0x35, 0x56];
+        let frame = build_dns_response_frame(0x1234, &m, &[[142, 250, 165, 220]]);
+        assert!(parse_dns_response(&frame, frame.len(), 0xDEAD).is_none());
+    }
+
+    #[test]
+    fn test_parse_dns_response_no_answers() {
+        let m = [0x52, 0x54, 0x00, 0x12, 0x35, 0x56];
+        let mut frame = build_dns_response_frame(0x1234, &m, &[]);
+        // Set ancount to 1 but don't add any answer records
+        frame[26] = 0x00; frame[27] = 0x01;
+        assert!(parse_dns_response(&frame, frame.len(), 0x1234).is_none());
+    }
+
+    #[test]
+    fn test_parse_dns_response_too_short() {
+        assert!(parse_dns_response(&[0u8; 10], 10, 0x1234).is_none());
+    }
+
+    #[test]
+    fn test_encode_domain_too_long_label() {
+        // Label must be <= 63 bytes; this one is exactly 64
+        assert!(encode_domain("a.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.com").is_none());
+    }
+
+    #[test]
+    fn test_encode_domain_empty_label() {
+        assert!(encode_domain("google..com").is_none());
     }
 }

@@ -229,25 +229,30 @@ pub fn send(base: u64, data: &[u8]) -> bool {
         return false;
     }
 
+    let old_tdt = reg_read32(base, REG_TDT);
+    // Use descriptor at index old_tdt % NUM_TX_DESC
+    // This ensures we always use a descriptor that the hardware is about to process
+    let desc_idx = (old_tdt as usize) % NUM_TX_DESC;
+
     #[cfg(not(test))]
     unsafe {
         let buf = core::ptr::addr_of_mut!(TX_BUF) as *mut u8;
         for i in 0..data.len() {
             *buf.add(i) = data[i];
         }
-        let desc = &raw mut TX_DESCS.0[0];
+        let desc = &raw mut TX_DESCS.0[desc_idx];
         write_volatile(core::ptr::addr_of_mut!((*desc).length), data.len() as u16);
         write_volatile(core::ptr::addr_of_mut!((*desc).cmd), CMD_EOP | CMD_IFCS | CMD_RS);
         write_volatile(core::ptr::addr_of_mut!((*desc).status), 0u8);
     }
 
-    let old_tdt = reg_read32(base, REG_TDT);
+    // Ring TDT to trigger the send
     reg_write32(base, REG_TDT, old_tdt.wrapping_add(1));
 
     for _ in 0..2000000 {
         #[cfg(not(test))]
         let status = unsafe {
-            let desc = &raw const TX_DESCS.0[0];
+            let desc = &raw const TX_DESCS.0[desc_idx];
             read_volatile(core::ptr::addr_of!((*desc).status))
         };
         #[cfg(test)]
@@ -260,7 +265,7 @@ pub fn send(base: u64, data: &[u8]) -> bool {
 
     #[cfg(not(test))]
     let ok = unsafe {
-        let desc = &raw const TX_DESCS.0[0];
+        let desc = &raw const TX_DESCS.0[desc_idx];
         read_volatile(core::ptr::addr_of!((*desc).status)) & TX_STATUS_DD != 0
     };
     #[cfg(test)]

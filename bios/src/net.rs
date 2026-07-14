@@ -73,6 +73,32 @@ pub fn scan_network() {
                     print_ip(&cfg.gateway);
                 }
                 putc(b'\n');
+                puts("    Nameserver: ");
+                if cfg.nameserver == [0, 0, 0, 0] {
+                    puts("(none)");
+                } else {
+                    print_ip(&cfg.nameserver);
+                }
+                putc(b'\n');
+
+                // DNS lookup for google.com
+                puts("    DNS google.com: ");
+                if cfg.nameserver != [0, 0, 0, 0] {
+                    // Use gateway for both ARP and DNS destination
+                    // (QEMU slirp gateway forwards DNS queries)
+                    let dns_target = if cfg.gateway != [0, 0, 0, 0] { &cfg.gateway } else { &cfg.nameserver };
+                    match dns_lookup(bar0_u64, &mac, &cfg.yiaddr, dns_target, dns_target) {
+                        Some(ip) => {
+                            print_ip(&ip);
+                            putc(b'\n');
+                        }
+                        None => {
+                            puts("FAILED\n");
+                        }
+                    }
+                } else {
+                    puts("(no nameserver)\n");
+                }
             }
             None => {
                 puts("FAILED\n");
@@ -110,7 +136,7 @@ fn print_ip(ip: &[u8; 4]) {
 }
 
 /// Build a DISCOVER, send it, and poll for an OFFER.
-/// Returns the assigned IP/subnet/gateway on success.
+/// Returns the assigned IP/subnet/gateway/nameserver on success.
 fn dhcp_run(base: u64, mac: &[u8; 6]) -> Option<DhcpConfig> {
     let xid: u32 = 0x12345678;
 
@@ -127,4 +153,16 @@ fn dhcp_run(base: u64, mac: &[u8; 6]) -> Option<DhcpConfig> {
     let mut buf = [0u8; 1514];
     let copy_len = e1000_common::try_receive(base, &mut buf, 100_000_000)?;
     dhcp::parse_response(&buf, copy_len, xid, mac)
+}
+
+/// DNS lookup for google.com via the e1000 NIC.
+fn dns_lookup(base: u64, mac: &[u8; 6], our_ip: &[u8; 4], arp_target: &[u8; 4], nameserver: &[u8; 4]) -> Option<[u8; 4]> {
+    puts("DNS...");
+    let result = dhcp::dns_lookup_via_e1000(base, mac, our_ip, arp_target, nameserver, "google.com");
+    if result.is_some() {
+        puts("OK\n");
+    } else {
+        puts("FAILED\n");
+    }
+    result
 }

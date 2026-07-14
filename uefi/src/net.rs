@@ -201,7 +201,34 @@ fn scan_pci_direct(
                             w16(con_out, "\r\n  Gateway: ");
                             if cfg.gateway == [0, 0, 0, 0] { w16(con_out, "(none)"); }
                             else { print_ip(con_out, &cfg.gateway); }
+                            w16(con_out, "\r\n  Nameserver: ");
+                            if cfg.nameserver == [0, 0, 0, 0] {
+                                w16(con_out, "(none)");
+                            } else {
+                                print_ip(con_out, &cfg.nameserver);
+                            }
                             w16(con_out, "\r\n");
+
+                            // DNS lookup for google.com
+                            if cfg.nameserver != [0, 0, 0, 0] {
+                                w16(con_out, "  DNS google.com: ");
+                                let arp_target = if cfg.gateway != [0, 0, 0, 0] { &cfg.gateway } else { &cfg.nameserver };
+                                if let Some(dns_ip) = common::dhcp::dns_lookup_via_e1000(bar0 as u64, &mac, &cfg.yiaddr, arp_target, &cfg.nameserver, "google.com") {
+                                    w16(con_out, "resolved=");
+                                    put_dec(con_out, dns_ip[0] as u64);
+                                    w16(con_out, ".");
+                                    put_dec(con_out, dns_ip[1] as u64);
+                                    w16(con_out, ".");
+                                    put_dec(con_out, dns_ip[2] as u64);
+                                    w16(con_out, ".");
+                                    put_dec(con_out, dns_ip[3] as u64);
+                                    w16(con_out, "\r\n");
+                                } else {
+                                    w16(con_out, "FAILED\r\n");
+                                }
+                            } else {
+                                w16(con_out, "  DNS: (no nameserver)\r\n");
+                            }
                             return Some(cfg);
                         }
                         None => {
@@ -324,7 +351,41 @@ fn e1000_init_and_dhcp(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, bar0: u64) -> Opti
     put_dec(con_out, gw_bytes[2] as u64);
     w16(con_out, ".");
     put_dec(con_out, gw_bytes[3] as u64);
+    w16(con_out, " Nameserver=");
+    let ns_bytes = config.nameserver;
+    if ns_bytes == [0, 0, 0, 0] {
+        w16(con_out, "(none)");
+    } else {
+        put_dec(con_out, ns_bytes[0] as u64);
+        w16(con_out, ".");
+        put_dec(con_out, ns_bytes[1] as u64);
+        w16(con_out, ".");
+        put_dec(con_out, ns_bytes[2] as u64);
+        w16(con_out, ".");
+        put_dec(con_out, ns_bytes[3] as u64);
+    }
     w16(con_out, "\r\n");
+
+    // DNS lookup for google.com
+    if ns_bytes != [0, 0, 0, 0] {
+        w16(con_out, "DNS google.com: ");
+        let arp_target = if gw_bytes != [0, 0, 0, 0] { &gw_bytes } else { &ns_bytes };
+        if let Some(dns_ip) = common::dhcp::dns_lookup_via_e1000(bar0, &mac, &ip_bytes, arp_target, &ns_bytes, "google.com") {
+            w16(con_out, "resolved=");
+            put_dec(con_out, dns_ip[0] as u64);
+            w16(con_out, ".");
+            put_dec(con_out, dns_ip[1] as u64);
+            w16(con_out, ".");
+            put_dec(con_out, dns_ip[2] as u64);
+            w16(con_out, ".");
+            put_dec(con_out, dns_ip[3] as u64);
+            w16(con_out, "\r\n");
+        } else {
+            w16(con_out, "FAILED\r\n");
+        }
+    } else {
+        w16(con_out, "DNS: (no nameserver)\r\n");
+    }
 
     Some(config)
 }
@@ -735,6 +796,83 @@ fn try_receive(
     common::dhcp::parse_response(&frame, buffer_size as usize, xid, mac)
 }
 
+/// DNS lookup via SNP (UEFI Simple Network Protocol).
+/// Sends a DNS query for the given domain to the nameserver and returns the resolved A record.
+fn dns_lookup_snp(
+    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    snp: &EFI_SIMPLE_NETWORK_PROTOCOL,
+    mac: &[u8; 6],
+    our_ip: &[u8; 4],
+    nameserver: &[u8; 4],
+) -> Option<[u8; 4]> {
+    w16(con_out, "DNS...");
+    let txid: u16 = 0x1234;
+    let query = common::dhcp::build_dns_query("google.com", txid)?;
+    let qlen = query.len();
+
+    // Find actual length (trim trailing zeros)
+    let mut actual_len = qlen;
+    for i in (0..qlen).rev() {
+        if query[i] != 0 {
+            actual_len = i + 1;
+            break;
+        }
+    }
+
+    let mut frame = [0u8; 1514];
+    let frame_len = common::dhcp::build_dns_frame(
+        mac,
+        our_ip,
+        nameserver,
+        &query[..actual_len],
+        actual_len,
+        &mut frame,
+    );
+
+    let st = unsafe {
+        (snp.transmit)(
+            snp as *const _ as *mut _,
+            0,
+            frame_len as UINTN,
+            frame.as_mut_ptr() as *mut c_void,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    if st != EFI_SUCCESS {
+        return None;
+    }
+
+    // Poll for response
+    let mut buf = [0u8; 1514];
+    for _ in 0..500_000 {
+        let mut header_size: UINTN = 0;
+        let mut buffer_size: UINTN = 1514;
+        let mut src_addr = EFI_MAC_ADDRESS { addr: [0u8; 32] };
+        let mut dst_addr = EFI_MAC_ADDRESS { addr: [0u8; 32] };
+        let mut protocol: u16 = 0;
+        let st = unsafe {
+            (snp.receive)(
+                snp as *const _ as *mut _,
+                &mut header_size,
+                &mut buffer_size,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut src_addr,
+                &mut dst_addr,
+                &mut protocol,
+            )
+        };
+        if st == EFI_SUCCESS {
+            if let Some(dns_ip) = common::dhcp::parse_dns_response(&buf, buffer_size as usize, txid) {
+                return Some(dns_ip);
+            }
+        }
+        for _ in 0..20 { core::hint::spin_loop(); }
+    }
+    None
+}
+
 // ─── Public API ───
 
 pub fn scan_network_devices(
@@ -816,7 +954,33 @@ pub fn scan_network_devices(
                     w16(con_out, "\r\n  Gateway: ");
                     if cfg.gateway == [0,0,0,0] { w16(con_out, "(none)"); }
                     else { print_ip(con_out, &cfg.gateway); }
+                    w16(con_out, "\r\n  Nameserver: ");
+                    if cfg.nameserver == [0,0,0,0] {
+                        w16(con_out, "(none)");
+                    } else {
+                        print_ip(con_out, &cfg.nameserver);
+                    }
                     w16(con_out, "\r\n");
+
+                    // DNS lookup for google.com (SNP path uses full DISCOVER→OFFER→REQUEST→ACK)
+                    if cfg.nameserver != [0,0,0,0] {
+                        w16(con_out, "  DNS google.com: ");
+                        if let Some(dns_ip) = dns_lookup_snp(con_out, snp, &mac, &cfg.yiaddr, &cfg.nameserver) {
+                            w16(con_out, "resolved=");
+                            put_dec(con_out, dns_ip[0] as u64);
+                            w16(con_out, ".");
+                            put_dec(con_out, dns_ip[1] as u64);
+                            w16(con_out, ".");
+                            put_dec(con_out, dns_ip[2] as u64);
+                            w16(con_out, ".");
+                            put_dec(con_out, dns_ip[3] as u64);
+                            w16(con_out, "\r\n");
+                        } else {
+                            w16(con_out, "FAILED\r\n");
+                        }
+                    } else {
+                        w16(con_out, "(no nameserver)\r\n");
+                    }
                 }
                 None => {
                     w16(con_out, "FAILED\r\n");

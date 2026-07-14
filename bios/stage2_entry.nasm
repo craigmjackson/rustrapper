@@ -1,5 +1,5 @@
 ; Stage 2 entry stub
-; Loaded by MBR at physical 0x1000 (16 sectors = 8192 bytes max).
+; Loaded by MBR at physical 0x1000 (32 sectors = 16384 bytes max).
 ; Enables A20, enters protected mode, copies the embedded Rust payload
 ; from the high portion of the loaded blob to 1 MB, and jumps there.
 ;
