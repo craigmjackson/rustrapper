@@ -26,9 +26,9 @@ a tiny 16-bit MBR and protected-mode entry stub in NASM (~1 KB total).
 rustup target add x86_64-unknown-uefi aarch64-unknown-uefi aarch64-unknown-none
 
 # Install system dependencies
-# Arch:  pacman -S nasm mtools dosfstools qemu-system-x86 qemu-system-aarch64
-# Debian: apt install nasm mtools dosfstools qemu-system-x86 qemu-system-arm
-# Fedora: dnf install nasm mtools dosfstools qemu-system-x86 qemu-system-arm
+# Arch:  pacman -S nasm edk2-ovmf qemu-system-x86 qemu-system-aarch64
+# Debian: apt install nasm ovmf qemu-efi-aarch64 qemu-system-x86 qemu-system-arm
+# Fedora: dnf install nasm edk2-ovmf edk2-aarch64 qemu-system-x86 qemu-system-arm
 
 make all                          # Build everything
 make run-x86_64-uefi              # x86_64 UEFI in QEMU (e1000 NIC, full DHCP)
