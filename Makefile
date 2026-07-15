@@ -1,14 +1,14 @@
 # Rustrapper - Rust Bootloader
 # Targets: all, x86_64-uefi, aarch64-uefi, aarch64-bare, i386-bios
 # All code is Rust. The only non-Rust pieces are:
-#   - bios/mbr.asm          (512-byte MBR, loads sector 1+ and jumps to it)
-#   - bios/stage2_entry.nasm (enables A20, switches to PM, copies Rust payload
+#   - bios/src/mbr.asm          (512-byte MBR, loads sector 1+ and jumps to it)
+#   - bios/src/stage2_entry.nasm (enables A20, switches to PM, copies Rust payload
 #     from 0x1200 to 0x100000, zeros BSS, calls Rust _start)
 
 CARGO    := cargo
 NASM     := nasm
 BIN      := bin
-BIOS_SRC := bios
+BIOS_SRC := bios/src
 
 # x86_64 UEFI target
 UEFI_TARGET   := x86_64-unknown-uefi
@@ -40,17 +40,17 @@ $(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN)
 BIOS_RUST_TARGET := $(CURDIR)/targets/i386-unknown-none.json
 CARGO_NIGHTLY    := cargo +nightly
 
-$(BIN)/rust_payload.bin: $(shell find bios-rust common -name '*.rs') \
-                         bios-rust/link.ld Cargo.toml $(BIOS_RUST_TARGET) | $(BIN)
-	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-arg=-T$(CURDIR)/bios-rust/link.ld -C link-arg=-N" \
+$(BIN)/rust_payload.bin: $(shell find bios common -name '*.rs') \
+                         bios/link.ld Cargo.toml $(BIOS_RUST_TARGET) | $(BIN)
+	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-arg=-T$(CURDIR)/bios/link.ld -C link-arg=-N" \
 		$(CARGO_NIGHTLY) build -Zjson-target-spec -Zbuild-std=core \
-		--target $(BIOS_RUST_TARGET) --package bios-rust --release
-	objcopy -O binary target/i386-unknown-none/release/bios-rust $@
+		--target $(BIOS_RUST_TARGET) --package bios --release
+	objcopy -O binary target/i386-unknown-none/release/bios $@
 
 # Combined stage2 = entry stub + Rust payload (assembled by NASM, which
 # incbins the payload so it can compute copy offsets at assembly time)
 $(BIN)/stage2_entry.bin: $(BIN)/rust_payload.bin | $(BIN)
-	cd $(BIOS_SRC) && $(NASM) -f bin -o ../$@ stage2_entry.nasm
+	cd $(BIOS_SRC) && $(NASM) -f bin -o ../../$@ stage2_entry.nasm
 
 i386-bios: $(BIN)/bios.bin $(BIN)/stage2_entry.bin
 

@@ -72,9 +72,6 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 ## Project Structure
 
 ```
-├── bios/               # Minimal NASM for BIOS boot
-│   ├── mbr.asm         # 512‑byte MBR stage‑1
-│   └── stage2_entry.nasm # Entry stub for Rust stage2 (A20, protected mode, payload copy)
 ├── common/             # no_std Rust library (print, scan, menu, e1000, dhcp, arp, dns, netio)
 │   └── src/
 │       ├── menu.rs     # Shared [1]/[2] menu logic
@@ -85,11 +82,13 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 │       ├── dns.rs      # DNS query build + response parse + unicast UDP frame build
 │       ├── netio.rs    # e1000 glue: ARP resolve + DNS lookup + dns_resolve_and_print
 │       └── dhcp.rs     # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server)
-├── bios-rust/          # Rust 32-bit BIOS stage2
+├── bios/                 # Rust 32-bit BIOS stage2
 │   ├── Cargo.toml
 │   ├── link.ld         # Link at 0x100000
 │   ├── targets/i386-unknown-none.json
 │   └── src/
+│       ├── mbr.asm     # 512‑byte MBR stage‑1
+│       ├── stage2_entry.nasm # Entry stub for Rust stage2 (A20, protected mode, payload copy)
 │       ├── main.rs     # _start entry, menu dispatch
 │       ├── serial.rs   # COM1 driver (putc, getc, flush)
 │       ├── vga.rs      # VGA text-mode driver with scrolling

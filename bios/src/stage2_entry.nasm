@@ -114,5 +114,5 @@ times 512 - ($ - $$) db 0
 
 ; ── Rust payload embedded here ────────────────────────────────────────
 __payload_start:
-    incbin "../bin/rust_payload.bin"
+    incbin "../../bin/rust_payload.bin"
 __payload_end:

@@ -11,14 +11,13 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 ├── Cargo.toml              # Workspace root (5 member crates)
 ├── Makefile                # Build orchestration (make all, make run-*)
 ├── AGENTS.md               # This file
-├── bios/                   # Minimal NASM for BIOS boot
-│   ├── mbr.asm             # 16-bit MBR stage-1 (loads sector 1+ and jumps to it)
-│   └── stage2_entry.nasm   # Entry stub for Rust stage2 (A20, PM, copy to 1 MB)
-├── bios-rust/              # Rust 32-bit BIOS stage2 (nightly only)
+├── bios/                   # Rust 32-bit BIOS stage2 (nightly only)
 │   ├── Cargo.toml
 │   ├── link.ld             # Link at 0x100000
 │   ├── targets/i386-unknown-none.json  # Bare-metal i386 target spec
 │   └── src/
+│       ├── mbr.asm         # 16-bit MBR stage-1 (loads sector 1+ and jumps to it)
+│       ├── stage2_entry.nasm # Entry stub for Rust stage2 (A20, PM, copy to 1 MB)
 │       ├── main.rs         # _start entry, menu dispatch
 │       ├── serial.rs       # COM1 driver (putc, getc, flush)
 │       ├── vga.rs          # VGA text-mode driver with scrolling
@@ -140,13 +139,13 @@ The following details apply to the common e1000 driver used by all three targets
 - `show_menu(puts, putc, get_key)` prints `[1]/[2]` and polls `get_key` until the user presses a valid choice.
 - `puts`/`putc` are function pointers, so the same function can be used with ASCII (UART/BIOS) and UEFI (wrapped to u16 `OutputString`) output.
 
-### `bios/mbr.asm` — 16-bit MBR stage-1
+### `bios/src/mbr.asm` — 16-bit MBR stage-1
 
 - 512-byte MBR that loads 32 sectors (LBA 1-32, 16384 bytes) to physical `0x1000` and jumps to `0x0100:0x0000`.
 - The DAP (Disk Address Packet) at line 69 sets the sector count to 16. Increase this if the entry stub + payload grows past 16 sectors.
 - "MZ" at offset 0 executes as `dec bp; pop dx`, which overwrites DL (the boot-drive value). Always set DL explicitly before `int 0x13`.
 
-### `bios/stage2_entry.nasm` — BIOS entry stub for Rust stage2
+### `bios/src/stage2_entry.nasm` — BIOS entry stub for Rust stage2
 
 - Loaded by MBR at physical `0x1000` (part of the 16-sector load). First 512 bytes are the stub itself; the Rust payload (`incbin`'d) follows at offset 512.
 - Enables A20 gate (fast method via port `0x92`).
@@ -159,7 +158,7 @@ The following details apply to the common e1000 driver used by all three targets
 - Pushes `boot_drive` on the stack, calls `_start(0x100000)` via `call eax`.
 - Total size = 512 B stub + Rust payload (currently ~7.4 KB = ~15 sectors total, under 16-sector limit).
 
-### `bios-rust/src/main.rs` — Rust BIOS stage2 entry
+### `bios/src/main.rs` — Rust BIOS stage2 entry
 
 - `#![no_std]`, `#![no_main]`, `extern "C" fn _start(boot_drive: u32) -> !` as entry point.
 - **Dual output**: VGA text-mode driver (`vga.rs`) writing directly to `0xB8000` via `write_volatile` (COL/ROW statics in BSS, with scrolling when row ≥ 25), and serial output (`serial.rs`) via COM1 (`0x3F8`) using inline `asm!` for `in al, dx` / `out dx, al`.
@@ -170,7 +169,7 @@ The following details apply to the common e1000 driver used by all three targets
 - `#[cfg(not(test))]` guards on `_start` and `#[panic_handler]` so the crate can be compiled in the host test harness.
 - Custom `link.ld` links at `0x100000` (where the entry stub copies the payload).
 
-### `bios-rust/src/pci.rs` — BIOS Rust PCI scan (x86 I/O ports)
+### `bios/src/pci.rs` — BIOS Rust PCI scan (x86 I/O ports)
 
 - PCI config space via x86 I/O ports `0xCF8`/`0xCFC` (NOT ECAM like `arm64-bare/src/pci.rs`).
 - `pci_read32`/`pci_write32` use `out dx, eax` / `in eax, dx` inline `asm!` with the 32-bit address format `0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (offset & 0xFC)`.
@@ -179,14 +178,14 @@ The following details apply to the common e1000 driver used by all three targets
 - `storage_name` maps subclass codes to names (same as `arm64-bare/src/pci.rs`).
 - `pci_print_all` prints all PCI devices with vendor/device IDs and class descriptions.
 
-### `bios-rust/src/net.rs` — BIOS Rust e1000 NIC + DHCP
+### `bios/src/net.rs` — BIOS Rust e1000 NIC + DHCP
 
 - Thin wrapper around `common::e1000` and `common::dhcp`. All e1000 register access, descriptor ring setup, and DHCP frame build/parse are in `common/`; this file only handles the PCI scan, output, and glue.
 - `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the global print sink (serial + VGA).
 - `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
 - `print_mac` and `print_ip` are tiny local helpers (12 and 9 lines) that format MAC/IP to the global print sink.
 
-### `bios-rust/src/serial.rs` — BIOS Rust serial driver
+### `bios/src/serial.rs` — BIOS Rust serial driver
 
 - `putc` auto-translates `\n` → `\r\n` (writes `\r` first).
 - Polls LSR (0x3FD) bit 5 (THRE) before writing to 0x3F8.
@@ -194,7 +193,7 @@ The following details apply to the common e1000 driver used by all three targets
 - `flush` waits for TEMT (LSR bit 6).
 - Uses separate `asm!` blocks for reads and writes; poll block must NOT use `options(pure)`.
 
-### `bios-rust/src/vga.rs` — BIOS Rust VGA text-mode driver
+### `bios/src/vga.rs` — BIOS Rust VGA text-mode driver
 
 - Writes directly to `0xB8000` (VGA text buffer) via `read_volatile`/`write_volatile`.
 - COL/ROW statics in BSS track cursor position.
@@ -286,11 +285,11 @@ The following details apply to the common e1000 driver used by all three targets
 
 9. **`i386-unknown-none` requires `i128:128` in data-layout**: The custom target JSON (`targets/i386-unknown-none.json`) must include `i128:128` in the `data-layout` field. LLVM's 32-bit x86 default data layout has `i128:64` on some versions; omitting `i128:128` produces linker errors about missing `__multi3`.
 10. **Rust BIOS payload compiles as a 32-bit ELF, not a flat binary**: `cargo build` produces a relocatable ELF; `objcopy -O binary` strips it to a flat binary suitable for the entry stub's `incbin` and copy to 1 MB.
-11. **NASM incbin path relative to source, not CWD**: The `incbin "../bin/rust_payload.bin"` in `stage2_entry.nasm` resolves relative to the `bios/` directory. The Makefile runs NASM with `cd bios` to make this work.
+11. **NASM incbin path relative to source, not CWD**: The `incbin "../../bin/rust_payload.bin"` in `stage2_entry.nasm` resolves relative to the `bios/src/` directory. The Makefile runs NASM with `cd bios/src` to make this work.
 12. **Stack must be in low RAM, NOT BIOS ROM area for Rust BIOS stage2**: The BIOS ROM at `0xF0000`–`0xFFFFF` is read-only. Setting `esp` to `0x000FFFF0` (top of 1 MB) causes pushes to silently drop, corrupting return addresses and causing triple faults. Use `0x00070000` (low RAM) instead.
 13. **`cli` before Rust code in protected mode**: No IDT is set up after the protected mode switch. A hardware timer interrupt with no IDT causes a triple fault. Always `cli` before calling Rust code from the entry stub.
 14. **Inline `asm!` for serial I/O**: Use separate `asm!` blocks for the LSR poll (`in al, dx`) and data output (`out dx, al`). The poll block must NOT use `options(pure)` (I/O port reads are NOT idempotent — `pure` causes the compiler to optimize the poll loop into `jmp $`). Pass the output byte via `in("al") c` — do NOT let the compiler choose the register, as `in al, dx` clobbers AL.
-15. **BSS_ZERO_SIZE must cover actual BSS**: The entry stub zeros `BSS_ZERO_SIZE` bytes after the payload. If BSS grows (e1000 descriptor rings + packet buffers ~4.3 KB), increase `BSS_ZERO_SIZE` from `0x1000` to `0x2000`. Check with `readelf -S target/i386-unknown-none/release/bios-rust | grep .bss`.
+15. **BSS_ZERO_SIZE must cover actual BSS**: The entry stub zeros `BSS_ZERO_SIZE` bytes after the payload. If BSS grows (e1000 descriptor rings + packet buffers ~4.3 KB), increase `BSS_ZERO_SIZE` from `0x1000` to `0x2000`. Check with `readelf -S target/i386-unknown-none/release/bios | grep .bss`.
 16. **MBR sector count must match payload**: The MBR loads 32 sectors (16384 bytes). The entry stub + Rust payload is ~10.8 KB = 22 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
 17. **PCI Bus Master must be enabled for e1000 DMA**: SeaBIOS enables Memory Space (bit 1) but may NOT enable Bus Master (bit 2) in the PCI Command register. Without Bus Master, the e1000 can read descriptors (MMIO works) but TX descriptor write-back (DMA) silently fails — TDH advances but the status DD bit is never set. `pci_enable_bars` must always set command bits 0-2 (I/O + Memory + Bus Master), even if some are already set. Do NOT re-assign BARs if firmware already assigned them (check if BAR0 is non-zero before sizing).
 

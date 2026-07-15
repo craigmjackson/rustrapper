@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bios-rust"
+name = "bios"
 version = "0.1.0"
 dependencies = [
  "common",

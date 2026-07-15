@@ -1,7 +1,7 @@
 //! e1000-based network I/O glue: ARP resolve and DNS lookup.
 //!
 //! These functions use `common::e1000` for send/receive and `common::print`
-//! for output. They are shared by `bios-rust` and `arm64-bare` (both use the
+//! for output. They are shared by `bios` and `arm64-bare` (both use the
 //! global print callback). The UEFI target implements its own glue because it
 //! uses `con_out` for output and may use SNP instead of direct e1000.
 
