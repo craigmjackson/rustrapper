@@ -75,7 +75,7 @@ fn put_dec(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, val: u64) {
 pub fn scan_storage_devices(
     image_handle: EFI_HANDLE,
     system_table: &EFI_SYSTEM_TABLE,
-) -> ! {
+) {
     let con_out = unsafe { &*system_table.con_out };
     let gbs = system_table.boot_services;
 
@@ -100,7 +100,10 @@ pub fn scan_storage_devices(
 
     if status != EFI_SUCCESS || handle_count == 0 {
         w16(con_out, "No storage devices found.\r\n");
-        loop {}
+        unsafe {
+            free_pool(handle_buffer as *mut c_void);
+        }
+        return;
     }
 
     w16(con_out, "Found ");
@@ -213,6 +216,4 @@ pub fn scan_storage_devices(
     }
 
     w16(con_out, "Scan complete.\r\n");
-
-    loop {}
 }

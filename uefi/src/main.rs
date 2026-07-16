@@ -70,11 +70,10 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
     let con_out = unsafe { &*system_table.con_out };
     net::w16(con_out, "Rustrapper UEFI\r\n");
 
-    match show_menu(u16_puts, u16_putc, get_key) {
-        MenuAction::StorageScan => scan::scan_storage_devices(image_handle, system_table),
-        MenuAction::NetworkBoot => {
-            net::scan_network_devices(image_handle, system_table);
-            loop {}
+    loop {
+        match show_menu(u16_puts, u16_putc, get_key) {
+            MenuAction::StorageScan => scan::scan_storage_devices(image_handle, system_table),
+            MenuAction::NetworkBoot => net::scan_network_devices(image_handle, system_table),
         }
     }
 }

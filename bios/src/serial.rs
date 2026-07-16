@@ -18,18 +18,6 @@ fn putc_raw(c: u8) {
     }
 }
 
-pub fn flush() {
-    unsafe {
-        loop {
-            let lsr: u8;
-            core::arch::asm!("in al, dx", in("dx") 0x3FDu16, out("al") lsr);
-            if lsr & 0x40 != 0 {
-                break;
-            }
-        }
-    }
-}
-
 pub fn getc() -> Option<u8> {
     unsafe {
         let lsr: u8;

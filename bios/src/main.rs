@@ -30,19 +30,18 @@ pub extern "C" fn _start(_boot_drive: u32) -> ! {
     print::init(dual_putc);
     print::puts("\nRustrapper BIOS Stage2 (Rust)\n");
     pci::pci_print_all();
-    match show_menu(common::print::puts, common::print::putc, serial::getc) {
-        MenuAction::StorageScan => {
-            print::puts("\nStorage devices:\n");
-            scan::scan_devices(pci::detect_device);
-        }
-        MenuAction::NetworkBoot => {
-            print::puts("\n");
-            net::scan_network();
+    loop {
+        match show_menu(common::print::puts, common::print::putc, serial::getc) {
+            MenuAction::StorageScan => {
+                print::puts("\nStorage devices:\n");
+                scan::scan_devices(pci::detect_device);
+            }
+            MenuAction::NetworkBoot => {
+                print::puts("\n");
+                net::scan_network();
+            }
         }
     }
-    print::puts("Halting.\n");
-    serial::flush();
-    loop {}
 }
 
 #[cfg(not(test))]

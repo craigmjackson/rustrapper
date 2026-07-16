@@ -23,7 +23,7 @@ BARE_ARM64_TARGET := aarch64-unknown-none
         run-x86_64-uefi-rom run-i386-bios-rom \
         i386-bios run-i386-bios check-deps
 
-all: x86_64-uefi aarch64-uefi aarch64-bare
+all: x86_64-uefi aarch64-uefi aarch64-bare i386-bios x86_64-uefi-rom i386-bios-rom
 
 # Create output directory
 $(BIN):

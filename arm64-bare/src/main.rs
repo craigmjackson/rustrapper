@@ -52,19 +52,17 @@ pub extern "C" fn main() -> ! {
     print::init(uart::putc);
     print::puts("\nRustrapper ARM64 Bare-Metal\n");
     pci::pci_print_all();
-    match show_menu(common::print::puts, common::print::putc, uart::getc) {
-        MenuAction::StorageScan => {
-            print::puts("\nStorage devices:\n");
-            scan::scan_devices(pci::detect_device);
-        }
-        MenuAction::NetworkBoot => {
-            print::puts("\n");
-            net::scan_network();
-        }
-    }
-    print::puts("Halting.\n");
     loop {
-        unsafe { core::arch::asm!("wfi") }
+        match show_menu(common::print::puts, common::print::putc, uart::getc) {
+            MenuAction::StorageScan => {
+                print::puts("\nStorage devices:\n");
+                scan::scan_devices(pci::detect_device);
+            }
+            MenuAction::NetworkBoot => {
+                print::puts("\n");
+                net::scan_network();
+            }
+        }
     }
 }
 
