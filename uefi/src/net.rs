@@ -147,6 +147,141 @@ impl DirectMmioE1000 {
 }
 
 
+/// Scan PCI bus for e1000 and return its BAR0 address.
+fn find_e1000_bar0() -> Option<u64> {
+    for bus in 0..=255u16 {
+        for dev in 0..32u8 {
+            for func in 0..8u8 {
+                let vendor_dev = pci_read_config32(bus as u8, dev, func, 0);
+                if vendor_dev == 0xFFFFFFFF {
+                    if func == 0 { break; }
+                    continue;
+                }
+                let vendor = vendor_dev as u16;
+                let device = (vendor_dev >> 16) as u16;
+                if vendor == 0x8086 && device == 0x100E {
+                    let bar0 = pci_read_config32(bus as u8, dev, func, 0x10) & !0xF;
+                    if bar0 != 0 { return Some(bar0 as u64); }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// TFTP download using direct e1000 MMIO (same path as BIOS)
+fn tftp_download_e1000(
+    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    e1000: &DirectMmioE1000,
+    mac: &[u8; 6],
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    filename: &str,
+    sink: &mut crate::mem::UefiMemorySink,
+) -> Option<usize> {
+    use common::tftp::*;
+
+    let mut rrq_buf = [0u8; 512];
+    let rrq_len = build_rrq(filename, &mut rrq_buf);
+
+    let mut frame = [0u8; 1514];
+    let frame_len = build_udp_frame(mac, src_ip, dst_ip, 68, 69, &rrq_buf[..rrq_len], &mut frame)?;
+
+    w16(con_out, "  TFTP: Sending RRQ...\r\n");
+    if !e1000.send(&frame[..frame_len]) {
+        w16(con_out, "  TFTP: RRQ send FAILED\r\n");
+        return None;
+    }
+    w16(con_out, "  TFTP: RRQ sent, waiting...\r\n");
+
+    let mut blksize = DEFAULT_BLKSIZE;
+    let mut total_size = 0usize;
+    let mut recv_buf = [0u8; 1514];
+    let mut server_port: Option<u16> = None;
+
+    loop {
+        let copy_len = match e1000.receive_into(&mut recv_buf) {
+            Some(len) => len,
+            None => {
+                w16(con_out, "  TFTP: receive timeout\r\n");
+                return None;
+            }
+        };
+
+        // Handle ARP requests from the TFTP server
+        if copy_len >= 42 && recv_buf[12] == 0x08 && recv_buf[13] == 0x06 {
+            let off = 14;
+            if off + 28 <= copy_len && recv_buf[off + 6] == 0x00 && recv_buf[off + 7] == 0x01 {
+                let tpa = [recv_buf[off + 24], recv_buf[off + 25], recv_buf[off + 26], recv_buf[off + 27]];
+                if tpa == *src_ip {
+                    let mut arp_reply = [0u8; 1514];
+                    if let Some(reply_len) = common::arp::build_reply(mac, *src_ip, &recv_buf, &mut arp_reply) {
+                        e1000.send(&arp_reply[..reply_len]);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Learn server's ephemeral port from first response
+        if server_port.is_none() {
+            server_port = Some(extract_src_port(&recv_buf, copy_len));
+        }
+        let sport = server_port.unwrap_or(69);
+
+        // Strip Ethernet+IP+UDP headers to get TFTP payload
+        if copy_len < 42 { continue; }
+        let ip_hdr_len = ((recv_buf[14] & 0x0F) as usize) * 4;
+        let udp_offset = 14 + ip_hdr_len;
+        if udp_offset + 8 > copy_len { continue; }
+        let tftp_payload = &recv_buf[udp_offset + 8..copy_len];
+        let tftp_len = tftp_payload.len();
+
+        // Detect TFTP ERROR packets (opcode 5)
+        if tftp_len >= 4 {
+            let opcode = u16::from_be_bytes([tftp_payload[0], tftp_payload[1]]);
+            if opcode == 5 {
+                w16(con_out, "  TFTP: ERROR from server\r\n");
+                return None;
+            }
+        }
+
+        // Check if it's an OACK
+        if let Some((new_blksize, _tsize)) = parse_oack(tftp_payload, tftp_len) {
+            blksize = new_blksize;
+            let mut ack_buf = [0u8; 4];
+            let ack_len = build_ack(0, &mut ack_buf);
+            let mut ack_frame = [0u8; 1514];
+            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, sport, &ack_buf[..ack_len], &mut ack_frame) {
+                e1000.send(&ack_frame[..ack_frame_len]);
+            }
+            continue;
+        }
+
+        // Check if it's a DATA packet
+        if let Some((block, data)) = parse_data(tftp_payload, tftp_len) {
+            if sink.write_block(data).is_err() {
+                return None;
+            }
+            total_size += data.len();
+
+            let mut ack_buf = [0u8; 4];
+            let ack_len = build_ack(block, &mut ack_buf);
+            let mut ack_frame = [0u8; 1514];
+            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, sport, &ack_buf[..ack_len], &mut ack_frame) {
+                e1000.send(&ack_frame[..ack_frame_len]);
+            }
+
+            if data.len() < blksize {
+                break;
+            }
+        }
+    }
+
+    sink.finalize(total_size).ok()?;
+    Some(total_size)
+}
+
 fn scan_pci_direct(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
 ) -> Option<common::dhcp::DhcpConfig> {
@@ -666,19 +801,23 @@ fn dhcp_run(
         for _ in 0..100 { core::hint::spin_loop(); }
     }
 
-    w16(con_out, "Sending DHCPDISCOVER...");
-    let discover = common::dhcp::build_discover(xid, mac);
-    if !send_udp_dhcp(snp, mac, &discover, 300) {
-        w16(con_out, "send failed\r\n");
-        return None;
-    }
-    w16(con_out, "sent, waiting for OFFER...\r\n");
-
-    for _ in 0..500000 {
-        if let Some(cfg) = try_receive(snp, xid, mac) {
-            return Some(cfg);
+    for retry in 0..4u32 {
+        w16(con_out, "Sending DHCPDISCOVER (try ");
+        put_dec(con_out, retry as u64 + 1);
+        w16(con_out, ")...");
+        let discover = common::dhcp::build_discover(xid, mac);
+        if !send_udp_dhcp(snp, mac, &discover, 300) {
+            w16(con_out, "send failed\r\n");
+            return None;
         }
-        for _ in 0..20 { core::hint::spin_loop(); }
+        w16(con_out, "sent\r\n");
+
+        for _ in 0..500000 {
+            if let Some(cfg) = try_receive(snp, xid, mac) {
+                return Some(cfg);
+            }
+            for _ in 0..20 { core::hint::spin_loop(); }
+        }
     }
 
     w16(con_out, "timeout\r\n");
@@ -839,7 +978,6 @@ fn dns_lookup_snp(
     let frame_len = common::dns::build_frame(
         mac, src_ip, dst_mac, dst_ip, src_port, &query, query_len, &mut frame,
     );
-    restart_snp(snp);
     if !send_raw_snp(snp, &frame[..frame_len]) {
         return None;
     }
@@ -948,6 +1086,329 @@ fn dns_resolve_e1000(
 
 // ─── Public API ───
 
+/// Helper function for execute_file callback
+fn uefi_puts(s: &str) {
+    if let Some(st) = unsafe { crate::SYSTEM_TABLE } {
+        let con_out = unsafe { &*st.con_out };
+        w16(con_out, s);
+    }
+}
+
+/// PXE boot: download file via TFTP and execute it
+fn pxe_boot_snp(
+    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    snp: &EFI_SIMPLE_NETWORK_PROTOCOL,
+    mac: &[u8; 6],
+    cfg: &common::dhcp::DhcpConfig,
+    image_handle: EFI_HANDLE,
+    system_table: &EFI_SYSTEM_TABLE,
+) {
+    // Extract filename from bootfile (null-terminated)
+    let filename_len = cfg.bootfile.iter().position(|&b| b == 0).unwrap_or(128);
+    let filename = match core::str::from_utf8(&cfg.bootfile[..filename_len]) {
+        Ok(s) => s,
+        Err(_) => {
+            w16(con_out, "  PXE: Invalid bootfile name\r\n");
+            return;
+        }
+    };
+    
+    w16(con_out, "  PXE: Downloading ");
+    w16(con_out, filename);
+    w16(con_out, " from ");
+    print_ip(con_out, &cfg.next_server);
+    w16(con_out, "...\r\n");
+    
+    // SNP receive is unreliable on OVMF for TFTP (blocks or drops packets).
+    // Find the e1000 BAR0 via PCI scan and use direct MMIO for TFTP instead.
+    w16(con_out, "  PXE: Finding e1000 for direct TFTP...\r\n");
+    if let Some(bar0) = find_e1000_bar0() {
+        w16(con_out, "  PXE: e1000 BAR0=0x");
+        put_dec(con_out, bar0 as u64);
+        w16(con_out, ", using direct MMIO\r\n");
+        
+        let e1000 = DirectMmioE1000::new(bar0);
+        if e1000.init() {
+            let mut sink = crate::mem::UefiMemorySink::new(system_table, 16 * 1024 * 1024);
+            let tftp_result = tftp_download_e1000(con_out, &e1000, mac, &cfg.yiaddr, &cfg.next_server, filename, &mut sink);
+            match tftp_result {
+                Some(size) => {
+                    w16(con_out, "  PXE: Downloaded ");
+                    put_dec(con_out, size as u64);
+                    w16(con_out, " bytes\r\n");
+                    crate::loader::execute_file(
+                        system_table,
+                        image_handle,
+                        sink.buffer(),
+                        size,
+                        uefi_puts,
+                    );
+                    return;
+                }
+                None => {
+                    w16(con_out, "  PXE: Direct TFTP failed\r\n");
+                }
+            }
+        } else {
+            w16(con_out, "  PXE: e1000 init failed\r\n");
+        }
+    } else {
+        w16(con_out, "  PXE: No e1000 found on PCI bus\r\n");
+    }
+
+    // Fallback: try SNP TFTP
+    w16(con_out, "  PXE: Trying SNP TFTP...\r\n");
+    let mut sink = crate::mem::UefiMemorySink::new(system_table, 16 * 1024 * 1024);
+    let tftp_result = tftp_download_snp(con_out, snp, mac, &cfg.yiaddr, &cfg.next_server, filename, &mut sink);
+    
+    match tftp_result {
+        Some(size) => {
+            w16(con_out, "  PXE: Downloaded ");
+            put_dec(con_out, size as u64);
+            w16(con_out, " bytes\r\n");
+            
+            crate::loader::execute_file(
+                system_table,
+                image_handle,
+                sink.buffer(),
+                size,
+                uefi_puts,
+            );
+        }
+        None => {
+            w16(con_out, "  PXE: Download failed\r\n");
+        }
+    }
+}
+
+/// TFTP download using SNP
+fn tftp_download_snp(
+    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    snp: &EFI_SIMPLE_NETWORK_PROTOCOL,
+    mac: &[u8; 6],
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    filename: &str,
+    sink: &mut crate::mem::UefiMemorySink,
+) -> Option<usize> {
+    use common::tftp::*;
+    
+    let mut rrq_buf = [0u8; 512];
+    let rrq_len = build_rrq(filename, &mut rrq_buf);
+    
+    let mut frame = [0u8; 1514];
+    let frame_len = build_udp_frame(mac, src_ip, dst_ip, 68, 69, &rrq_buf[..rrq_len], &mut frame)?;
+    
+    w16(con_out, "  PXE: Sending RRQ...\r\n");
+    let status = unsafe {
+        (snp.transmit)(
+            snp as *const _ as *mut _,
+            0,
+            frame_len as u64,
+            frame.as_mut_ptr() as *mut _,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    if status != EFI_SUCCESS {
+        w16(con_out, "  PXE: RRQ transmit failed: ");
+        put_dec(con_out, status as u64);
+        w16(con_out, "\r\n");
+        return None;
+    }
+    w16(con_out, "  PXE: RRQ sent, waiting for response...\r\n");
+    
+    let mut blksize = DEFAULT_BLKSIZE;
+    let mut total_size = 0usize;
+    let mut recv_buf = [0u8; 1514];
+    let mut server_port: Option<u16> = None;
+    let mut iterations = 0u64;
+    let mut received = 0u32;
+    
+    w16(con_out, "  PXE: entering receive loop\r\n");
+    loop {
+        iterations += 1;
+        if iterations <= 3 || iterations % 5_000_000 == 0 {
+            w16(con_out, "  PXE: iter=");
+            put_dec(con_out, iterations);
+            w16(con_out, " pkts=");
+            put_dec(con_out, received as u64);
+            w16(con_out, "\r\n");
+        }
+        if iterations > 50_000_000 {
+            w16(con_out, "  PXE: receive timeout after ");
+            put_dec(con_out, iterations);
+            w16(con_out, " iters\r\n");
+            return None;
+        }
+        
+        let mut buf_size: u64 = 1514;
+        let mut header_size: u64 = 0;
+        let mut src_addr = [0u8; 32];
+        let mut dest_addr = [0u8; 32];
+        let mut protocol: u16 = 0;
+        let status = unsafe {
+            (snp.receive)(
+                snp as *const _ as *mut _,
+                &mut header_size,
+                &mut buf_size,
+                recv_buf.as_mut_ptr() as *mut _,
+                src_addr.as_mut_ptr() as *mut _,
+                dest_addr.as_mut_ptr() as *mut _,
+                &mut protocol,
+            )
+        };
+        
+        if status != EFI_SUCCESS {
+            continue;
+        }
+        received += 1;
+        
+        let copy_len = buf_size as usize;
+        
+        if copy_len < 14 { continue; }
+        
+        // Handle ARP requests from the TFTP server
+        if recv_buf[12] == 0x08 && recv_buf[13] == 0x06 {
+            let off = 14;
+            if off + 28 <= copy_len && recv_buf[off + 6] == 0x00 && recv_buf[off + 7] == 0x01 {
+                let tpa = [recv_buf[off + 24], recv_buf[off + 25], recv_buf[off + 26], recv_buf[off + 27]];
+                if tpa == *src_ip {
+                    let mut arp_reply = [0u8; 1514];
+                    if let Some(reply_len) = common::arp::build_reply(mac, *src_ip, &recv_buf, &mut arp_reply) {
+                        send_raw_snp(snp, &arp_reply[..reply_len]);
+                    }
+                    continue;
+                }
+            }
+        }
+        
+        // Skip non-IPv4 frames
+        if recv_buf[12] != 0x08 || recv_buf[13] != 0x00 { continue; }
+        if copy_len < 42 { continue; }
+        
+        // Learn server's ephemeral port from first response
+        if server_port.is_none() {
+            server_port = Some(extract_src_port(&recv_buf, copy_len));
+        }
+        let sport = server_port.unwrap_or(69);
+        
+        // Strip Ethernet+IP+UDP headers to get TFTP payload
+        let ip_hdr_len = ((recv_buf[14] & 0x0F) as usize) * 4;
+        let udp_offset = 14 + ip_hdr_len;
+        if udp_offset + 8 > copy_len { continue; }
+        let tftp_payload = &recv_buf[udp_offset + 8..copy_len];
+        let tftp_len = tftp_payload.len();
+        
+        // Detect TFTP ERROR packets (opcode 5)
+        if tftp_len >= 4 {
+            let opcode = u16::from_be_bytes([tftp_payload[0], tftp_payload[1]]);
+            if opcode == 5 {
+                w16(con_out, "  PXE: TFTP ERROR\r\n");
+                return None;
+            }
+        }
+        
+        // Check if it's an OACK
+        if let Some((new_blksize, _tsize)) = parse_oack(tftp_payload, tftp_len) {
+            blksize = new_blksize;
+            let mut ack_buf = [0u8; 4];
+            let ack_len = build_ack(0, &mut ack_buf);
+            let mut ack_frame = [0u8; 1514];
+            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, sport, &ack_buf[..ack_len], &mut ack_frame) {
+                send_raw_snp(snp, &ack_frame[..ack_frame_len]);
+            }
+            continue;
+        }
+        
+        // Check if it's a DATA packet
+        if let Some((block, data)) = parse_data(tftp_payload, tftp_len) {
+            if sink.write_block(data).is_err() {
+                return None;
+            }
+            total_size += data.len();
+            
+            let mut ack_buf = [0u8; 4];
+            let ack_len = build_ack(block, &mut ack_buf);
+            let mut ack_frame = [0u8; 1514];
+            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, sport, &ack_buf[..ack_len], &mut ack_frame) {
+                send_raw_snp(snp, &ack_frame[..ack_frame_len]);
+            }
+            
+            if data.len() < blksize {
+                break;
+            }
+        }
+    }
+    
+    sink.finalize(total_size).ok()?;
+    Some(total_size)
+}
+
+/// Extract source port from a received Ethernet+IPv4+UDP frame.
+fn extract_src_port(frame: &[u8], len: usize) -> u16 {
+    if len < 42 { return 69; }
+    let ip_hdr_len = ((frame[14] & 0x0F) as usize) * 4;
+    let udp_offset = 14 + ip_hdr_len;
+    if udp_offset + 4 > len { return 69; }
+    u16::from_be_bytes([frame[udp_offset], frame[udp_offset + 1]])
+}
+
+/// Build a UDP frame for TFTP
+fn build_udp_frame(
+    src_mac: &[u8; 6],
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    frame: &mut [u8; 1514],
+) -> Option<usize> {
+    // Ethernet header
+    frame[0..6].copy_from_slice(&[0xff; 6]); // broadcast for now
+    frame[6..12].copy_from_slice(src_mac);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // IPv4
+    
+    // IPv4 header
+    let ip_hdr_len = 20;
+    let udp_hdr_len = 8;
+    let total_len = ip_hdr_len + udp_hdr_len + payload.len();
+    
+    frame[14] = 0x45; // version 4, IHL 5
+    frame[15] = 0x00; // DSCP/ECN
+    frame[16..18].copy_from_slice(&(total_len as u16).to_be_bytes());
+    frame[18..20].copy_from_slice(&0u16.to_be_bytes()); // identification
+    frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // flags/fragment
+    frame[22] = 64; // TTL
+    frame[23] = 17; // UDP protocol
+    frame[24..26].copy_from_slice(&0u16.to_be_bytes()); // checksum placeholder
+    frame[26..30].copy_from_slice(src_ip);
+    frame[30..34].copy_from_slice(dst_ip);
+    
+    // Compute IP header checksum
+    let mut sum = 0u32;
+    for i in (14..14 + ip_hdr_len).step_by(2) {
+        sum += u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    frame[24..26].copy_from_slice(&cksum.to_be_bytes());
+    
+    // UDP header
+    frame[34..36].copy_from_slice(&src_port.to_be_bytes());
+    frame[36..38].copy_from_slice(&dst_port.to_be_bytes());
+    frame[38..40].copy_from_slice(&((udp_hdr_len + payload.len()) as u16).to_be_bytes());
+    frame[40..42].copy_from_slice(&0u16.to_be_bytes()); // UDP checksum (skip for now)
+    
+    // Payload
+    frame[42..42 + payload.len()].copy_from_slice(payload);
+    
+    Some(14 + total_len)
+}
+
 pub fn scan_network_devices(
     image_handle: EFI_HANDLE,
     system_table: &EFI_SYSTEM_TABLE,
@@ -1030,12 +1491,17 @@ pub fn scan_network_devices(
                     w16(con_out, "\r\n");
 
                     dns_resolve_snp(con_out, snp, &mac, &cfg);
+                    
+                    // PXE boot: download and execute if next_server and bootfile are present
+                    if cfg.next_server != [0, 0, 0, 0] && cfg.bootfile[0] != 0 {
+                        pxe_boot_snp(con_out, snp, &mac, &cfg, image_handle, system_table);
+                    }
+                    snp_handled = true;
                 }
                 None => {
-                    w16(con_out, "FAILED\r\n");
+                    w16(con_out, "FAILED\r\nSNP DHCP failed, trying direct e1000...\r\n");
                 }
             }
-            snp_handled = true;
         }
     }
 

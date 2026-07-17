@@ -6,6 +6,10 @@ mod uart;
 mod pci;
 #[cfg(not(test))]
 mod net;
+#[cfg(not(test))]
+mod mem;
+#[cfg(not(test))]
+mod loader;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;

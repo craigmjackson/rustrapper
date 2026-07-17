@@ -11,13 +11,14 @@ a tiny 16-bit MBR and protected-mode entry stub in NASM (~1 KB total).
 
 ## Features
 
-- **BIOS** — 16‑bit MBR + 32-bit Rust stage2: menu, PCI storage scan, e1000 MMIO DHCP + DNS lookup
-- **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, ARP resolve, DNS lookup, storage scan
+- **BIOS** — 16‑bit MBR + 32-bit Rust stage2: menu, PCI storage scan, e1000 MMIO DHCP + DNS lookup, PXE boot
+- **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, ARP resolve, DNS lookup, storage scan, PXE boot
 - **UEFI option ROM** — PCI expansion ROM with direct e1000 MMIO driver (no UEFI protocols needed during DXE)
 - **ARM64 UEFI** — Same Rust code compiled for `aarch64-unknown-uefi`
-- **ARM64 bare‑metal** — No firmware: PL011 UART, PCI ECAM walk, AHCI probe
+- **ARM64 bare‑metal** — No firmware: PL011 UART, PCI ECAM walk, AHCI probe, PXE boot
 - **BIOS option ROM** — Legacy PCI expansion ROM from `rust_payload.bin` via `romwrap --bios`
 - **ROM wrapper** — Rust CLI tool wraps PE/COFF into UEFI PCI option ROM (`--bios` for BIOS option ROM)
+- **PXE Boot** — DHCP options 66/67, TFTP client with block size negotiation, executes PE/COFF/ELF32/ELF64/Multiboot
 
 ## Quick Start
 
@@ -31,9 +32,12 @@ rustup target add x86_64-unknown-uefi aarch64-unknown-uefi aarch64-unknown-none
 # Fedora: dnf install nasm edk2-ovmf edk2-aarch64 qemu-system-x86 qemu-system-arm
 
 make all                          # Build everything
-make run-x86_64-uefi              # x86_64 UEFI in QEMU (e1000 NIC, full DHCP)
+make run-x86_64-uefi              # x86_64 UEFI in QEMU (e1000 NIC, full DHCP, PXE boot)
 make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM + DHCP
+make run-i386-bios                # Legacy BIOS with PXE boot support
 ```
+
+The `run-*` targets automatically create a `tftp-root/` directory containing bootloader binaries and a test file. QEMU's built-in TFTP server serves these files when DHCP options 66/67 are present.
 
 ## Build Targets
 
@@ -61,18 +65,29 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 
 ## Network Support
 
-| Target                   | NIC            | Method                          | DHCP                                      |
-| ------------------------ | -------------- | ------------------------------- | ----------------------------------------- |
-| BIOS Rust stage2 (disk)  | e1000          | PCI I/O ports + MMIO            | Full DHCP (DISCOVER→OFFER)                |
-| BIOS (option ROM)        | e1000          | PCI option ROM with PCIR header | e1000 I/O BAR driver (real hardware only) |
-| x86_64 UEFI (disk)       | e1000          | SNP protocol                    | Full DHCP (DISCOVER/OFFER/REQUEST/ACK)    |
-| x86_64 UEFI (option ROM) | e1000          | Direct MMIO + I/O port PCI scan | Full DHCP (DISCOVER→OFFER)                |
-| ARM64 UEFI               | virtio-net-pci | SNP protocol                    | Single-transmit DHCP (DISCOVER→OFFER)     |
+| Target                   | NIC            | Method                          | DHCP                                      | PXE                                      |
+| ------------------------ | -------------- | ------------------------------- | ----------------------------------------- | ----------------------------------------- |
+| BIOS Rust stage2 (disk)  | e1000          | PCI I/O ports + MMIO            | Full DHCP (DISCOVER→OFFER)                | TFTP download + execute (ELF32/Multiboot) |
+| BIOS (option ROM)        | e1000          | PCI option ROM with PCIR header | e1000 I/O BAR driver (real hardware only) | TFTP download + execute (ELF32/Multiboot) |
+| x86_64 UEFI (disk)       | e1000          | SNP protocol                    | Full DHCP (DISCOVER/OFFER/REQUEST/ACK)    | TFTP download + execute (PE/COFF)         |
+| x86_64 UEFI (option ROM) | e1000          | Direct MMIO + I/O port PCI scan | Full DHCP (DISCOVER→OFFER)                | TFTP download + execute (PE/COFF)         |
+| ARM64 UEFI               | virtio-net-pci | SNP protocol                    | Single-transmit DHCP (DISCOVER→OFFER)     | TFTP download + execute (PE/COFF)         |
+| ARM64 bare-metal         | e1000          | PCI ECAM + MMIO                 | Full DHCP (DISCOVER→OFFER)                | TFTP download + execute (ELF64)           |
+
+## PXE Boot
+
+All targets support PXE boot via DHCP options 66 (TFTP server) and 67 (bootfile name). When these options are present in the DHCP response, the bootloader automatically:
+
+1. Downloads the specified file via TFTP (RFC 1350 with RFC 2348 block size negotiation)
+2. Detects the file format by magic number (PE/COFF, ELF32, ELF64, Multiboot, Multiboot2, text, or binary)
+3. Executes the file if it's a recognized executable format, or displays it if it's text
+
+QEMU's built-in TFTP server (`-netdev user,tftp=...,bootfile=...`) provides PXE services without requiring root privileges or external servers. The `tftp-root/` directory is automatically populated with bootloader binaries and a test file.
 
 ## Project Structure
 
 ```
-├── common/             # no_std Rust library (print, scan, menu, e1000, dhcp, arp, dns, netio)
+├── common/             # no_std Rust library (print, scan, menu, e1000, dhcp, arp, dns, netio, tftp, loader)
 │   └── src/
 │       ├── menu.rs     # Shared [1]/[2] menu logic
 │       ├── print.rs    # Callback-based print (putc/puts/print_hex/print_dec/print_ip)
@@ -81,7 +96,9 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 │       ├── arp.rs      # ARP request build + reply parse
 │       ├── dns.rs      # DNS query build + response parse + unicast UDP frame build
 │       ├── netio.rs    # e1000 glue: ARP resolve + DNS lookup + dns_resolve_and_print
-│       └── dhcp.rs     # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server)
+│       ├── dhcp.rs     # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server, PXE options)
+│       ├── tftp.rs     # TFTP client (RFC 1350) with block size negotiation (RFC 2348), streaming transfer
+│       └── loader.rs   # File format detection (PE/COFF, ELF32, ELF64, Multiboot, text, binary)
 ├── bios/                 # Rust 32-bit BIOS stage2
 │   ├── Cargo.toml
 │   ├── link.ld         # Link at 0x100000
@@ -93,20 +110,27 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 │       ├── serial.rs   # COM1 driver (putc, getc, flush)
 │       ├── vga.rs      # VGA text-mode driver with scrolling
 │       ├── pci.rs      # PCI scan via I/O ports 0xCF8/0xCFC
-│       └── net.rs      # PCI + e1000 scan, DHCP (thin wrapper over common)
+│       ├── net.rs      # PCI + e1000 scan, DHCP, PXE boot (thin wrapper over common)
+│       ├── mem.rs      # Extended memory allocation via INT 15h E820
+│       └── loader.rs   # ELF32/Multiboot execution
 ├── uefi/               # Rust UEFI binary (x86_64 + ARM64)
 │   └── src/
 │       ├── efi.rs      # Hand-typed EFI types, GUIDs, function offsets
 │       ├── scan.rs     # Storage device enumeration
-│       ├── net.rs      # SNP + direct e1000 DHCP client (uses common e1000/dhcp)
+│       ├── net.rs      # SNP + direct e1000 DHCP client, PXE boot (uses common e1000/dhcp/tftp)
+│       ├── mem.rs      # UEFI memory allocation (AllocatePool/FreePool)
+│       ├── loader.rs   # PE/COFF execution (LoadImage/StartImage)
 │       └── main.rs     # efi_main entry point
 ├── arm64-bare/         # Rust ARM64 bare‑metal binary
 │   └── src/
 │       ├── pci.rs      # PCI ECAM walk, BAR sizing, AHCI probe
 │       ├── uart.rs     # PL011 UART driver
-│       ├── net.rs      # PCI + e1000 scan, DHCP (thin wrapper over common)
+│       ├── net.rs      # PCI + e1000 scan, DHCP, PXE boot (thin wrapper over common)
+│       ├── mem.rs      # Fixed RAM region allocation
+│       ├── loader.rs   # ELF64 execution
 │       └── main.rs     # global_asm! entry, UART/PCI init
 ├── romwrap/            # CLI tool: wraps PE/COFF into PCI option ROM
+├── tftp-root/          # Files served via QEMU's built-in TFTP server (auto-generated)
 ├── Makefile            # Build orchestration
 └── AGENTS.md           # Full development reference & gotchas
 ```
@@ -116,12 +140,12 @@ All BIOS targets use `-nographic` (Ctrl-A X to exit). The BIOS stage2 target (`r
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 149 tests across all crates
+cargo test --workspace   # 174 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
-| `common`     | 71    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check |
+| `common`     | 96    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
 | `uefi`       | 24    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 33    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

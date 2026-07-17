@@ -22,7 +22,9 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │       ├── serial.rs       # COM1 driver (putc, getc, flush)
 │       ├── vga.rs          # VGA text-mode driver with scrolling
 │       ├── pci.rs          # PCI scan via I/O ports 0xCF8/0xCFC
-│       └── net.rs          # PCI + e1000 scan, DHCP (thin wrapper over common)
+│       ├── net.rs          # PCI + e1000 scan, DHCP, PXE boot (thin wrapper over common)
+│       ├── mem.rs          # Extended memory allocation via INT 15h E820
+│       └── loader.rs       # ELF32/Multiboot execution
 ├── common/                 # Rust no_std library (shared by all targets)
 │   ├── Cargo.toml
 │   └── src/
@@ -34,25 +36,35 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │       ├── arp.rs          # ARP request build + reply parse
 │       ├── dns.rs          # DNS query build + response parse + unicast UDP frame build
 │       ├── netio.rs        # e1000 glue: ARP resolve + DNS lookup + dns_resolve_and_print
-│       └── dhcp.rs         # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server)
+│       ├── dhcp.rs         # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server, PXE options)
+│       ├── tftp.rs         # TFTP client (RFC 1350) with block size negotiation (RFC 2348), streaming transfer
+│       └── loader.rs       # File format detection (PE/COFF, ELF32, ELF64, Multiboot, text, binary)
 ├── uefi/                   # Rust UEFI binary (x86_64 + ARM64)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs         # efi_main entry point
 │       ├── efi.rs          # Hand-typed EFI types, GUIDs, Boot Services offsets
 │       ├── scan.rs         # UEFI device scan (LocateHandleBuffer + OpenProtocol)
-│       └── net.rs          # SNP + 4-tier e1000 DHCP (uses common::e1000 + common::dhcp)
+│       ├── net.rs          # SNP + 4-tier e1000 DHCP, PXE boot (uses common::e1000 + common::dhcp + common::tftp)
+│       ├── mem.rs          # UEFI memory allocation (AllocatePool/FreePool)
+│       └── loader.rs       # PE/COFF execution (LoadImage/StartImage)
 ├── arm64-bare/             # Rust ARM64 bare-metal binary (no firmware)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs         # Entry (global_asm! start), UART init, PCI scan
 │       ├── pci.rs          # PCI ECAM walk, BAR sizing/enable, AHCI probe
-│       ├── net.rs          # PCI + e1000 scan, DHCP (thin wrapper over common)
+│       ├── net.rs          # PCI + e1000 scan, DHCP, PXE boot (thin wrapper over common)
+│       ├── mem.rs          # Fixed RAM region allocation
+│       ├── loader.rs       # ELF64 execution
 │       └── uart.rs         # PL011 UART driver
 ├── romwrap/                # Rust CLI tool (PCI expansion ROM wrapper)
-    ├── Cargo.toml
-    └── src/
-        └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
+│   ├── Cargo.toml
+│   └── src/
+│       └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
+└── tftp-root/              # Files served via QEMU's built-in TFTP server (auto-generated)
+    ├── rustrapper.efi      # UEFI bootloader
+    ├── rust_payload.bin    # BIOS bootloader
+    └── test.txt            # Test file for PXE boot verification
 ```
 
 ## Files
@@ -98,6 +110,21 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `try_receive` calls `SNP.Receive` with non-null `SrcAddr`, `DestAddr`, and `Protocol` output pointers; some firmware requires them.
 - The ARM64 virtio SNP only supports one transmit per session (no buffer recycling without `Initialize`), so `send_udp_dhcp` sends one DHCPDISCOVER and accepts the OFFER as final. x86_64 e1000 works normally with full DISCOVER→OFFER→REQUEST→ACK.
 
+### `uefi/src/mem.rs` — UEFI memory allocation
+
+- `UefiMemorySink` implements `TftpSink` — uses `AllocatePool`/`FreePool` for dynamic memory allocation.
+- Allocates memory via Boot Services `AllocatePool` with `EfiLoaderData` type.
+- Frees memory in `Drop` implementation via `FreePool`.
+- Tracks current offset and capacity for streaming TFTP transfers.
+
+### `uefi/src/loader.rs` — UEFI executable loader
+
+- `execute_pe_coff(system_table, image_handle, buffer, size) -> Result<(), &'static str>` — loads and executes PE/COFF EFI application via Boot Services.
+- Uses `LoadImage` (offset 0x68) with `SourceBuffer` parameter to load from memory.
+- Uses `StartImage` (offset 0x70) to execute the loaded image.
+- `execute_file(system_table, image_handle, buffer, size, puts)` — detects format via `common::loader::detect_format`, dispatches to PE/COFF executor or displays text/binary info.
+- PE/COFF files are executed; text files are displayed; binary files print size only.
+
 ### `arm64-bare/src/main.rs` — ARM64 bare-metal entry
 
 - Entry point via `global_asm!`: sets stack pointer, enables FP/SIMD access via `CPACR_EL1`, zeroes BSS, calls `main`.
@@ -114,6 +141,18 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
 - `print_mac` and `print_ip` are tiny local helpers that format MAC/IP to the global print sink.
 - Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
+
+### `arm64-bare/src/mem.rs` — ARM64 bare-metal memory allocation
+
+- `Arm64MemorySink` implements `TftpSink` — writes TFTP blocks to physical memory at fixed address.
+- Uses fixed RAM region at `0x50000000` (1.25GB on QEMU virt machine).
+- Tracks current offset and capacity for streaming TFTP transfers.
+
+### `arm64-bare/src/loader.rs` — ARM64 bare-metal executable loader
+
+- `execute_elf64(buffer: *mut u8, size: usize)` — parses ELF64 header, loads PT_LOAD segments to p_paddr, zeros BSS, jumps to e_entry.
+- `execute_file(buffer, size, puts)` — detects format via `common::loader::detect_format`, dispatches to ELF64 executor or displays text/binary info.
+- ELF64 files are executed; text files are displayed; binary files print size only.
 
 ### e1000 / DHCP details (shared `common::e1000` and `common::dhcp`)
 
@@ -185,6 +224,21 @@ The following details apply to the common e1000 driver used by all three targets
 - `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
 - `print_mac` and `print_ip` are tiny local helpers (12 and 9 lines) that format MAC/IP to the global print sink.
 
+### `bios/src/mem.rs` — BIOS extended memory allocation
+
+- `E820Entry` struct: `base_addr`, `length`, `entry_type`, `acpi_ext` — memory map entry from BIOS INT 15h E820.
+- `get_memory_map(entries: &mut [E820Entry]) -> usize` — calls INT 15h E820 to fill entries, returns count.
+- `find_largest_ram_region(entries: &[E820Entry]) -> Option<(u64, u64)>` — finds largest RAM region above 1MB (entry_type == 1).
+- `BiosExtendedMemorySink` implements `TftpSink` — writes TFTP blocks to physical memory at allocated address.
+- Allocation strategy: finds largest available RAM region above 1MB, uses that as base address for TFTP downloads.
+
+### `bios/src/loader.rs` — BIOS executable loader
+
+- `execute_elf32(buffer: *mut u8, size: usize)` — parses ELF32 header, loads PT_LOAD segments to p_paddr, zeros BSS, jumps to e_entry.
+- `execute_multiboot(buffer: *mut u8, size: usize)` — validates multiboot magic (0x1BADB002) and checksum, sets up minimal multiboot info, jumps to entry point.
+- `execute_file(buffer, size, puts)` — detects format via `common::loader::detect_format`, dispatches to appropriate executor or displays text.
+- Text files are displayed via the `puts` callback; binary files print size only.
+
 ### `bios/src/serial.rs` — BIOS Rust serial driver
 
 - `putc` auto-translates `\n` → `\r\n` (writes `\r` first).
@@ -225,11 +279,35 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `common/src/dhcp.rs` — DHCP frame build/parse (shared by all targets)
 
-- `DhcpConfig` struct: `yiaddr`, `subnet`, `gateway`, `dns` — the result of a successful DHCP exchange.
+- `DhcpConfig` struct: `yiaddr`, `subnet`, `gateway`, `dns`, `next_server`, `bootfile` — the result of a successful DHCP exchange.
+- `next_server` is the TFTP server IP (from DHCP option 66, or fallback to siaddr field).
+- `bootfile` is the boot filename (from DHCP option 67, null-terminated).
 - `ip_checksum(buf) -> u16` — standard Internet checksum (one's complement of one's complement sum of 16-bit words).
-- `build_discover(xid, mac) -> [u8; 300]` — DHCPDISCOVER payload with magic cookie 0x63825363, option 53=1 (DISCOVER), option 55=param request list (1/3/6), option 255=end.
+- `build_discover(xid, mac) -> [u8; 300]` — DHCPDISCOVER payload with magic cookie 0x63825363, option 53=1 (DISCOVER), option 55=param request list (1/3/6/66/67), option 255=end.
 - `build_eth_ip_udp(mac, dhcp_payload, dhcp_len, frame) -> usize` — wraps the DHCP payload in Ethernet + IPv4 + UDP headers (including IP checksum), returns total frame length.
-- `parse_response(buf, len, xid, mac) -> Option<DhcpConfig>` — validates EtherType, IP protocol, UDP offset, magic cookie, transaction ID, MAC match, then walks options for type 53 (OFFER or ACK), type 1 (subnet), type 3 (gateway), type 6 (DNS server).
+- `parse_response(buf, len, xid, mac) -> Option<DhcpConfig>` — validates EtherType, IP protocol, UDP offset, magic cookie, transaction ID, MAC match, then walks options for type 53 (OFFER or ACK), type 1 (subnet), type 3 (gateway), type 6 (DNS server), type 66 (TFTP server), type 67 (bootfile).
+
+### `common/src/tftp.rs` — TFTP client (RFC 1350) with block size negotiation (RFC 2348)
+
+- `TftpSink` trait: `write_block(&mut self, data: &[u8]) -> Result<(), ()>`, `finalize(&mut self, size: usize) -> Result<(), ()>` — streaming transfer interface for large file support.
+- `tftp_read<S: TftpSink>(base, src_mac, src_ip, dst_ip, filename, sink) -> Option<usize>` — downloads a file via TFTP, writes blocks to sink, returns total size on success.
+- `build_rrq(filename, buf) -> usize` — builds TFTP Read Request packet with blksize=1468 and tsize=0 options.
+- `parse_oack(buf, len) -> Option<(usize, usize)>` — parses Option Acknowledgment packet, returns (blksize, tsize).
+- `parse_data(buf, len) -> Option<(u16, &[u8])>` — parses DATA packet, returns (block_number, data_slice).
+- `build_ack(block, buf) -> usize` — builds ACK packet for given block number.
+- Block size negotiation: requests blksize=1468 (Ethernet MTU - IP/UDP headers), falls back to 512 if server rejects.
+- Transfer ends when received block < blksize (EOF marker).
+
+### `common/src/loader.rs` — File format detection (shared by all targets)
+
+- `FileFormat` enum: `PeCoff`, `Elf32`, `Elf64`, `Multiboot`, `Multiboot2`, `Text`, `Binary`.
+- `detect_format(data: &[u8]) -> FileFormat` — detects file format by magic number:
+  - PE/COFF: `0x4D 0x5A` ("MZ") at offset 0
+  - ELF32/64: `0x7F 'E' 'L' 'F'` at offset 0, class byte at offset 4 (1=32-bit, 2=64-bit)
+  - Multiboot: `0x1BADB002` at offset 0 (little-endian)
+  - Multiboot2: `0xE85250D6` at offset 0 (little-endian)
+  - Text: all printable ASCII (0x20-0x7E) plus whitespace (tab, newline, CR) in first 1KB
+  - Binary: everything else
 
 ### `common/src/arp.rs` — ARP request build and reply parse
 
@@ -269,6 +347,35 @@ The following details apply to the common e1000 driver used by all three targets
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - `i386-bios` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
 - `run-i386-bios` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
+- All `run-*` targets automatically create `tftp-root/` directory and use QEMU's built-in TFTP server (`-netdev user,tftp=tftp-root,bootfile=...`) for PXE boot testing. No root privileges or external TFTP server required.
+
+### PXE Boot Flow
+
+All targets support PXE boot via DHCP options 66 (TFTP server) and 67 (bootfile name):
+
+1. **DHCP Discovery**: Bootloader sends DHCPDISCOVER with parameter request list including options 66/67.
+2. **DHCP Response**: Server responds with DHCPOFFER/DHCPACK containing `next_server` (option 66 or siaddr field) and `bootfile` (option 67).
+3. **TFTP Download**: If both fields are present, bootloader initiates TFTP transfer:
+   - Sends RRQ (Read Request) with blksize=1468 and tsize=0 options.
+   - Server may respond with OACK (Option Acknowledgment) confirming negotiated block size.
+   - Server sends DATA packets (block number + up to 1468 bytes).
+   - Bootloader writes each block to memory via `TftpSink` trait and sends ACK.
+   - Transfer ends when received block < blksize (EOF marker).
+4. **File Execution**: Bootloader detects file format via `common::loader::detect_format`:
+   - **UEFI**: PE/COFF files → `LoadImage` + `StartImage` via Boot Services.
+   - **BIOS**: ELF32 files → parse headers, load segments, jump to entry. Multiboot files → validate magic, set up info struct, jump.
+   - **ARM64 bare-metal**: ELF64 files → parse headers, load segments, jump to entry.
+   - **All targets**: Text files → display via `puts`. Binary files → print size only.
+
+### QEMU Built-in TFTP Server
+
+QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server that requires no root privileges:
+
+- `tftp=<directory>` — serves files from the specified directory.
+- `bootfile=<filename>` — sets the bootfile name in DHCP responses (option 67).
+- The TFTP server IP is automatically set to the QEMU gateway IP (typically 10.0.2.2) in DHCP option 66.
+- Files in `tftp-root/` are auto-generated by the Makefile and include bootloader binaries and a test file.
+- This approach is simpler than running a separate TFTP server (e.g., dnsmasq or OpenWrt VM) and works in unprivileged environments.
 
 ## Key Gotchas
 
@@ -296,6 +403,14 @@ The following details apply to the common e1000 driver used by all three targets
 18. **e1000 TX descriptor index must track TDT**: The `send` function uses the TX descriptor at the current TDT index (not always descriptor 0). After each send, TDT advances by 1, so the next send must use the next descriptor. All TX descriptors' `addr` fields are set to `TX_BUF` during init. Always using descriptor 0 while incrementing TDT causes the second send to fail silently — hardware processes the wrong descriptor (the one at TDH, not 0) while software polls descriptor 0's DD bit forever.
 
 19. **ARP resolve required before unicast DNS**: DHCP gives us the DNS server IP but not its MAC. To send a unicast DNS query, we must first ARP resolve the next-hop MAC (DNS server if on-subnet, gateway if off-subnet). The flow is: DHCP → ARP request → ARP reply → DNS query → DNS response. Each step uses a separate e1000 send/receive cycle. The e1000 RX ring must be re-armed after each receive (done automatically by `try_receive`).
+
+20. **PXE boot requires DHCP options 66/67**: The bootloader only initiates TFTP download if both `next_server` (option 66 or siaddr field) and `bootfile` (option 67) are present in the DHCP response. QEMU's built-in TFTP server (`-netdev user,tftp=...,bootfile=...`) automatically provides these options. External TFTP servers must be configured to send these options in DHCP responses.
+
+21. **TFTP block size negotiation**: The bootloader requests blksize=1468 (Ethernet MTU minus IP/UDP headers) for optimal performance. If the server rejects this option (no OACK response), the bootloader falls back to the standard 512-byte blocks. The transfer ends when a received DATA packet is smaller than the negotiated block size (EOF marker).
+
+22. **File format detection by magic number**: The `common::loader::detect_format` function identifies file types by examining the first few bytes. PE/COFF starts with "MZ" (0x4D5A), ELF starts with 0x7F'ELF' followed by class byte (1=32-bit, 2=64-bit), Multiboot starts with 0x1BADB002, Multiboot2 with 0xE85250D6. Text files are detected by checking if all bytes in the first 1KB are printable ASCII or whitespace. Everything else is classified as binary.
+
+23. **UEFI PE/COFF execution via LoadImage/StartImage**: UEFI targets can execute downloaded PE/COFF files by calling `LoadImage` with the `SourceBuffer` parameter pointing to the file in memory, followed by `StartImage`. The bootloader must pass the correct `BootPolicy` (false for explicit boot) and `ParentImageHandle` (the bootloader's own image handle). The loaded image runs in the same UEFI environment and has access to all Boot Services.
 
 ### MBR
 
@@ -390,8 +505,8 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 149 tests across all crates
-cargo test --package common   # 71 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check)
+cargo test --workspace        # All 174 tests across all crates
+cargo test --package common   # 96 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection)
 cargo test --package uefi     # 33 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
 cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
@@ -399,7 +514,7 @@ cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, ent
 
 | Crate | Tests | What's tested |
 |-------|-------|---------------|
-| `common` | 71 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask) |
+| `common` | 96 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask), TFTP RRQ/OACK/DATA/ACK packet build/parse, block size negotiation, file format detection (PE/COFF, ELF32, ELF64, Multiboot, Multiboot2, text, binary) |
 | `uefi`/`efi` | 24 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
 | `arm64-bare`/`pci` | 21 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 12 subclass codes including unassigned, unknown fallback) |
 | `romwrap` | 33 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`/`0x00`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, BIOS entry routine, block count consistency, PCIR length field matching, empty/boundary-aligned/overlapping payload sizes |

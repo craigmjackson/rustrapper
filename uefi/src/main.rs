@@ -9,6 +9,10 @@ mod efi;
 mod scan;
 #[cfg(not(test))]
 mod net;
+#[cfg(not(test))]
+mod mem;
+#[cfg(not(test))]
+mod loader;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -20,7 +24,7 @@ use common::menu::{show_menu, MenuAction};
 use crate::efi::*;
 
 #[cfg(not(test))]
-static mut SYSTEM_TABLE: Option<&'static EFI_SYSTEM_TABLE> = None;
+pub static mut SYSTEM_TABLE: Option<&'static EFI_SYSTEM_TABLE> = None;
 
 #[cfg(not(test))]
 #[panic_handler]

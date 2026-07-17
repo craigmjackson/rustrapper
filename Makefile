@@ -21,7 +21,8 @@ BARE_ARM64_TARGET := aarch64-unknown-none
         x86_64-uefi-rom i386-bios-rom \
         run-x86_64-uefi run-aarch64-uefi run-aarch64-bare \
         run-x86_64-uefi-rom run-i386-bios-rom \
-        i386-bios run-i386-bios check-deps
+        i386-bios run-i386-bios check-deps \
+        pxe-start pxe-stop tftp-root
 
 all: x86_64-uefi aarch64-uefi aarch64-bare i386-bios x86_64-uefi-rom i386-bios-rom
 
@@ -115,58 +116,107 @@ $(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
 # All targets use -nographic (Ctrl-A X to exit). QEMU's e1000 I/O BAR is a
 # stub (see AGENTS.md gotcha), so the Rust stage2's direct e1000 driver uses
 # MMIO (PCI config via I/O ports 0xCF8/0xCFC + MMIO register access).
+# PXE boot uses OpenWrt VM as DHCP/TFTP server via multicast networking.
 
 run-i386-bios: TARGET := run-i386-bios
-run-i386-bios: $(BIN)/bios.img check-deps
-	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw -nic user,model=e1000 -nographic
+run-i386-bios: $(BIN)/bios.img pxe-start check-deps
+	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw \
+		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:57 \
+		-nographic
 
 run-x86_64-uefi: TARGET := run-x86_64-uefi
-run-x86_64-uefi: $(BIN)/rustrapper.efi check-deps
-	mkdir -p EFI/BOOT
-	cp $(BIN)/rustrapper.efi EFI/BOOT/BOOTX64.EFI
-	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=fat:rw:.,format=raw -nic user,model=e1000 -nographic
-
-run-x86_64-uefi-rom: TARGET := run-x86_64-uefi-rom
-run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom check-deps
+run-x86_64-uefi: $(BIN)/rustrapper.efi pxe-start check-deps
 	mkdir -p EFI/BOOT
 	cp $(BIN)/rustrapper.efi EFI/BOOT/BOOTX64.EFI
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
 		-drive file=fat:rw:.,format=raw \
-		-netdev user,id=net0 \
-		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0 \
+		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:58 \
+		-nographic
+
+run-x86_64-uefi-rom: TARGET := run-x86_64-uefi-rom
+run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom pxe-start check-deps
+	mkdir -p EFI/BOOT
+	cp $(BIN)/rustrapper.efi EFI/BOOT/BOOTX64.EFI
+	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
+		-drive file=fat:rw:.,format=raw \
+		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0,mac=52:54:00:12:34:59 \
 		-nographic
 
 run-i386-bios-rom: TARGET := run-i386-bios-rom
-run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom check-deps
+run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom pxe-start check-deps
 	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw \
-		-netdev user,id=net0 \
-		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0 \
+		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0,mac=52:54:00:12:34:5a \
 		-nographic
 
 run-aarch64-uefi: TARGET := run-aarch64-uefi
-run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi check-deps
+run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi pxe-start check-deps
 	mkdir -p EFI/BOOT
 	cp $< EFI/BOOT/BOOTAA64.EFI
 	qemu-system-aarch64 -machine virt -cpu max \
 		-bios /usr/share/edk2/aarch64/QEMU_EFI.fd \
-		-drive file=fat:rw:.,format=raw -nic user,model=virtio-net-pci -nographic
+		-drive file=fat:rw:.,format=raw \
+		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:5b \
+		-nographic
 
 test.img:
 	qemu-img create -f raw $@ 64M 2>/dev/null || dd if=/dev/zero bs=1M count=64 of=$@ 2>/dev/null
 
 run-aarch64-bare: TARGET := run-aarch64-bare
-run-aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf test.img check-deps
+run-aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf test.img pxe-start check-deps
 	qemu-system-aarch64 -M virt -cpu max -kernel $< \
 		-drive file=test.img,format=raw,if=none,id=drive0 \
 		-device ahci,id=ahci \
 		-device ide-hd,bus=ahci.0,drive=drive0 \
-		-nic user,model=e1000 -nographic
+		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:5c \
+		-nographic
+
+# ── PXE Server (OpenWrt VM) ─────────────────────────────────────
+# OpenWrt VM acts as DHCP/TFTP server for PXE boot testing
+
+openwrt:
+	./setup-openwrt.sh
+
+tftp-root: $(BIN)/rustrapper.efi $(BIN)/rust_payload.bin
+	mkdir -p tftp-root
+	cp $(BIN)/rustrapper.efi tftp-root/
+	cp $(BIN)/rust_payload.bin tftp-root/
+	echo "PXE boot successful!" > tftp-root/test.txt
+
+pxe-start: openwrt tftp-root
+	@echo "Starting OpenWrt PXE server..."
+	@make -s pxe-stop 2>/dev/null || true
+	qemu-system-x86_64 \
+		-drive file=openwrt,format=raw \
+		-netdev socket,id=net0,listen=127.0.0.1:43210 \
+		-device e1000,netdev=net0 \
+		-m 256 -display none -daemonize \
+		-pidfile pxe-server.pid
+	@echo "Waiting for OpenWrt to boot..."
+	@sleep 30
+	@echo "PXE server ready"
+
+pxe-stop:
+	@if [ -f pxe-server.pid ]; then \
+		kill $$(cat pxe-server.pid) 2>/dev/null && rm -f pxe-server.pid && echo "PXE server stopped" || echo "PXE server not running"; \
+	else \
+		echo "PXE server not running"; \
+	fi
 
 # ── Clean ────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BIN)/* build/
-	rm -rf target/ EFI/
+	rm -rf target/ EFI/ tftp-root/
+	@echo "Note: OpenWrt image not removed. Run 'make clean-pxe' to remove it."
+
+clean-pxe: pxe-stop
+	rm -f openwrt openwrt-*.img.gz .openwrt-configured
+	rm -rf tftp-root/
 
 # ── Dependency check ─────────────────────────────────────────────
 # Usage:

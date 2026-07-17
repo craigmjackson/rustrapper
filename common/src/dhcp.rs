@@ -12,13 +12,15 @@
 //! - `parse_response` rejects non-OFFER/ACK messages
 
 /// A successful DHCP result: the IP address we were assigned, plus subnet,
-/// gateway, and DNS server.
+/// gateway, DNS server, and PXE boot information.
 #[derive(Clone, Copy)]
 pub struct DhcpConfig {
     pub yiaddr: [u8; 4],
     pub subnet: [u8; 4],
     pub gateway: [u8; 4],
     pub dns: [u8; 4],
+    pub next_server: [u8; 4],    // TFTP server IP (option 66 or siaddr)
+    pub bootfile: [u8; 128],     // Boot filename (option 67, null-terminated)
 }
 
 /// Compute the standard Internet checksum (one's complement of the one's
@@ -41,7 +43,8 @@ pub fn ip_checksum(buf: &[u8]) -> u16 {
 
 /// Build a DHCPDISCOVER payload (300 bytes).
 /// Options: magic cookie 0x63825363, DHCP type 1 (DISCOVER), parameter
-/// request list for subnet (1), router (3), DNS (6), end (255).
+/// request list for subnet (1), router (3), DNS (6), TFTP server (66),
+/// bootfile (67), end (255).
 pub fn build_discover(xid: u32, mac: &[u8; 6]) -> [u8; 300] {
     let mut pkt = [0u8; 300];
     pkt[0] = 1; // op = BOOTREQUEST
@@ -58,11 +61,13 @@ pub fn build_discover(xid: u32, mac: &[u8; 6]) -> [u8; 300] {
     pkt[off + 2] = 1; // DISCOVER
     off += 3;
     pkt[off] = 55;
-    pkt[off + 1] = 3;
+    pkt[off + 1] = 5;
     pkt[off + 2] = 1; // subnet
     pkt[off + 3] = 3; // router
     pkt[off + 4] = 6; // DNS
-    off += 5;
+    pkt[off + 5] = 66; // TFTP server
+    pkt[off + 6] = 67; // bootfile
+    off += 7;
     pkt[off] = 255; // end
 
     pkt
@@ -173,9 +178,18 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
         buf[dhcp_off + 19],
     ];
 
+    // siaddr (next server for TFTP) - bytes 20-23 of DHCP packet
+    let mut next_server: [u8; 4] = [
+        buf[dhcp_off + 20],
+        buf[dhcp_off + 21],
+        buf[dhcp_off + 22],
+        buf[dhcp_off + 23],
+    ];
+
     let mut subnet = [255u8; 4];
     let mut gateway = [0u8; 4];
     let mut dns = [0u8; 4];
+    let mut bootfile = [0u8; 128];
     let mut dhcp_msg_type = 0u8;
     let mut off = dhcp_off + 240;
 
@@ -197,6 +211,24 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
             gateway.copy_from_slice(&buf[off + 2..off + 6]);
         } else if opt_type == 6 && opt_len >= 4 {
             dns.copy_from_slice(&buf[off + 2..off + 6]);
+        } else if opt_type == 66 && opt_len >= 4 {
+            // TFTP server name (option 66) - can be IP address or hostname
+            // If it's an IP address string like "10.0.0.1", parse it
+            if opt_len == 4 {
+                // Binary IP address format
+                next_server.copy_from_slice(&buf[off + 2..off + 6]);
+            } else {
+                // String format - try to parse as IP address
+                let s = &buf[off + 2..off + 2 + opt_len];
+                if let Some(ip) = parse_ip_string(s) {
+                    next_server = ip;
+                }
+            }
+        } else if opt_type == 67 && opt_len > 0 {
+            // Bootfile name (option 67)
+            let copy_len = opt_len.min(127); // Leave room for null terminator
+            bootfile[..copy_len].copy_from_slice(&buf[off + 2..off + 2 + copy_len]);
+            bootfile[copy_len] = 0; // Ensure null termination
         }
         off += 2 + opt_len;
     }
@@ -212,7 +244,46 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
         subnet,
         gateway,
         dns,
+        next_server,
+        bootfile,
     })
+}
+
+/// Parse an IP address string like "10.0.0.1" into [u8; 4]
+fn parse_ip_string(s: &[u8]) -> Option<[u8; 4]> {
+    let mut ip = [0u8; 4];
+    let mut octet = 0u16;
+    let mut octet_idx = 0;
+    let mut has_digit = false;
+
+    for &byte in s {
+        if byte == 0 {
+            break;
+        }
+        if byte >= b'0' && byte <= b'9' {
+            octet = octet * 10 + (byte - b'0') as u16;
+            has_digit = true;
+            if octet > 255 {
+                return None;
+            }
+        } else if byte == b'.' {
+            if !has_digit || octet_idx >= 3 {
+                return None;
+            }
+            ip[octet_idx] = octet as u8;
+            octet_idx += 1;
+            octet = 0;
+            has_digit = false;
+        } else {
+            return None;
+        }
+    }
+
+    if !has_digit || octet_idx != 3 {
+        return None;
+    }
+    ip[octet_idx] = octet as u8;
+    Some(ip)
 }
 
 #[cfg(test)]
@@ -242,19 +313,19 @@ mod tests {
         assert_eq!(p[240], 53);
         assert_eq!(p[241], 1);
         assert_eq!(p[242], 1);
-        // Option 55 (Parameter Request List) = 1,3,6
+        // Option 55 (Parameter Request List) = 1,3,6,66,67
         assert_eq!(p[243], 55);
-        assert_eq!(p[244], 3);
-        assert_eq!(p[245..248], [1, 3, 6]);
+        assert_eq!(p[244], 5);
+        assert_eq!(p[245..250], [1, 3, 6, 66, 67]);
         // Option 255 (End)
-        assert_eq!(p[248], 255);
+        assert_eq!(p[250], 255);
     }
 
     #[test]
     fn test_build_discover_padding() {
         let p = build_discover(0x12345678, &mac());
-        // Bytes 249..300 should be zero (padding)
-        for i in 249..300 {
+        // Bytes 251..300 should be zero (padding)
+        for i in 251..300 {
             assert_eq!(p[i], 0, "padding byte {} should be 0", i);
         }
         assert_eq!(p.len(), 300);
@@ -478,5 +549,167 @@ mod tests {
         // Corrupt magic cookie (at dhcp_off + 236 = 42 + 236 = 278)
         frame[278] = 0xFF;
         assert!(parse_response(&frame, frame.len(), 0x12345678, &m).is_none());
+    }
+
+    /// Build a response frame with PXE options (66 and 67)
+    fn build_response_frame_pxe(xid: u32, m: &[u8; 6], yiaddr: [u8; 4],
+                                 siaddr: [u8; 4], opt66_ip: Option<[u8; 4]>,
+                                 opt67_file: Option<&str>) -> [u8; 512] {
+        let mut frame = [0u8; 512];
+        let mut pos = 0;
+        // Ethernet: dst = us, src = server MAC
+        frame[pos..pos + 6].copy_from_slice(m); pos += 6;
+        frame[pos..pos + 6].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x35, 0x57]); pos += 6;
+        frame[pos..pos + 2].copy_from_slice(&[0x08, 0x00]); pos += 2; // EtherType IPv4
+        // IPv4
+        let ip_off = pos;
+        frame[pos] = 0x45; pos += 1; // version/ihl
+        frame[pos] = 0x00; pos += 1; // DSCP/ECN
+        let total_len: u16 = 20 + 8 + 300;
+        frame[pos..pos + 2].copy_from_slice(&total_len.to_be_bytes()); pos += 2;
+        frame[pos..pos + 4].copy_from_slice(&[0; 4]); pos += 4; // id, flags, frag
+        frame[pos] = 64; pos += 1; // TTL
+        frame[pos] = 17; pos += 1; // protocol = UDP
+        frame[pos..pos + 2].copy_from_slice(&[0; 2]); pos += 2; // checksum
+        frame[pos..pos + 4].copy_from_slice(&[10, 0, 0, 2]); pos += 4; // src
+        frame[pos..pos + 4].copy_from_slice(&yiaddr); pos += 4; // dst
+        // Compute IP checksum
+        let cksum = ip_checksum(&frame[ip_off..ip_off + 20]);
+        frame[ip_off + 10..ip_off + 12].copy_from_slice(&cksum.to_be_bytes());
+        // UDP
+        frame[pos..pos + 2].copy_from_slice(&[0x00, 0x43]); pos += 2; // src 67
+        frame[pos..pos + 2].copy_from_slice(&[0x00, 0x44]); pos += 2; // dst 68
+        let udp_len: u16 = total_len - 20;
+        frame[pos..pos + 2].copy_from_slice(&udp_len.to_be_bytes()); pos += 2;
+        frame[pos..pos + 2].copy_from_slice(&[0; 2]); pos += 2; // checksum
+        // DHCP
+        let dhcp_off = pos;
+        frame[pos] = 2; pos += 1; // op = BOOTREPLY
+        frame[pos] = 1; pos += 1; // htype
+        frame[pos] = 6; pos += 1; // hlen
+        frame[pos] = 0; pos += 1; // hops
+        frame[pos..pos + 4].copy_from_slice(&xid.to_be_bytes()); pos += 4;
+        frame[pos..pos + 2].copy_from_slice(&[0; 2]); pos += 2; // secs
+        frame[pos..pos + 2].copy_from_slice(&[0; 2]); pos += 2; // flags
+        frame[pos..pos + 4].copy_from_slice(&[0; 4]); pos += 4; // ciaddr
+        frame[pos..pos + 4].copy_from_slice(&yiaddr); pos += 4; // yiaddr
+        frame[pos..pos + 4].copy_from_slice(&siaddr); pos += 4; // siaddr (next server)
+        frame[pos..pos + 4].copy_from_slice(&[0; 4]); pos += 4; // giaddr
+        // chaddr: 16 bytes total, first 6 are our MAC
+        frame[pos..pos + 6].copy_from_slice(m); pos += 6;
+        frame[pos..pos + 10].fill(0); pos += 10; // rest of chaddr (16 - 6 = 10)
+        // sname: 64 bytes
+        frame[pos..pos + 64].fill(0); pos += 64;
+        // file: 128 bytes
+        frame[pos..pos + 128].fill(0);
+        // Magic cookie (at dhcp_off + 236)
+        frame[dhcp_off + 236..dhcp_off + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+        // Options (at dhcp_off + 240)
+        let opt_off = dhcp_off + 240;
+        frame[opt_off] = 53; frame[opt_off + 1] = 1; frame[opt_off + 2] = 2; // OFFER
+        let mut o = opt_off + 3;
+        // Subnet
+        frame[o] = 1; frame[o + 1] = 4;
+        frame[o + 2..o + 6].copy_from_slice(&[255, 255, 255, 0]);
+        o += 6;
+        // Option 66 (TFTP server) if provided
+        if let Some(ip) = opt66_ip {
+            frame[o] = 66; frame[o + 1] = 4;
+            frame[o + 2..o + 6].copy_from_slice(&ip);
+            o += 6;
+        }
+        // Option 67 (bootfile) if provided
+        if let Some(file) = opt67_file {
+            let file_bytes = file.as_bytes();
+            frame[o] = 67;
+            frame[o + 1] = file_bytes.len() as u8;
+            frame[o + 2..o + 2 + file_bytes.len()].copy_from_slice(file_bytes);
+            o += 2 + file_bytes.len();
+        }
+        frame[o] = 255; // end
+        frame
+    }
+
+    #[test]
+    fn test_parse_response_pxe_option_66_binary() {
+        let m = mac();
+        let frame = build_response_frame_pxe(
+            0x12345678, &m, [10, 0, 2, 15],
+            [0, 0, 0, 0], // siaddr = 0
+            Some([10, 0, 0, 1]), // option 66 = 10.0.0.1
+            None
+        );
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(cfg.next_server, [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn test_parse_response_pxe_option_67() {
+        let m = mac();
+        let frame = build_response_frame_pxe(
+            0x12345678, &m, [10, 0, 2, 15],
+            [0, 0, 0, 0],
+            None,
+            Some("boot.efi")
+        );
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        let bootfile_str = core::str::from_utf8(&cfg.bootfile[..8]).unwrap();
+        assert_eq!(bootfile_str, "boot.efi");
+        assert_eq!(cfg.bootfile[8], 0); // null terminated
+    }
+
+    #[test]
+    fn test_parse_response_pxe_siaddr_fallback() {
+        let m = mac();
+        let frame = build_response_frame_pxe(
+            0x12345678, &m, [10, 0, 2, 15],
+            [10, 0, 0, 99], // siaddr = 10.0.0.99
+            None, // no option 66
+            None
+        );
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(cfg.next_server, [10, 0, 0, 99]); // should use siaddr
+    }
+
+    #[test]
+    fn test_parse_response_pxe_option_66_overrides_siaddr() {
+        let m = mac();
+        let frame = build_response_frame_pxe(
+            0x12345678, &m, [10, 0, 2, 15],
+            [10, 0, 0, 99], // siaddr = 10.0.0.99
+            Some([10, 0, 0, 1]), // option 66 = 10.0.0.1
+            None
+        );
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(cfg.next_server, [10, 0, 0, 1]); // option 66 overrides siaddr
+    }
+
+    #[test]
+    fn test_parse_response_pxe_full() {
+        let m = mac();
+        let frame = build_response_frame_pxe(
+            0x12345678, &m, [10, 0, 2, 15],
+            [10, 0, 0, 99],
+            Some([10, 0, 0, 1]),
+            Some("pxelinux.0")
+        );
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(cfg.yiaddr, [10, 0, 2, 15]);
+        assert_eq!(cfg.next_server, [10, 0, 0, 1]);
+        let bootfile_str = core::str::from_utf8(&cfg.bootfile[..10]).unwrap();
+        assert_eq!(bootfile_str, "pxelinux.0");
+    }
+
+    #[test]
+    fn test_parse_ip_string() {
+        assert_eq!(parse_ip_string(b"10.0.0.1"), Some([10, 0, 0, 1]));
+        assert_eq!(parse_ip_string(b"192.168.1.100"), Some([192, 168, 1, 100]));
+        assert_eq!(parse_ip_string(b"255.255.255.255"), Some([255, 255, 255, 255]));
+        assert_eq!(parse_ip_string(b"0.0.0.0"), Some([0, 0, 0, 0]));
+        assert_eq!(parse_ip_string(b"256.0.0.1"), None);
+        assert_eq!(parse_ip_string(b"10.0.0"), None);
+        assert_eq!(parse_ip_string(b"10.0.0.1.2"), None);
+        assert_eq!(parse_ip_string(b"abc"), None);
+        assert_eq!(parse_ip_string(b""), None);
     }
 }

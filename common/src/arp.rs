@@ -3,6 +3,43 @@
 //! Used to resolve the MAC address of the next-hop gateway or on-subnet DNS
 //! server before sending a unicast DNS query.
 
+/// Build an ARP reply frame in response to a request targeting `target_ip`.
+///
+/// `request` is the incoming ARP request frame.  Returns the reply length.
+pub fn build_reply(
+    my_mac: &[u8; 6],
+    my_ip: [u8; 4],
+    request: &[u8],
+    frame: &mut [u8; 1514],
+) -> Option<usize> {
+    if request.len() < 42 { return None; }
+    if request[12] != 0x08 || request[13] != 0x06 { return None; }
+    let off = 14;
+    // oper must be 1 (request)
+    if request[off + 6] != 0x00 || request[off + 7] != 0x01 { return None; }
+    // target IP must be us
+    let tpa = [request[off + 24], request[off + 25], request[off + 26], request[off + 27]];
+    if tpa != my_ip { return None; }
+
+    // Ethernet header: unicast to requester
+    frame[0..6].copy_from_slice(&request[off + 8..off + 14]); // requester MAC
+    frame[6..12].copy_from_slice(my_mac);
+    frame[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
+
+    // ARP reply payload
+    frame[off..off + 2].copy_from_slice(&[0x00, 0x01]); // htype Ethernet
+    frame[off + 2..off + 4].copy_from_slice(&[0x08, 0x00]); // ptype IPv4
+    frame[off + 4] = 6; // hlen
+    frame[off + 5] = 4; // plen
+    frame[off + 6..off + 8].copy_from_slice(&[0x00, 0x02]); // oper = reply
+    frame[off + 8..off + 14].copy_from_slice(my_mac); // sender MAC
+    frame[off + 14..off + 18].copy_from_slice(&my_ip); // sender IP
+    frame[off + 18..off + 24].copy_from_slice(&request[off + 8..off + 14]); // target MAC
+    frame[off + 24..off + 28].copy_from_slice(&tpa); // target IP
+
+    Some(off + 28)
+}
+
 /// Build a broadcast ARP request frame (Ethernet + ARP, 42 bytes).
 ///
 /// - `src_mac` / `src_ip`: our MAC and IP
