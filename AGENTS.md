@@ -468,6 +468,12 @@ QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server tha
 
 52. **Boot Services table offsets must be correct**: AllocatePool is at offset 0x40 (not 0x30 which is FreePages), FreePool is at 0x48, LoadImage is at 0xC8 (not 0x68 which is SignalEvent), StartImage is at 0xD0. Using wrong offsets causes silent failures or calls to the wrong functions.
 
+53. **ARM64 UEFI PCI IO handle scanning crashes**: On ARM64, scanning PCI IO protocol handles and reading device paths causes synchronous exceptions. The device path parsing returns invalid bus/dev/func values, leading to invalid ECAM MMIO accesses. Fix: skip tiers 1-3 on ARM64 (`#[cfg(not(target_arch = "aarch64"))]`) and go directly to tier 4 (direct PCI scan).
+
+54. **ARM64 UEFI DHCP requires restart_snp**: The ARM64 virtio SNP driver has a single-transmit limit. After one transmit, subsequent transmits fail with `EFI_NOT_READY`. Fix: call `restart_snp` before each DHCP transmit attempt on ARM64 (`#[cfg(target_arch = "aarch64")]`). This resets the SNP driver state and recycles TX buffers.
+
+55. **ARM64 UEFI PXE boot limitations**: ARM64 UEFI only supports virtio-net-pci (no e1000), so we can't use direct MMIO for TFTP. The virtio SNP has reliability issues with receive operations and single-transmit limits. Full PXE boot (DHCP + ARP + DNS + TFTP) is not reliably supported on ARM64 UEFI. The current implementation supports DHCP with restart_snp, but ARP/DNS/TFTP may fail. For reliable PXE boot on ARM64, use the bare-metal target (`aarch64-bare`) with e1000.
+
 ## Makefile Targets
 
 ```bash
