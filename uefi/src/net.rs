@@ -45,7 +45,7 @@ pub fn w16(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, s: &str) {
     }
 }
 
-fn put_dec(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, val: u64) {
+pub fn put_dec(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, val: u64) {
     let mut rev = [0u16; 24];
     let mut n = 0usize;
     let mut v = val;
@@ -67,6 +67,41 @@ fn put_dec(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, val: u64) {
         j += 1;
     }
     buf[j] = 0;
+    unsafe {
+        (con_out.output_string)(con_out as *const _ as *mut _, buf.as_ptr());
+    }
+}
+
+pub fn put_hex_byte(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, val: u8) {
+    let hex_chars = b"0123456789ABCDEF";
+    let mut buf = [0u16; 3];
+    buf[0] = hex_chars[(val >> 4) as usize] as u16;
+    buf[1] = hex_chars[(val & 0xF) as usize] as u16;
+    buf[2] = 0;
+    unsafe {
+        (con_out.output_string)(con_out as *const _ as *mut _, buf.as_ptr());
+    }
+}
+
+pub fn put_hex(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, val: u64) {
+    let hex_chars = b"0123456789ABCDEF";
+    let mut buf = [0u16; 17];
+    buf[0] = b'0' as u16;
+    buf[1] = b'x' as u16;
+    let mut i = 2;
+    let mut shift = 60;
+    let mut started = false;
+    loop {
+        let nibble = ((val >> shift) & 0xF) as usize;
+        if nibble != 0 || started || shift == 0 {
+            buf[i] = hex_chars[nibble] as u16;
+            i += 1;
+            started = true;
+        }
+        if shift == 0 { break; }
+        shift -= 4;
+    }
+    buf[i] = 0;
     unsafe {
         (con_out.output_string)(con_out as *const _ as *mut _, buf.as_ptr());
     }
@@ -192,18 +227,36 @@ fn tftp_download_e1000(
         w16(con_out, "  TFTP: RRQ send FAILED\r\n");
         return None;
     }
-    w16(con_out, "  TFTP: RRQ sent, waiting...\r\n");
+    w16(con_out, "  TFTP: RRQ sent (");
+    put_dec(con_out, frame_len as u64);
+    w16(con_out, " bytes), waiting...\r\n");
 
     let mut blksize = DEFAULT_BLKSIZE;
     let mut total_size = 0usize;
     let mut recv_buf = [0u8; 1514];
     let mut server_port: Option<u16> = None;
+    let mut pkt_count = 0u32;
 
     loop {
         let copy_len = match e1000.receive_into(&mut recv_buf) {
-            Some(len) => len,
+            Some(len) => {
+                pkt_count += 1;
+                if pkt_count <= 5 {
+                    w16(con_out, "  TFTP: got pkt #");
+                    put_dec(con_out, pkt_count as u64);
+                    w16(con_out, " len=");
+                    put_dec(con_out, len as u64);
+                    w16(con_out, " ethertype=0x");
+                    put_hex_byte(con_out, recv_buf[12]);
+                    put_hex_byte(con_out, recv_buf[13]);
+                    w16(con_out, "\r\n");
+                }
+                len
+            },
             None => {
-                w16(con_out, "  TFTP: receive timeout\r\n");
+                w16(con_out, "  TFTP: receive timeout after ");
+                put_dec(con_out, pkt_count as u64);
+                w16(con_out, " packets\r\n");
                 return None;
             }
         };
@@ -214,6 +267,7 @@ fn tftp_download_e1000(
             if off + 28 <= copy_len && recv_buf[off + 6] == 0x00 && recv_buf[off + 7] == 0x01 {
                 let tpa = [recv_buf[off + 24], recv_buf[off + 25], recv_buf[off + 26], recv_buf[off + 27]];
                 if tpa == *src_ip {
+                    w16(con_out, "  TFTP: handling ARP request\r\n");
                     let mut arp_reply = [0u8; 1514];
                     if let Some(reply_len) = common::arp::build_reply(mac, *src_ip, &recv_buf, &mut arp_reply) {
                         e1000.send(&arp_reply[..reply_len]);
@@ -223,9 +277,20 @@ fn tftp_download_e1000(
             }
         }
 
+        // Check if it's IPv4
+        if recv_buf[12] != 0x08 || recv_buf[13] != 0x00 {
+            if pkt_count <= 5 {
+                w16(con_out, "  TFTP: not IPv4, skipping\r\n");
+            }
+            continue;
+        }
+
         // Learn server's ephemeral port from first response
         if server_port.is_none() {
             server_port = Some(extract_src_port(&recv_buf, copy_len));
+            w16(con_out, "  TFTP: server port=");
+            put_dec(con_out, server_port.unwrap() as u64);
+            w16(con_out, "\r\n");
         }
         let sport = server_port.unwrap_or(69);
 
@@ -236,6 +301,17 @@ fn tftp_download_e1000(
         if udp_offset + 8 > copy_len { continue; }
         let tftp_payload = &recv_buf[udp_offset + 8..copy_len];
         let tftp_len = tftp_payload.len();
+
+        if pkt_count <= 5 {
+            w16(con_out, "  TFTP: payload len=");
+            put_dec(con_out, tftp_len as u64);
+            w16(con_out, " opcode=0x");
+            if tftp_len >= 2 {
+                put_hex_byte(con_out, tftp_payload[0]);
+                put_hex_byte(con_out, tftp_payload[1]);
+            }
+            w16(con_out, "\r\n");
+        }
 
         // Detect TFTP ERROR packets (opcode 5)
         if tftp_len >= 4 {
@@ -249,6 +325,9 @@ fn tftp_download_e1000(
         // Check if it's an OACK
         if let Some((new_blksize, _tsize)) = parse_oack(tftp_payload, tftp_len) {
             blksize = new_blksize;
+            w16(con_out, "  TFTP: OACK blksize=");
+            put_dec(con_out, blksize as u64);
+            w16(con_out, "\r\n");
             let mut ack_buf = [0u8; 4];
             let ack_len = build_ack(0, &mut ack_buf);
             let mut ack_frame = [0u8; 1514];
@@ -260,7 +339,13 @@ fn tftp_download_e1000(
 
         // Check if it's a DATA packet
         if let Some((block, data)) = parse_data(tftp_payload, tftp_len) {
+            w16(con_out, "  TFTP: DATA block=");
+            put_dec(con_out, block as u64);
+            w16(con_out, " len=");
+            put_dec(con_out, data.len() as u64);
+            w16(con_out, "\r\n");
             if sink.write_block(data).is_err() {
+                w16(con_out, "  TFTP: write_block FAILED\r\n");
                 return None;
             }
             total_size += data.len();
@@ -273,8 +358,11 @@ fn tftp_download_e1000(
             }
 
             if data.len() < blksize {
+                w16(con_out, "  TFTP: last block, done\r\n");
                 break;
             }
+        } else {
+            w16(con_out, "  TFTP: not OACK or DATA\r\n");
         }
     }
 
@@ -1119,23 +1207,22 @@ fn pxe_boot_snp(
     print_ip(con_out, &cfg.next_server);
     w16(con_out, "...\r\n");
     
-    // SNP receive is unreliable on OVMF for TFTP (blocks or drops packets).
-    // Stop SNP first to release the e1000 hardware, then use direct MMIO.
-    w16(con_out, "  PXE: Stopping SNP to use direct e1000...\r\n");
-    unsafe {
-        (snp.shutdown)(snp as *const _ as *mut _);
-        (snp.stop)(snp as *const _ as *mut _);
-    }
-    
-    // Find the e1000 BAR0 via PCI scan and use direct MMIO for TFTP.
+    // Try direct e1000 MMIO for TFTP (SNP receive is unreliable for TFTP on OVMF).
+    // Don't stop SNP — if direct MMIO fails, we can't recover SNP anyway.
     w16(con_out, "  PXE: Finding e1000 for direct TFTP...\r\n");
     if let Some(bar0) = find_e1000_bar0() {
         w16(con_out, "  PXE: e1000 BAR0=0x");
-        put_dec(con_out, bar0 as u64);
-        w16(con_out, ", using direct MMIO\r\n");
+        put_hex(con_out, bar0 as u64);
+        w16(con_out, "\r\n");
         
         let e1000 = DirectMmioE1000::new(bar0);
+        let mac_check = e1000.read_mac();
+        w16(con_out, "  PXE: e1000 MAC: ");
+        print_mac(con_out, &mac_check);
+        w16(con_out, "\r\n");
+        
         if e1000.init() {
+            w16(con_out, "  PXE: e1000 init OK\r\n");
             let mut sink = crate::mem::UefiMemorySink::new(system_table, 16 * 1024 * 1024);
             let tftp_result = tftp_download_e1000(con_out, &e1000, mac, &cfg.yiaddr, &cfg.next_server, filename, &mut sink);
             match tftp_result {

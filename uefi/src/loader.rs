@@ -5,8 +5,8 @@ use crate::efi::*;
 use common::loader::{FileFormat, detect_format};
 
 // Boot Services function offsets (UEFI Spec 2.10)
-const BOOT_SVC_LOAD_IMAGE: usize = 0x68;
-const BOOT_SVC_START_IMAGE: usize = 0x70;
+const BOOT_SVC_LOAD_IMAGE: usize = 0xC8;
+const BOOT_SVC_START_IMAGE: usize = 0xD0;
 
 type LoadImageFn = unsafe extern "efiapi" fn(
     boot_policy: bool,

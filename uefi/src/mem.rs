@@ -5,8 +5,8 @@ use crate::efi::*;
 use common::tftp::TftpSink;
 
 // Boot Services function offsets (UEFI Spec 2.10)
-const BOOT_SVC_ALLOCATE_POOL: usize = 0x30;
-const BOOT_SVC_FREE_POOL: usize = 0x38;
+const BOOT_SVC_ALLOCATE_POOL: usize = 0x40;
+const BOOT_SVC_FREE_POOL: usize = 0x48;
 
 // Memory types
 const EFI_LOADER_DATA: u32 = 2;
@@ -45,6 +45,13 @@ impl UefiMemorySink {
         };
         
         if status != EFI_SUCCESS {
+            // Print error status for debugging
+            if let Some(st) = unsafe { crate::SYSTEM_TABLE } {
+                let con_out = unsafe { &*st.con_out };
+                crate::net::w16(con_out, "    AllocatePool failed: status=0x");
+                crate::net::put_hex(con_out, status as u64);
+                crate::net::w16(con_out, "\r\n");
+            }
             Self {
                 buffer: core::ptr::null_mut(),
                 capacity: 0,
@@ -81,6 +88,10 @@ impl Drop for UefiMemorySink {
 impl TftpSink for UefiMemorySink {
     fn write_block(&mut self, data: &[u8]) -> Result<(), ()> {
         if self.buffer.is_null() {
+            if let Some(st) = unsafe { crate::SYSTEM_TABLE } {
+                let con_out = unsafe { &*st.con_out };
+                crate::net::w16(con_out, "    write_block: buffer is null\r\n");
+            }
             return Err(());
         }
         
@@ -88,6 +99,14 @@ impl TftpSink for UefiMemorySink {
         
         // Check if we need to grow the buffer
         if new_offset > self.capacity {
+            if let Some(st) = unsafe { crate::SYSTEM_TABLE } {
+                let con_out = unsafe { &*st.con_out };
+                crate::net::w16(con_out, "    write_block: capacity exceeded (");
+                crate::net::put_dec(con_out, new_offset as u64);
+                crate::net::w16(con_out, " > ");
+                crate::net::put_dec(con_out, self.capacity as u64);
+                crate::net::w16(con_out, ")\r\n");
+            }
             // For now, just fail if we exceed capacity
             // In a more sophisticated implementation, we could reallocate
             return Err(());
