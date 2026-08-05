@@ -517,57 +517,62 @@ fn scan_e1000_devices(
     image_handle: EFI_HANDLE,
     system_table: &EFI_SYSTEM_TABLE,
 ) -> Option<common::dhcp::DhcpConfig> {
-    let _open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
+    // On ARM64, skip directly to tier 4 (direct PCI scan) because PCI IO protocol
+    // handles have unreliable device paths that cause synchronous exceptions.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
 
-    // Try 1: Get device path from image handle to find PCI location
-    w16(con_out, "Trying Device Path on image handle...\r\n");
-    if let Some(cfg) = try_device_path(con_out, gbs, image_handle) {
-        return Some(cfg);
-    }
+        // Try 1: Get device path from image handle to find PCI location
+        w16(con_out, "Trying Device Path on image handle...\r\n");
+        if let Some(cfg) = try_device_path(con_out, gbs, image_handle) {
+            return Some(cfg);
+        }
 
-    // Try 2: Enumerate all handles with PCI IO protocol (works in normal UEFI post-DXE)
-    let locate_handle_buffer: LocateHandleBufferFn = read_boot_svc_fn(gbs, BOOT_SVC_LOCATE_HANDLE_BUFFER);
-    let open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
-    let free_pool: FreePoolFn = read_boot_svc_fn(gbs, BOOT_SVC_FREE_POOL);
+        // Try 2: Enumerate all handles with PCI IO protocol (works in normal UEFI post-DXE)
+        let locate_handle_buffer: LocateHandleBufferFn = read_boot_svc_fn(gbs, BOOT_SVC_LOCATE_HANDLE_BUFFER);
+        let open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
+        let free_pool: FreePoolFn = read_boot_svc_fn(gbs, BOOT_SVC_FREE_POOL);
 
-    w16(con_out, "Trying PCI IO protocol handles...\r\n");
-    let mut handle_count: UINTN = 0;
-    let mut handle_buffer: *mut EFI_HANDLE = core::ptr::null_mut();
-    let st = unsafe {
-        locate_handle_buffer(
-            2, // ByProtocol
-            &PCI_IO_GUID as *const EFI_GUID,
-            core::ptr::null_mut(),
-            &mut handle_count,
-            &mut handle_buffer,
-        )
-    };
+        w16(con_out, "Trying PCI IO protocol handles...\r\n");
+        let mut handle_count: UINTN = 0;
+        let mut handle_buffer: *mut EFI_HANDLE = core::ptr::null_mut();
+        let st = unsafe {
+            locate_handle_buffer(
+                2, // ByProtocol
+                &PCI_IO_GUID as *const EFI_GUID,
+                core::ptr::null_mut(),
+                &mut handle_count,
+                &mut handle_buffer,
+            )
+        };
 
-    if st != EFI_SUCCESS {
-        w16(con_out, "LocateHandleBuffer(PCI_IO) failed: status=");
-        put_dec(con_out, st as u64);
-        w16(con_out, "\r\n");
-    } else if handle_count == 0 {
-        w16(con_out, "No PCI IO handles found\r\n");
-    } else {
-        w16(con_out, "Found ");
-        put_dec(con_out, handle_count as u64);
-        w16(con_out, " PCI IO handles\r\n");
+        if st != EFI_SUCCESS {
+            w16(con_out, "LocateHandleBuffer(PCI_IO) failed: status=");
+            put_dec(con_out, st as u64);
+            w16(con_out, "\r\n");
+        } else if handle_count == 0 {
+            w16(con_out, "No PCI IO handles found\r\n");
+        } else {
+            w16(con_out, "Found ");
+            put_dec(con_out, handle_count as u64);
+            w16(con_out, " PCI IO handles\r\n");
 
-        for i in 0..handle_count {
-            let handle = unsafe { *handle_buffer.add(i as usize) };
-            if let Some(cfg) = scan_pci_io_handle(con_out, handle, open_protocol, image_handle) {
-                unsafe { free_pool(handle_buffer as *mut c_void); }
-                return Some(cfg);
+            for i in 0..handle_count {
+                let handle = unsafe { *handle_buffer.add(i as usize) };
+                if let Some(cfg) = scan_pci_io_handle(con_out, handle, open_protocol, image_handle) {
+                    unsafe { free_pool(handle_buffer as *mut c_void); }
+                    return Some(cfg);
+                }
             }
         }
-    }
-    unsafe { free_pool(handle_buffer as *mut c_void); }
+        unsafe { free_pool(handle_buffer as *mut c_void); }
 
-    // Try 3: Loaded Image protocol
-    w16(con_out, "Trying Loaded Image protocol...\r\n");
-    if let Some(cfg) = try_loaded_image_path(con_out, gbs, image_handle) {
-        return Some(cfg);
+        // Try 3: Loaded Image protocol
+        w16(con_out, "Trying Loaded Image protocol...\r\n");
+        if let Some(cfg) = try_loaded_image_path(con_out, gbs, image_handle) {
+            return Some(cfg);
+        }
     }
 
     // Try 4: Direct PCI bus scan via I/O ports (works in all phases, no protocols needed)
@@ -993,6 +998,13 @@ fn dhcp_run(
         w16(con_out, "Sending DHCPDISCOVER (try ");
         put_dec(con_out, retry as u64 + 1);
         w16(con_out, ")...");
+        
+        // On ARM64, restart SNP before each transmit to work around single-transmit limit
+        #[cfg(target_arch = "aarch64")]
+        if retry > 0 {
+            restart_snp(snp);
+        }
+        
         let discover = common::dhcp::build_discover(xid, mac);
         if !send_udp_dhcp(snp, mac, &discover, 300) {
             w16(con_out, "send failed\r\n");
