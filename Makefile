@@ -160,7 +160,7 @@ run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi pxe-start check-deps
 		-bios /usr/share/edk2/aarch64/QEMU_EFI.fd \
 		-drive file=fat:rw:.,format=raw \
 		-netdev socket,id=net0,connect=127.0.0.1:43210 \
-		-device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:5b \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:5b \
 		-nographic
 
 test.img:
