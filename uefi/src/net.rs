@@ -1120,7 +1120,14 @@ fn pxe_boot_snp(
     w16(con_out, "...\r\n");
     
     // SNP receive is unreliable on OVMF for TFTP (blocks or drops packets).
-    // Find the e1000 BAR0 via PCI scan and use direct MMIO for TFTP instead.
+    // Stop SNP first to release the e1000 hardware, then use direct MMIO.
+    w16(con_out, "  PXE: Stopping SNP to use direct e1000...\r\n");
+    unsafe {
+        (snp.shutdown)(snp as *const _ as *mut _);
+        (snp.stop)(snp as *const _ as *mut _);
+    }
+    
+    // Find the e1000 BAR0 via PCI scan and use direct MMIO for TFTP.
     w16(con_out, "  PXE: Finding e1000 for direct TFTP...\r\n");
     if let Some(bar0) = find_e1000_bar0() {
         w16(con_out, "  PXE: e1000 BAR0=0x");
@@ -1366,7 +1373,7 @@ fn build_udp_frame(
     frame: &mut [u8; 1514],
 ) -> Option<usize> {
     // Ethernet header
-    frame[0..6].copy_from_slice(&[0xff; 6]); // broadcast for now
+    frame[0..6].copy_from_slice(&[0xff; 6]); // broadcast
     frame[6..12].copy_from_slice(src_mac);
     frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // IPv4
     
