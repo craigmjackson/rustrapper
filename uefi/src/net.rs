@@ -404,6 +404,8 @@ fn tftp_download_e1000(
 
 fn scan_pci_direct(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    image_handle: EFI_HANDLE,
+    system_table: &EFI_SYSTEM_TABLE,
 ) -> Option<common::dhcp::DhcpConfig> {
     w16(con_out, "Scanning PCI buses via I/O ports...\r\n");
     for bus in 0..=255u8 {
@@ -487,6 +489,12 @@ fn scan_pci_direct(
 
                             // Skip DNS lookup for now - it hangs when upstream DNS is not configured
                             // dns_resolve_e1000(con_out, e1000.base, &mac, &cfg);
+                            
+                            // PXE boot: download and execute if next_server and bootfile are present
+                            if cfg.next_server != [0, 0, 0, 0] && cfg.bootfile[0] != 0 {
+                                pxe_boot_e1000(con_out, &e1000, &mac, &cfg, image_handle, system_table);
+                            }
+                            
                             return Some(cfg);
                         }
                         None => {
@@ -507,6 +515,7 @@ fn scan_e1000_devices(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
     gbs: *mut c_void,
     image_handle: EFI_HANDLE,
+    system_table: &EFI_SYSTEM_TABLE,
 ) -> Option<common::dhcp::DhcpConfig> {
     let _open_protocol: OpenProtocolFn = read_boot_svc_fn(gbs, BOOT_SVC_OPEN_PROTOCOL);
 
@@ -563,7 +572,7 @@ fn scan_e1000_devices(
 
     // Try 4: Direct PCI bus scan via I/O ports (works in all phases, no protocols needed)
     w16(con_out, "Trying direct PCI scan via I/O ports...\r\n");
-    if let Some(cfg) = scan_pci_direct(con_out) {
+    if let Some(cfg) = scan_pci_direct(con_out, image_handle, system_table) {
         return Some(cfg);
     }
 
@@ -1366,6 +1375,54 @@ fn pxe_boot_snp(
     }
 }
 
+/// PXE boot using direct e1000 MMIO (for option ROM path)
+fn pxe_boot_e1000(
+    con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
+    e1000: &DirectMmioE1000,
+    mac: &[u8; 6],
+    cfg: &common::dhcp::DhcpConfig,
+    image_handle: EFI_HANDLE,
+    system_table: &EFI_SYSTEM_TABLE,
+) {
+    // Extract filename from bootfile (null-terminated)
+    let filename_len = cfg.bootfile.iter().position(|&b| b == 0).unwrap_or(128);
+    let filename = match core::str::from_utf8(&cfg.bootfile[..filename_len]) {
+        Ok(s) => s,
+        Err(_) => {
+            w16(con_out, "  PXE: Invalid bootfile name\r\n");
+            return;
+        }
+    };
+    
+    w16(con_out, "  PXE: Downloading ");
+    w16(con_out, filename);
+    w16(con_out, " from ");
+    print_ip(con_out, &cfg.next_server);
+    w16(con_out, "...\r\n");
+    
+    let mut sink = crate::mem::UefiMemorySink::new(system_table, 16 * 1024 * 1024);
+    let tftp_result = tftp_download_e1000(con_out, e1000, mac, &cfg.yiaddr, &cfg.next_server, filename, &mut sink);
+    
+    match tftp_result {
+        Some(size) => {
+            w16(con_out, "  PXE: Downloaded ");
+            put_dec(con_out, size as u64);
+            w16(con_out, " bytes\r\n");
+            
+            crate::loader::execute_file(
+                system_table,
+                image_handle,
+                sink.buffer(),
+                size,
+                uefi_puts,
+            );
+        }
+        None => {
+            w16(con_out, "  PXE: Download failed\r\n");
+        }
+    }
+}
+
 /// TFTP download using SNP
 fn tftp_download_snp(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
@@ -1692,7 +1749,7 @@ pub fn scan_network_devices(
 
     if !snp_handled {
         w16(con_out, "SNP not available, trying direct e1000...\r\n");
-        let _ = scan_e1000_devices(con_out, gbs, image_handle);
+        let _ = scan_e1000_devices(con_out, gbs, image_handle, system_table);
     }
 
     unsafe { free_pool(handle_buffer as *mut c_void); }
