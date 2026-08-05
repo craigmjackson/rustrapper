@@ -399,8 +399,18 @@ fn scan_pci_direct(
                         continue;
                     }
                     w16(con_out, "  BAR0=0x");
-                    put_dec(con_out, bar0 as u64);
+                    put_hex(con_out, bar0 as u64);
                     w16(con_out, "\r\n");
+
+                    // Enable PCI command register (Memory Space + Bus Master)
+                    let cmd = pci_read_config32(bus, dev, func, 0x04);
+                    let new_cmd = cmd | 0x06; // Memory Space (bit 1) + Bus Master (bit 2)
+                    if cmd != new_cmd {
+                        pci_write_config32(bus, dev, func, 0x04, new_cmd);
+                        w16(con_out, "  Enabled PCI command: 0x");
+                        put_hex(con_out, new_cmd as u64);
+                        w16(con_out, "\r\n");
+                    }
 
                     let e1000 = DirectMmioE1000::new(bar0 as u64);
                     if !e1000.init() {
@@ -409,10 +419,7 @@ fn scan_pci_direct(
                     }
                     let mac = e1000.read_mac();
                     w16(con_out, "  MAC: ");
-                    for i in 0..6 {
-                        put_dec(con_out, mac[i] as u64);
-                        if i < 5 { w16(con_out, ":"); }
-                    }
+                    print_mac(con_out, &mac);
                     w16(con_out, "\r\n  DHCP: ");
                     match e1000.dhcp_run() {
                         Some(cfg) => {
@@ -686,6 +693,36 @@ fn pci_read_config32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let ecam_base: u64 = 0x4010_0000_0000;
     let addr = ecam_base | ((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12) | (offset as u64);
     unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pci_write_config32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+    let addr: u32 = 0x8000_0000
+        | (bus as u32) << 16
+        | (dev as u32) << 11
+        | (func as u32) << 8
+        | (offset as u32 & 0xFC);
+    let cfg_port: u16 = 0xCF8;
+    let data_port: u16 = 0xCFC;
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") cfg_port,
+            in("eax") addr,
+        );
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") data_port,
+            in("eax") val,
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn pci_write_config32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
+    let ecam_base: u64 = 0x4010_0000_0000;
+    let addr = ecam_base | ((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12) | (offset as u64);
+    unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
 }
 
 fn try_device_path(
