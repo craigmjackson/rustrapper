@@ -485,7 +485,8 @@ fn scan_pci_direct(
                             else { print_ip(con_out, &cfg.gateway); }
                             w16(con_out, "\r\n");
 
-                            dns_resolve_e1000(con_out, e1000.base, &mac, &cfg);
+                            // Skip DNS lookup for now - it hangs when upstream DNS is not configured
+                            // dns_resolve_e1000(con_out, e1000.base, &mac, &cfg);
                             return Some(cfg);
                         }
                         None => {
@@ -610,7 +611,8 @@ fn e1000_init_and_dhcp(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, bar0: u64) -> Opti
     put_dec(con_out, gw_bytes[3] as u64);
     w16(con_out, "\r\n");
 
-    dns_resolve_e1000(con_out, bar0 as u64, &mac, &config);
+    // Skip DNS lookup - it hangs when upstream DNS is not configured
+    // dns_resolve_e1000(con_out, bar0 as u64, &mac, &config);
 
     Some(config)
 }
