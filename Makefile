@@ -125,22 +125,28 @@ run-i386-bios: $(BIN)/bios.img pxe-start check-deps
 		-device e1000,netdev=net0,mac=52:54:00:12:34:57 \
 		-nographic
 
+# ── UEFI FAT root ────────────────────────────────────────────────
+# FAT drive for UEFI run targets. Contains only the EFI boot files so the
+# drive stays small — the working directory also holds the 126MB OpenWrt
+# image, which would overflow FAT16's ~504MB limit (QEMU picks FAT16 for
+# the rw fat drive).
+fat-root: $(BIN)/rustrapper.efi $(BIN)/rustrapper_arm64.efi | $(BIN)
+	mkdir -p $@/EFI/BOOT
+	cp $(BIN)/rustrapper.efi $@/EFI/BOOT/BOOTX64.EFI
+	cp $(BIN)/rustrapper_arm64.efi $@/EFI/BOOT/BOOTAA64.EFI
+
 run-x86_64-uefi: TARGET := run-x86_64-uefi
-run-x86_64-uefi: $(BIN)/rustrapper.efi pxe-start check-deps
-	mkdir -p EFI/BOOT
-	cp $(BIN)/rustrapper.efi EFI/BOOT/BOOTX64.EFI
+run-x86_64-uefi: $(BIN)/rustrapper.efi fat-root pxe-start check-deps
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=fat:rw:.,format=raw \
+		-drive file=fat:rw:fat-root,format=raw \
 		-netdev socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:58 \
 		-nographic
 
 run-x86_64-uefi-rom: TARGET := run-x86_64-uefi-rom
-run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom pxe-start check-deps
-	mkdir -p EFI/BOOT
-	cp $(BIN)/rustrapper.efi EFI/BOOT/BOOTX64.EFI
+run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root pxe-start check-deps
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=fat:rw:.,format=raw \
+		-drive file=fat:rw:fat-root,format=raw \
 		-netdev socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0,mac=52:54:00:12:34:59 \
 		-nographic
@@ -153,12 +159,10 @@ run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom pxe-start check-de
 		-nographic
 
 run-aarch64-uefi: TARGET := run-aarch64-uefi
-run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi pxe-start check-deps
-	mkdir -p EFI/BOOT
-	cp $< EFI/BOOT/BOOTAA64.EFI
+run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi fat-root pxe-start check-deps
 	qemu-system-aarch64 -machine virt -cpu max \
 		-bios /usr/share/edk2/aarch64/QEMU_EFI.fd \
-		-drive file=fat:rw:.,format=raw \
+		-drive file=fat:rw:fat-root,format=raw \
 		-netdev socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:5b \
 		-nographic
@@ -211,7 +215,7 @@ pxe-stop:
 # ── Clean ────────────────────────────────────────────────────────
 clean:
 	rm -rf $(BIN)/* build/
-	rm -rf target/ EFI/ tftp-root/
+	rm -rf target/ EFI/ tftp-root/ fat-root/
 	@echo "Note: OpenWrt image not removed. Run 'make clean-pxe' to remove it."
 
 clean-pxe: pxe-stop

@@ -2,6 +2,7 @@ target/
 bin/
 build/
 EFI/
+fat-root/
 test.img
 *.o
 *.obj
