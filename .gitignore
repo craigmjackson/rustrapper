@@ -4,9 +4,21 @@ build/
 EFI/
 fat-root/
 test.img
+
+# Downloaded/auto-generated binaries — never commit these.
+# setup-openwrt.sh downloads the OpenWrt image; Makefile targets
+# generate the rest at build/run time.
+openwrt
+openwrt-*.gz
+.openwrt-configured
+pxe-server.pid
+tftp-root/
+
 *.o
 *.obj
 *.elf
 *.bin
+*.efi
+*.rom
 *.log
 NvVars
