@@ -191,14 +191,9 @@ mod tests {
         assert_eq!(&buf[2..11], b"test.txt\0");
         // Mode
         assert_eq!(&buf[11..17], b"octet\0");
-        // blksize option
-        assert_eq!(&buf[17..25], b"blksize\0");
-        assert_eq!(&buf[25..30], b"1468\0");
-        // tsize option
-        assert_eq!(&buf[30..36], b"tsize\0");
-        assert_eq!(&buf[36..38], b"0\0");
+        // No options (disabled for compatibility)
         
-        assert_eq!(len, 38);
+        assert_eq!(len, 17);
     }
     
     #[test]
