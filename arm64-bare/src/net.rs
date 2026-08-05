@@ -185,6 +185,16 @@ fn pxe_boot(base: u64, mac: &[u8; 6], cfg: &DhcpConfig) {
     }
 }
 
+/// Extract source port from a received Ethernet+IPv4+UDP frame.
+/// Returns the UDP source port, or 69 (default TFTP port) if parsing fails.
+fn extract_src_port(frame: &[u8], len: usize) -> u16 {
+    if len < 42 { return 69; } // Minimum: Eth(14) + IP(20) + UDP(8)
+    let ip_hdr_len = ((frame[14] & 0x0F) as usize) * 4;
+    let udp_offset = 14 + ip_hdr_len;
+    if udp_offset + 4 > len { return 69; }
+    u16::from_be_bytes([frame[udp_offset], frame[udp_offset + 1]])
+}
+
 /// TFTP download using e1000
 fn tftp_download(
     base: u64,
@@ -219,6 +229,7 @@ fn tftp_download(
     puts("    TFTP: Waiting for response...\n");
     
     // Receive and process packets
+    let mut server_port: Option<u16> = None; // Will be learned from first response
     let mut _block_num = 0u16;
     let mut blksize = DEFAULT_BLKSIZE;
     let mut total_size = 0usize;
@@ -268,6 +279,18 @@ fn tftp_download(
             continue;
         }
         
+        // Learn the server's ephemeral port from the first response
+        if server_port.is_none() {
+            let port = extract_src_port(&recv_buf, copy_len);
+            server_port = Some(port);
+            if pkt_count <= 5 {
+                puts("    TFTP: Server port ");
+                print_dec(port as u64);
+                putc(b'\n');
+            }
+        }
+        let sport = server_port.unwrap_or(69);
+        
         // Strip Ethernet+IP+UDP headers to get TFTP payload
         if copy_len < 42 { continue; }
         let ip_hdr_len = ((recv_buf[14] & 0x0F) as usize) * 4;
@@ -305,11 +328,11 @@ fn tftp_download(
         // Check if it's an OACK
         if let Some((new_blksize, _tsize)) = parse_oack(tftp_payload, tftp_len) {
             blksize = new_blksize;
-            // Send ACK for block 0
+            // Send ACK for block 0 to server's ephemeral port
             let mut ack_buf = [0u8; 4];
             let ack_len = build_ack(0, &mut ack_buf);
             let mut ack_frame = [0u8; 1514];
-            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, 69, &ack_buf[..ack_len], &mut ack_frame) {
+            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, sport, &ack_buf[..ack_len], &mut ack_frame) {
                 e1000_common::send(base, &ack_frame[..ack_frame_len]);
             }
             continue;
@@ -324,11 +347,11 @@ fn tftp_download(
             total_size += data.len();
             _block_num = block;
             
-            // Send ACK
+            // Send ACK to server's ephemeral port
             let mut ack_buf = [0u8; 4];
             let ack_len = build_ack(block, &mut ack_buf);
             let mut ack_frame = [0u8; 1514];
-            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, 69, &ack_buf[..ack_len], &mut ack_frame) {
+            if let Some(ack_frame_len) = build_udp_frame(mac, src_ip, dst_ip, 68, sport, &ack_buf[..ack_len], &mut ack_frame) {
                 e1000_common::send(base, &ack_frame[..ack_frame_len]);
             }
             

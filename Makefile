@@ -168,7 +168,7 @@ test.img:
 
 run-aarch64-bare: TARGET := run-aarch64-bare
 run-aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf test.img pxe-start check-deps
-	qemu-system-aarch64 -M virt -cpu max -kernel $< \
+	qemu-system-aarch64 -M virt -cpu max -m 512 -kernel $< \
 		-drive file=test.img,format=raw,if=none,id=drive0 \
 		-device ahci,id=ahci \
 		-device ide-hd,bus=ahci.0,drive=drive0 \

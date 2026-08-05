@@ -267,7 +267,7 @@ pub fn send(base: u64, data: &[u8]) -> bool {
 
     reg_write32(base, REG_TDT, ((tdt + 1) % NUM_TX_DESC) as u32);
 
-    for _ in 0..2000000 {
+    for _ in 0..25000000 {
         #[cfg(not(test))]
         let status = unsafe {
             let desc = &raw const TX_DESCS.0[tdt];
