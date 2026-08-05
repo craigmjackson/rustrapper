@@ -3,6 +3,7 @@ use core::ptr::{read_volatile, write_volatile};
 // e1000 register offsets (from BAR0, u64 for cross-platform use)
 pub const REG_CTRL: u64 = 0x0000;
 pub const REG_STATUS: u64 = 0x0008;
+pub const REG_EERD: u64 = 0x0014;
 pub const REG_RCTL: u64 = 0x0100;
 pub const REG_TCTL: u64 = 0x0400;
 pub const REG_RDBAL: u64 = 0x2800;
@@ -112,17 +113,36 @@ pub fn reg_write32(base: u64, reg: u64, val: u32) {
     unsafe { write_volatile((base + reg) as *mut u32, val) }
 }
 
-/// Read the MAC address from the NIC's Receive Address registers.
+/// Read a word from the EEPROM. The EEPROM contains the MAC address and other
+/// configuration data. Word 0-2 contain the MAC address.
+pub fn eeprom_read(base: u64, addr: u16) -> u16 {
+    // Write the address with the READ flag (bit 0) set
+    reg_write32(base, REG_EERD, ((addr as u32) << 8) | 1);
+    
+    // Wait for the DONE bit (bit 4) to be set
+    for _ in 0..10000 {
+        let val = reg_read32(base, REG_EERD);
+        if val & 0x10 != 0 {
+            return (val >> 16) as u16;
+        }
+        core::hint::spin_loop();
+    }
+    0 // Timeout
+}
+
+/// Read the MAC address from the EEPROM. The MAC is stored in EEPROM words 0-2.
 pub fn read_mac(base: u64) -> [u8; 6] {
-    let low = reg_read32(base, REG_RA);
-    let high = reg_read32(base, REG_RA + 4);
+    let word0 = eeprom_read(base, 0);
+    let word1 = eeprom_read(base, 1);
+    let word2 = eeprom_read(base, 2);
+    
     [
-        low as u8,
-        (low >> 8) as u8,
-        (low >> 16) as u8,
-        (low >> 24) as u8,
-        high as u8,
-        (high >> 8) as u8,
+        word0 as u8,
+        (word0 >> 8) as u8,
+        word1 as u8,
+        (word1 >> 8) as u8,
+        word2 as u8,
+        (word2 >> 8) as u8,
     ]
 }
 

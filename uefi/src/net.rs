@@ -171,12 +171,17 @@ impl DirectMmioE1000 {
         let mut frame = [0u8; 1514];
         let dhcp_payload = common::dhcp::build_discover(xid, &mac);
         let frame_len = common::dhcp::build_eth_ip_udp(&mac, &dhcp_payload, 300, &mut frame);
+        w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Building DHCP discover frame...\r\n");
         if !self.send(&frame[..frame_len]) {
+            w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Send failed\r\n");
             return None;
         }
+        w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Sent, waiting for response...\r\n");
         if let Some(len) = self.receive_into(&mut frame) {
+            w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Received response\r\n");
             return common::dhcp::parse_response(&frame, len, xid, &mac);
         }
+        w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Receive timeout\r\n");
         None
     }
 }
@@ -398,29 +403,49 @@ fn scan_pci_direct(
                         w16(con_out, "  BAR0 is 0, skipping\r\n");
                         continue;
                     }
-                    w16(con_out, "  BAR0=0x");
+                    w16(con_out, "  BAR0=");
                     put_hex(con_out, bar0 as u64);
                     w16(con_out, "\r\n");
 
                     // Enable PCI command register (Memory Space + Bus Master)
                     let cmd = pci_read_config32(bus, dev, func, 0x04);
+                    w16(con_out, "  PCI cmd before=0x");
+                    put_hex(con_out, cmd as u64);
+                    w16(con_out, "\r\n");
                     let new_cmd = cmd | 0x06; // Memory Space (bit 1) + Bus Master (bit 2)
                     if cmd != new_cmd {
                         pci_write_config32(bus, dev, func, 0x04, new_cmd);
-                        w16(con_out, "  Enabled PCI command: 0x");
+                        w16(con_out, "  PCI cmd after=0x");
                         put_hex(con_out, new_cmd as u64);
                         w16(con_out, "\r\n");
                     }
 
                     let e1000 = DirectMmioE1000::new(bar0 as u64);
+                    w16(con_out, "  Initializing e1000...\r\n");
                     if !e1000.init() {
                         w16(con_out, "  e1000 init failed\r\n");
                         continue;
                     }
+                    w16(con_out, "  e1000 init OK\r\n");
                     let mac = e1000.read_mac();
-                    w16(con_out, "  MAC: ");
+                    w16(con_out, "  MAC from EEPROM: ");
                     print_mac(con_out, &mac);
-                    w16(con_out, "\r\n  DHCP: ");
+                    w16(con_out, "\r\n");
+                    
+                    // Debug: Read raw EEPROM words
+                    let word0 = common::e1000::eeprom_read(bar0 as u64, 0);
+                    let word1 = common::e1000::eeprom_read(bar0 as u64, 1);
+                    let word2 = common::e1000::eeprom_read(bar0 as u64, 2);
+                    w16(con_out, "  EEPROM words: 0x");
+                    put_hex(con_out, word0 as u64);
+                    w16(con_out, " 0x");
+                    put_hex(con_out, word1 as u64);
+                    w16(con_out, " 0x");
+                    put_hex(con_out, word2 as u64);
+                    w16(con_out, "\r\n");
+                    
+                    w16(con_out, "  DHCP: ");
+                    w16(con_out, "sending discover...\r\n");
                     match e1000.dhcp_run() {
                         Some(cfg) => {
                             w16(con_out, "OK\r\n");
