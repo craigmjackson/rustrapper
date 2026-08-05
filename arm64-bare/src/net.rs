@@ -74,7 +74,8 @@ pub fn scan_network() {
                 }
                 putc(b'\n');
 
-                common::netio::dns_resolve_and_print(bar0_u64, &mac, &cfg);
+                // Skip DNS lookup - it hangs when upstream DNS is not configured
+                // common::netio::dns_resolve_and_print(bar0_u64, &mac, &cfg);
                 
                 // PXE boot: download and execute if next_server and bootfile are present
                 if cfg.next_server != [0, 0, 0, 0] && cfg.bootfile[0] != 0 {
@@ -195,6 +196,8 @@ fn tftp_download(
 ) -> Option<usize> {
     use common::tftp::*;
     
+    puts("    TFTP: Building RRQ...\n");
+    
     // Build RRQ packet
     let mut rrq_buf = [0u8; 512];
     let rrq_len = build_rrq(filename, &mut rrq_buf);
@@ -203,23 +206,104 @@ fn tftp_download(
     let mut frame = [0u8; 1514];
     let frame_len = build_udp_frame(mac, src_ip, dst_ip, 68, 69, &rrq_buf[..rrq_len], &mut frame)?;
     
+    puts("    TFTP: Sending RRQ (");
+    print_dec(frame_len as u64);
+    puts(" bytes)...\n");
+    
     // Send RRQ
     if !e1000_common::send(base, &frame[..frame_len]) {
+        puts("    TFTP: Send failed\n");
         return None;
     }
+    
+    puts("    TFTP: Waiting for response...\n");
     
     // Receive and process packets
     let mut _block_num = 0u16;
     let mut blksize = DEFAULT_BLKSIZE;
     let mut total_size = 0usize;
     let mut recv_buf = [0u8; 1514];
+    let mut pkt_count = 0u32;
     
     loop {
         // Receive packet
-        let copy_len = e1000_common::try_receive(base, &mut recv_buf, 100_000_000)?;
+        let copy_len = match e1000_common::try_receive(base, &mut recv_buf, 100_000_000) {
+            Some(len) => {
+                pkt_count += 1;
+                if pkt_count <= 5 {
+                    puts("    TFTP: Received packet #");
+                    print_dec(pkt_count as u64);
+                    puts(" (");
+                    print_dec(len as u64);
+                    puts(" bytes)\n");
+                }
+                len
+            }
+            None => {
+                puts("    TFTP: Receive timeout after ");
+                print_dec(pkt_count as u64);
+                puts(" packets\n");
+                return None;
+            }
+        };
+        
+        // Respond to ARP requests for our IP
+        if copy_len >= 42 && recv_buf[12] == 0x08 && recv_buf[13] == 0x06 {
+            let off = 14;
+            if recv_buf[off + 6] == 0x00 && recv_buf[off + 7] == 0x01 { // ARP request
+                let tpa = [recv_buf[off + 24], recv_buf[off + 25], recv_buf[off + 26], recv_buf[off + 27]];
+                if tpa == *src_ip {
+                    puts("    TFTP: Handling ARP request\n");
+                    let mut arp_reply = [0u8; 1514];
+                    if let Some(reply_len) = common::arp::build_reply(mac, *src_ip, &recv_buf, &mut arp_reply) {
+                        e1000_common::send(base, &arp_reply[..reply_len]);
+                    }
+                    continue;
+                }
+            }
+        }
+        
+        // Check if it's IPv4
+        if recv_buf[12] != 0x08 || recv_buf[13] != 0x00 {
+            continue;
+        }
+        
+        // Strip Ethernet+IP+UDP headers to get TFTP payload
+        if copy_len < 42 { continue; }
+        let ip_hdr_len = ((recv_buf[14] & 0x0F) as usize) * 4;
+        let udp_offset = 14 + ip_hdr_len;
+        if udp_offset + 8 > copy_len { continue; }
+        let tftp_payload = &recv_buf[udp_offset + 8..copy_len];
+        let tftp_len = tftp_payload.len();
+        
+        if pkt_count <= 5 {
+            puts("    TFTP: TFTP payload len=");
+            print_dec(tftp_len as u64);
+            puts(" opcode=0x");
+            if tftp_len >= 2 {
+                print_hex(u16::from_be_bytes([tftp_payload[0], tftp_payload[1]]) as u64, 4);
+            }
+            putc(b'\n');
+        }
+        
+        // Detect TFTP ERROR packets (opcode 5)
+        if tftp_len >= 4 {
+            let opcode = u16::from_be_bytes([tftp_payload[0], tftp_payload[1]]);
+            if opcode == 5 {
+                puts("    TFTP: ERROR from server: ");
+                print_dec(u16::from_be_bytes([tftp_payload[2], tftp_payload[3]]) as u64);
+                puts(" - ");
+                let msg_end = tftp_payload[4..].iter().position(|&b| b == 0).unwrap_or(tftp_len - 4);
+                for &b in &tftp_payload[4..4 + msg_end] {
+                    putc(b);
+                }
+                putc(b'\n');
+                return None;
+            }
+        }
         
         // Check if it's an OACK
-        if let Some((new_blksize, _tsize)) = parse_oack(&recv_buf[..copy_len], copy_len) {
+        if let Some((new_blksize, _tsize)) = parse_oack(tftp_payload, tftp_len) {
             blksize = new_blksize;
             // Send ACK for block 0
             let mut ack_buf = [0u8; 4];
@@ -232,7 +316,7 @@ fn tftp_download(
         }
         
         // Check if it's a DATA packet
-        if let Some((block, data)) = parse_data(&recv_buf[..copy_len], copy_len) {
+        if let Some((block, data)) = parse_data(tftp_payload, tftp_len) {
             // Write to sink
             if sink.write_block(data).is_err() {
                 return None;
@@ -286,9 +370,20 @@ fn build_udp_frame(
     frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // flags/fragment
     frame[22] = 64; // TTL
     frame[23] = 17; // UDP protocol
-    frame[24..26].copy_from_slice(&0u16.to_be_bytes()); // checksum (skip for now)
+    frame[24..26].copy_from_slice(&0u16.to_be_bytes()); // checksum placeholder
     frame[26..30].copy_from_slice(src_ip);
     frame[30..34].copy_from_slice(dst_ip);
+    
+    // Compute IP header checksum
+    let mut sum = 0u32;
+    for i in (14..14 + ip_hdr_len).step_by(2) {
+        sum += u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    frame[24..26].copy_from_slice(&cksum.to_be_bytes());
     
     // UDP header
     frame[34..36].copy_from_slice(&src_port.to_be_bytes());

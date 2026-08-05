@@ -54,32 +54,32 @@ pub fn build_rrq(filename: &str, buf: &mut [u8]) -> usize {
     buf[pos] = 0;
     pos += 1;
     
-    // Options (RFC 2348)
+    // Options (RFC 2348) - disabled for compatibility with simple TFTP servers
     // blksize option
-    let blksize_key = b"blksize";
-    buf[pos..pos + blksize_key.len()].copy_from_slice(blksize_key);
-    pos += blksize_key.len();
-    buf[pos] = 0;
-    pos += 1;
+    // let blksize_key = b"blksize";
+    // buf[pos..pos + blksize_key.len()].copy_from_slice(blksize_key);
+    // pos += blksize_key.len();
+    // buf[pos] = 0;
+    // pos += 1;
     
-    let blksize_val = b"1468";
-    buf[pos..pos + blksize_val.len()].copy_from_slice(blksize_val);
-    pos += blksize_val.len();
-    buf[pos] = 0;
-    pos += 1;
+    // let blksize_val = b"1468";
+    // buf[pos..pos + blksize_val.len()].copy_from_slice(blksize_val);
+    // pos += blksize_val.len();
+    // buf[pos] = 0;
+    // pos += 1;
     
     // tsize option (request file size)
-    let tsize_key = b"tsize";
-    buf[pos..pos + tsize_key.len()].copy_from_slice(tsize_key);
-    pos += tsize_key.len();
-    buf[pos] = 0;
-    pos += 1;
+    // let tsize_key = b"tsize";
+    // buf[pos..pos + tsize_key.len()].copy_from_slice(tsize_key);
+    // pos += tsize_key.len();
+    // buf[pos] = 0;
+    // pos += 1;
     
-    let tsize_val = b"0";
-    buf[pos..pos + tsize_val.len()].copy_from_slice(tsize_val);
-    pos += tsize_val.len();
-    buf[pos] = 0;
-    pos += 1;
+    // let tsize_val = b"0";
+    // buf[pos..pos + tsize_val.len()].copy_from_slice(tsize_val);
+    // pos += tsize_val.len();
+    // buf[pos] = 0;
+    // pos += 1;
     
     pos
 }
