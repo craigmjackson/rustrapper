@@ -75,7 +75,10 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `extern "efiapi"` calling convention is the EFI ABI on both x86_64 and ARM64.
 - Function pointers that dereference raw pointers (e.g. `output_string`) must be `unsafe extern "efiapi" fn(...)`, NOT `extern "efiapi" fn(...)`. Using safe `extern "efiapi" fn` causes "unnecessary `unsafe` block" warnings when wrapping calls.
 - **Boot Services function offsets** (hardcoded, verified on OVMF/EDK2):
+  - `0x40` — `AllocatePool`
   - `0x48` — `FreePool`
+  - `0xC8` — `LoadImage`
+  - `0xD0` — `StartImage`
   - `0x118` — `OpenProtocol`
   - `0x138` — `LocateHandleBuffer`
 - GUIDs must be `static` (not `const`) to guarantee stable address semantics when taking references.
@@ -109,6 +112,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `send_udp_dhcp` builds the Ethernet/IP/UDP/DHCP frame via `common::dhcp::build_eth_ip_udp` and calls `SNP.Transmit`.
 - `try_receive` calls `SNP.Receive` with non-null `SrcAddr`, `DestAddr`, and `Protocol` output pointers; some firmware requires them.
 - The ARM64 virtio SNP only supports one transmit per session (no buffer recycling without `Initialize`), so `send_udp_dhcp` sends one DHCPDISCOVER and accepts the OFFER as final. x86_64 e1000 works normally with full DISCOVER→OFFER→REQUEST→ACK.
+- **PXE boot flow**: After DHCP succeeds, the bootloader attempts TFTP download via direct MMIO e1000 (bypassing SNP). This works around OVMF's SNP receive issues. The flow is: find e1000 BAR0 via PCI scan → initialize e1000 → send TFTP RRQ → receive OACK/DATA packets → send ACKs → execute downloaded file.
 
 ### `uefi/src/mem.rs` — UEFI memory allocation
 
@@ -120,8 +124,8 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 ### `uefi/src/loader.rs` — UEFI executable loader
 
 - `execute_pe_coff(system_table, image_handle, buffer, size) -> Result<(), &'static str>` — loads and executes PE/COFF EFI application via Boot Services.
-- Uses `LoadImage` (offset 0x68) with `SourceBuffer` parameter to load from memory.
-- Uses `StartImage` (offset 0x70) to execute the loaded image.
+- Uses `LoadImage` (offset 0xC8) with `SourceBuffer` parameter to load from memory.
+- Uses `StartImage` (offset 0xD0) to execute the loaded image.
 - `execute_file(system_table, image_handle, buffer, size, puts)` — detects format via `common::loader::detect_format`, dispatches to PE/COFF executor or displays text/binary info.
 - PE/COFF files are executed; text files are displayed; binary files print size only.
 
@@ -457,6 +461,12 @@ QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server tha
 49. **QEMU e1000 MMIO BAR0 is valid during DXE**: Even though option ROM runs early, QEMU's firmware assigns PCI resources before dispatching option ROMs. BAR0 reads back a valid MMIO address (e.g. `0x80F80000`). On real hardware this is also true — the BIOS/firmware configures PCI devices before option ROM entry.
 
 50. **`pci_read_config32` is cross-platform**: In `uefi/src/net.rs`, `pci_read_config32` uses x86 I/O ports on `#[cfg(target_arch = "x86_64")]` and ECAM MMIO at `0x4010_0000_0000` on ARM64. Both return `u32` with the same signature, so call sites need no cfg guards. The ARM64 ECAM address matches QEMU virt v11+ (same as `arm64-bare/src/pci.rs`).
+
+### UEFI PXE Boot
+
+51. **UEFI SNP receive is unreliable for TFTP**: After SNP DHCP succeeds, SNP receive may block or drop packets during TFTP transfer. The direct MMIO e1000 path works around this by bypassing SNP entirely. The flow is: DHCP via SNP → find e1000 BAR0 via PCI scan → initialize e1000 via direct MMIO → TFTP via direct MMIO. This works because SNP and direct MMIO can share the same NIC hardware (SNP initializes it, direct MMIO re-initializes it).
+
+52. **Boot Services table offsets must be correct**: AllocatePool is at offset 0x40 (not 0x30 which is FreePages), FreePool is at 0x48, LoadImage is at 0xC8 (not 0x68 which is SignalEvent), StartImage is at 0xD0. Using wrong offsets causes silent failures or calls to the wrong functions.
 
 ## Makefile Targets
 
