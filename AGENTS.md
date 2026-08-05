@@ -4,6 +4,10 @@
 
 Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, and PCI expansion ROMs. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP).
 
+## Agent Rules
+
+- **Never perform git actions** (add, commit, push, branch, rebase, filter-branch, force-push, tag, etc.) unless the user explicitly asks. Editing/reading files is fine; git mutating operations require an explicit request.
+
 ## Directory Structure
 
 ```
