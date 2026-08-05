@@ -758,7 +758,7 @@ fn pci_read_config32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn pci_read_config32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    let ecam_base: u64 = 0x4010_0000_0000;
+    let ecam_base: u64 = 0x4010_0000_00;
     let addr = ecam_base | ((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12) | (offset as u64);
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
@@ -788,7 +788,7 @@ fn pci_write_config32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn pci_write_config32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
-    let ecam_base: u64 = 0x4010_0000_0000;
+    let ecam_base: u64 = 0x4010_0000_00;
     let addr = ecam_base | ((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12) | (offset as u64);
     unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
 }
