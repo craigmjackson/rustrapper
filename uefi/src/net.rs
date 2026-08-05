@@ -177,68 +177,36 @@ impl DirectMmioE1000 {
             return None;
         }
         w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Sent, waiting for response...\r\n");
-        if let Some(len) = self.receive_into(&mut frame) {
-            w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Received response (");
-            put_dec(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, len as u64);
-            w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, " bytes)\r\n");
-            
-            // Debug: print key fields
-            let con_out = unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out };
-            w16(con_out, "    Ethertype: 0x");
-            put_hex_byte(con_out, frame[12]);
-            put_hex_byte(con_out, frame[13]);
-            w16(con_out, "\r\n");
-            
-            let ip_off = 14;
-            let ip_hdr_len = (frame[ip_off] & 0x0F) as usize * 4;
-            w16(con_out, "    IP hdr len: ");
-            put_dec(con_out, ip_hdr_len as u64);
-            w16(con_out, ", protocol: ");
-            put_dec(con_out, frame[ip_off + 9] as u64);
-            w16(con_out, "\r\n");
-            
-            let udp_off = ip_off + ip_hdr_len;
-            let dhcp_off = udp_off + 8;
-            w16(con_out, "    DHCP offset: ");
-            put_dec(con_out, dhcp_off as u64);
-            w16(con_out, "\r\n");
-            
-            // Magic cookie
-            w16(con_out, "    Magic: 0x");
-            put_hex_byte(con_out, frame[dhcp_off + 236]);
-            put_hex_byte(con_out, frame[dhcp_off + 237]);
-            put_hex_byte(con_out, frame[dhcp_off + 238]);
-            put_hex_byte(con_out, frame[dhcp_off + 239]);
-            w16(con_out, "\r\n");
-            
-            // Transaction ID
-            let pkt_xid = u32::from_be_bytes([
-                frame[dhcp_off + 4],
-                frame[dhcp_off + 5],
-                frame[dhcp_off + 6],
-                frame[dhcp_off + 7],
-            ]);
-            w16(con_out, "    XID: 0x");
-            put_hex(con_out, pkt_xid as u64);
-            w16(con_out, " (expected 0x");
-            put_hex(con_out, xid as u64);
-            w16(con_out, ")\r\n");
-            
-            // MAC in response
-            w16(con_out, "    Response MAC: ");
-            for i in 0..6 {
-                put_hex_byte(con_out, frame[dhcp_off + 28 + i]);
-                if i < 5 { w16(con_out, ":"); }
+        
+        // Loop to skip non-DHCP packets (like ARP)
+        for _attempt in 0..100 {
+            if let Some(len) = self.receive_into(&mut frame) {
+                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Received packet (");
+                put_dec(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, len as u64);
+                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, " bytes, ethertype=0x");
+                put_hex_byte(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, frame[12]);
+                put_hex_byte(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, frame[13]);
+                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, ")\r\n");
+                
+                // Check if it's IPv4
+                if frame[12] != 0x08 || frame[13] != 0x00 {
+                    w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Skipping non-IPv4 packet\r\n");
+                    continue;
+                }
+                
+                // Check if it's UDP
+                let ip_off = 14;
+                if frame[ip_off + 9] != 17 {
+                    w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Skipping non-UDP packet\r\n");
+                    continue;
+                }
+                
+                // Try to parse as DHCP
+                if let Some(cfg) = common::dhcp::parse_response(&frame, len, xid, &mac) {
+                    return Some(cfg);
+                }
+                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Not a valid DHCP response\r\n");
             }
-            w16(con_out, "\r\n");
-            w16(con_out, "    Expected MAC: ");
-            for i in 0..6 {
-                put_hex_byte(con_out, mac[i]);
-                if i < 5 { w16(con_out, ":"); }
-            }
-            w16(con_out, "\r\n");
-            
-            return common::dhcp::parse_response(&frame, len, xid, &mac);
         }
         w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Receive timeout\r\n");
         None
