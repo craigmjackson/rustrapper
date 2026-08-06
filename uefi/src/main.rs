@@ -41,7 +41,7 @@ fn u16_puts(s: &str) {
 }
 
 #[cfg(not(test))]
-fn u16_putc(c: u8) {
+pub fn u16_putc(c: u8) {
     let mut buf = [0u16; 2];
     buf[0] = c as u16;
     if let Some(st) = unsafe { SYSTEM_TABLE } {

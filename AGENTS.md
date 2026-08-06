@@ -2,7 +2,7 @@
 
 ## Overview
 
-Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, and PCI expansion ROMs. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP). The ARM64 bare-metal PXE path can execute `.lua` scripts served over TFTP with a built-in no_std Lua interpreter (`lua/` crate).
+Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, and PCI expansion ROMs. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP). The ARM64 bare-metal and both UEFI PXE paths can execute `.lua` scripts served over TFTP with a built-in no_std Lua interpreter (`lua/` crate).
 
 ## Agent Rules
 
@@ -103,6 +103,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - Stores a global reference to the system table for console input.
 - Presents the `[1]/[2]` menu via `common::menu::show_menu`, using `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` for non-blocking input.
 - Dispatches to `scan_storage_devices` or `net::scan_network_devices` based on the choice.
+- `u16_putc(c: u8)` is `pub` — it is the `fn(u8)` output callback passed to `lua::run` from `loader::execute_pxe_file` (each byte is converted to u16 and emitted via `OutputString`).
 
 ### `uefi/src/scan.rs` — UEFI storage scan
 
@@ -126,6 +127,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `try_receive` calls `SNP.Receive` with non-null `SrcAddr`, `DestAddr`, and `Protocol` output pointers; some firmware requires them.
 - The ARM64 virtio SNP only supports one transmit per session (no buffer recycling without `Initialize`), so `send_udp_dhcp` sends one DHCPDISCOVER and accepts the OFFER as final. x86_64 e1000 works normally with full DISCOVER→OFFER→REQUEST→ACK.
 - **PXE boot flow**: After DHCP succeeds, the bootloader attempts TFTP download via direct MMIO e1000 (bypassing SNP). This works around OVMF's SNP receive issues. The flow is: find e1000 BAR0 via PCI scan → initialize e1000 → send TFTP RRQ → receive OACK/DATA packets → send ACKs → execute downloaded file.
+- TFTP payload extraction and frame building use the shared `common::tftp::udp_payload` / `common::tftp::build_udp_frame` helpers (same as BIOS and ARM64 bare-metal). Both `tftp_download_e1000` and `tftp_download_snp` bound the TFTP payload by the UDP length field (not the raw RX length) so the 4-byte FCS QEMU appends is never parsed as file data.
 
 ### `uefi/src/mem.rs` — UEFI memory allocation
 
@@ -140,6 +142,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - Uses `LoadImage` (offset 0xC8) with `SourceBuffer` parameter to load from memory.
 - Uses `StartImage` (offset 0xD0) to execute the loaded image.
 - `execute_file(system_table, image_handle, buffer, size, puts)` — detects format via `common::loader::detect_format`, dispatches to PE/COFF executor or displays text/binary info.
+- `execute_pxe_file(system_table, image_handle, buffer, size, filename, puts)` — the PXE entry point (all three `pxe_boot_*` call sites in `net.rs`). If the bootfile name ends with `.lua`, runs it in place with `lua::run(data, crate::u16_putc)`; everything else falls through to `execute_file`. Mirrors `arm64-bare/src/net.rs::pxe_boot`, reusing the same `lua` crate.
 - PE/COFF files are executed; text files are displayed; binary files print size only.
 
 ### `arm64-bare/src/main.rs` — ARM64 bare-metal entry
@@ -159,7 +162,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
 - `print_mac` and `print_ip` are tiny local helpers that format MAC/IP to the global print sink.
 - `pxe_boot` TFTP-downloads the bootfile into an `Arm64MemorySink`; if the bootfile name ends with `.lua`, it executes the downloaded buffer in place with `lua::run(data, putc)`, otherwise it hands the buffer to `loader::execute_file`.
-- `tftp_download` bounds the TFTP payload slice by the UDP length field, NOT the raw Ethernet frame length — QEMU's e1000 model appends the 4-byte FCS to received frames, so the RX descriptor length returned by `try_receive` is 4 bytes too long on the final DATA packet. Without the UDP-length bound, the trailing FCS bytes get parsed as script/binary data (a `.lua` script fails with "unexpected character", and the downloaded size is 4 bytes too large).
+- `tftp_download` bounds the TFTP payload slice by the UDP length field via `common::tftp::udp_payload`, NOT the raw Ethernet frame length — QEMU's e1000 model appends the 4-byte FCS to received frames, so the RX descriptor length returned by `try_receive` is 4 bytes too long on the final DATA packet. Without the UDP-length bound, the trailing FCS bytes get parsed as script/binary data (a `.lua` script fails with "unexpected character", and the downloaded size is 4 bytes too large).
 - Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
 
 ### `arm64-bare/src/mem.rs` — ARM64 bare-metal memory allocation
@@ -243,6 +246,7 @@ The following details apply to the common e1000 driver used by all three targets
 - `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the global print sink (serial + VGA).
 - `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
 - `print_mac` and `print_ip` are tiny local helpers (12 and 9 lines) that format MAC/IP to the global print sink.
+- `tftp_download` uses the shared `common::tftp::udp_payload` / `common::tftp::build_udp_frame` helpers (same as UEFI and ARM64 bare-metal).
 
 ### `bios/src/mem.rs` — BIOS extended memory allocation
 
@@ -310,13 +314,13 @@ The following details apply to the common e1000 driver used by all three targets
 ### `common/src/tftp.rs` — TFTP client (RFC 1350) with block size negotiation (RFC 2348)
 
 - `TftpSink` trait: `write_block(&mut self, data: &[u8]) -> Result<(), ()>`, `finalize(&mut self, size: usize) -> Result<(), ()>` — streaming transfer interface for large file support.
-- `tftp_read<S: TftpSink>(base, src_mac, src_ip, dst_ip, filename, sink) -> Option<usize>` — downloads a file via TFTP, writes blocks to sink, returns total size on success.
-- `build_rrq(filename, buf) -> usize` — builds TFTP Read Request packet with blksize=1468 and tsize=0 options.
+- `build_rrq(filename, buf) -> usize` — builds TFTP Read Request packet. The RFC 2348 blksize/tsize options are currently commented out (disabled for compatibility with simple TFTP servers), so RRQ requests the default 512-byte blocks.
 - `parse_oack(buf, len) -> Option<(usize, usize)>` — parses Option Acknowledgment packet, returns (blksize, tsize).
 - `parse_data(buf, len) -> Option<(u16, &[u8])>` — parses DATA packet, returns (block_number, data_slice).
 - `build_ack(block, buf) -> usize` — builds ACK packet for given block number.
-- Block size negotiation: requests blksize=1468 (Ethernet MTU - IP/UDP headers), falls back to 512 if server rejects.
-- Transfer ends when received block < blksize (EOF marker).
+- `build_udp_frame(src_mac, src_ip, dst_ip, src_port, dst_port, payload, frame) -> Option<usize>` — wraps a TFTP payload in Ethernet + IPv4 + UDP headers (broadcast dst MAC, computed IP checksum, zero UDP checksum), returns total frame length. Shared by BIOS, ARM64 bare-metal, and both UEFI TFTP paths.
+- `udp_payload(frame, len) -> Option<&[u8]>` — extracts the UDP payload from a received Ethernet+IPv4+UDP frame, bounded by the **UDP length field**, not the raw frame length. QEMU's e1000 appends the 4-byte FCS to RX frames, so descriptor lengths are 4 bytes too long on the final packet; this strips the trailing FCS/padding. Used by all four targets' TFTP receive loops.
+- Block size negotiation: the server can shrink blocks via OACK; the transfer ends when a received DATA packet is smaller than the negotiated block size (EOF marker).
 
 ### `common/src/loader.rs` — File format detection (shared by all targets)
 
@@ -374,6 +378,7 @@ The following details apply to the common e1000 driver used by all three targets
 
 - Top-level targets: `all`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `run-*`, `clean`.
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
+- The `rustrapper.efi`, `rustrapper_arm64.efi`, and `rustrapper_arm64_bare.elf` targets list `$(shell find ... lua -name '*.rs')` in their deps so all three rebuild when the `lua/` crate changes (all three link the interpreter).
 - `i386-bios` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
 - `run-i386-bios` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
 - All `run-*` targets automatically create `tftp-root/` directory (copying the UEFI/BIOS binaries plus `lua/demo/test.lua` as `test.lua`) and use QEMU's built-in TFTP server (`-netdev user,tftp=tftp-root,bootfile=...`) for PXE boot testing. No root privileges or external TFTP server required.
@@ -391,7 +396,7 @@ All targets support PXE boot via DHCP options 66 (TFTP server) and 67 (bootfile 
    - Bootloader writes each block to memory via `TftpSink` trait and sends ACK.
    - Transfer ends when received block < blksize (EOF marker).
 4. **File Execution**: Bootloader detects file format via `common::loader::detect_format`:
-   - **UEFI**: PE/COFF files → `LoadImage` + `StartImage` via Boot Services.
+   - **UEFI**: PE/COFF files → `LoadImage` + `StartImage` via Boot Services. `.lua` files → execute in place with the built-in Lua interpreter (`lua::run`) via `loader::execute_pxe_file`.
    - **BIOS**: ELF32 files → parse headers, load segments, jump to entry. Multiboot files → validate magic, set up info struct, jump.
    - **ARM64 bare-metal**: ELF64 files → parse headers, load segments, jump to entry.
    - **ARM64 bare-metal**: `.lua` files → execute in place with the built-in Lua interpreter (`lua::run`).
@@ -504,7 +509,7 @@ QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server tha
 
 56. **ARM64 bare-metal stack must fit the Lua interpreter**: `LuaState` is ~38 KB and lives on the stack, and the DHCP/TFTP path already holds ~7 KB of packet buffers. With a 64 KB stack (`link.ld` `. += 0x10000`) the frame overflows into BSS below the stack — no vector table means the CPU silently fetches garbage from address `0x200` and looks like a hang with no error. Enlarged to 512 KB (`. += 0x80000`). Symptom check: an on-device `print("hi")` script produced no `hi` and no error, only silence after "Executing Lua script".
 
-57. **QEMU e1000 appends the 4-byte FCS to RX frames**: The e1000 RX descriptor length (what `try_receive` returns) is the frame length + 4 on QEMU's model. For the final TFTP DATA packet this makes the downloaded buffer 4 bytes too long and the FCS bytes land in the script/binary data (a `.lua` script fails with "unexpected character"; the reported size is 4 bytes too large). Always bound TFTP payload parsing by the UDP length field (`frame[udp_offset+4..udp_offset+6]`), not the raw Ethernet frame length.
+57. **QEMU e1000 appends the 4-byte FCS to RX frames**: The e1000 RX descriptor length (what `try_receive` returns) is the frame length + 4 on QEMU's model. For the final TFTP DATA packet this makes the downloaded buffer 4 bytes too long and the FCS bytes land in the script/binary data (a `.lua` script fails with "unexpected character"; the reported size is 4 bytes too large). All four TFTP receive loops (BIOS, ARM64 bare-metal, and both UEFI paths) bound the payload by the UDP length field via the shared `common::tftp::udp_payload` helper, not the raw Ethernet frame length.
 
 ## Makefile Targets
 
@@ -553,8 +558,8 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 189 tests across all crates
-cargo test --package common   # 94 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection, bootfile BOOTP-file fallback)
+cargo test --workspace        # All 192 tests across all crates
+cargo test --package common   # 97 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection, bootfile BOOTP-file fallback)
 cargo test --package lua      # 17 tests (lexer, parser, evaluator, demo script output)
 cargo test --package uefi     # 33 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
@@ -563,7 +568,7 @@ cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, ent
 
 | Crate | Tests | What's tested |
 |-------|-------|---------------|
-| `common` | 94 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask), TFTP RRQ/OACK/DATA/ACK packet build/parse, block size negotiation, file format detection (PE/COFF, ELF32, ELF64, Multiboot, Multiboot2, text, binary), DHCP bootfile from BOOTP `file` field with option 67 override |
+| `common` | 97 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask), TFTP RRQ/OACK/DATA/ACK packet build/parse, block size negotiation, UDP frame build (headers, IP checksum, payload placement), `udp_payload` extraction (strips trailing FCS, rejects non-IPv4/too-short), file format detection (PE/COFF, ELF32, ELF64, Multiboot, Multiboot2, text, binary), DHCP bootfile from BOOTP `file` field with option 67 override |
 | `lua` | 17 | Lexer tokens, parser AST structure (if/elseif/else, while, numeric for, function args, table fields), evaluator (arithmetic, comparisons, locals/globals, recursion, nested tables, concat, `print`), demo script exact output |
 | `uefi`/`efi` | 33 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
 | `arm64-bare`/`pci` | 21 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 12 subclass codes including unassigned, unknown fallback) |

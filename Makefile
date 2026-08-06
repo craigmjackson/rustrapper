@@ -60,14 +60,14 @@ i386-bios: $(BIN)/bios.bin $(BIN)/stage2_entry.bin
 # ── x86_64 UEFI ──────────────────────────────────────────────────
 # The common crate does not need a separate -I path; Cargo handles deps
 $(BIN)/rustrapper.efi: TARGET := x86_64-uefi
-$(BIN)/rustrapper.efi: $(shell find uefi common -name '*.rs') Cargo.toml | $(BIN) check-deps
+$(BIN)/rustrapper.efi: $(shell find uefi common lua -name '*.rs') Cargo.toml | $(BIN) check-deps
 	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-args=/NODEFAULTLIB" \
 		$(CARGO) build --target $(UEFI_TARGET) --package uefi --release
 	cp target/$(UEFI_TARGET)/release/uefi.efi $@
 
 # ── ARM64 UEFI ───────────────────────────────────────────────────
 $(BIN)/rustrapper_arm64.efi: TARGET := aarch64-uefi
-$(BIN)/rustrapper_arm64.efi: $(shell find uefi common -name '*.rs') Cargo.toml | $(BIN) check-deps
+$(BIN)/rustrapper_arm64.efi: $(shell find uefi common lua -name '*.rs') Cargo.toml | $(BIN) check-deps
 	CARGO_TARGET_DIR=target \
 		$(CARGO) build --target $(UEFI_ARM64_TARGET) --package uefi --release
 	cp target/$(UEFI_ARM64_TARGET)/release/uefi.efi $@

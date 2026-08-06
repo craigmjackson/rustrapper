@@ -163,6 +163,92 @@ pub fn build_ack(block: u16, buf: &mut [u8]) -> usize {
     4
 }
 
+/// Extract the UDP payload from a received Ethernet+IPv4+UDP frame.
+///
+/// The payload is bounded by the UDP length field rather than the raw frame
+/// length: QEMU's e1000 model appends the 4-byte Ethernet FCS to received
+/// frames, so the descriptor length reported by `try_receive` is 4 bytes too
+/// long on the final packet. Bounding by the UDP length strips any trailing
+/// FCS/padding so the payload is never over-read.
+pub fn udp_payload<'a>(frame: &'a [u8], len: usize) -> Option<&'a [u8]> {
+    if len < 42 {
+        return None;
+    }
+    if frame[12] != 0x08 || frame[13] != 0x00 {
+        return None;
+    }
+    let ip_hdr_len = ((frame[14] & 0x0F) as usize) * 4;
+    let udp_offset = 14 + ip_hdr_len;
+    if udp_offset + 8 > len {
+        return None;
+    }
+    let udp_len = u16::from_be_bytes([frame[udp_offset + 4], frame[udp_offset + 5]]) as usize;
+    let payload_off = udp_offset + 8;
+    let payload_end = (udp_offset + udp_len).min(len);
+    if payload_off > payload_end {
+        return None;
+    }
+    Some(&frame[payload_off..payload_end])
+}
+
+/// Build an Ethernet+IPv4+UDP frame carrying `payload`.
+///
+/// Destination MAC is broadcast (the caller resolves the real next-hop MAC
+/// via ARP when needed); the IP header checksum is computed, the UDP checksum
+/// is left zero (acceptable on local links for TFTP/DHCP traffic).
+pub fn build_udp_frame(
+    src_mac: &[u8; 6],
+    src_ip: &[u8; 4],
+    dst_ip: &[u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+    frame: &mut [u8; 1514],
+) -> Option<usize> {
+    // Ethernet header
+    frame[0..6].copy_from_slice(&[0xff; 6]); // broadcast
+    frame[6..12].copy_from_slice(src_mac);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // IPv4
+
+    // IPv4 header
+    let ip_hdr_len = 20;
+    let udp_hdr_len = 8;
+    let total_len = ip_hdr_len + udp_hdr_len + payload.len();
+
+    frame[14] = 0x45; // version 4, IHL 5
+    frame[15] = 0x00; // DSCP/ECN
+    frame[16..18].copy_from_slice(&(total_len as u16).to_be_bytes());
+    frame[18..20].copy_from_slice(&0u16.to_be_bytes()); // identification
+    frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // flags/fragment
+    frame[22] = 64; // TTL
+    frame[23] = 17; // UDP protocol
+    frame[24..26].copy_from_slice(&0u16.to_be_bytes()); // checksum placeholder
+    frame[26..30].copy_from_slice(src_ip);
+    frame[30..34].copy_from_slice(dst_ip);
+
+    // Compute IP header checksum
+    let mut sum = 0u32;
+    for i in (14..14 + ip_hdr_len).step_by(2) {
+        sum += u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    frame[24..26].copy_from_slice(&cksum.to_be_bytes());
+
+    // UDP header
+    frame[34..36].copy_from_slice(&src_port.to_be_bytes());
+    frame[36..38].copy_from_slice(&dst_port.to_be_bytes());
+    frame[38..40].copy_from_slice(&((udp_hdr_len + payload.len()) as u16).to_be_bytes());
+    frame[40..42].copy_from_slice(&0u16.to_be_bytes()); // UDP checksum (skip for now)
+
+    // Payload
+    frame[42..42 + payload.len()].copy_from_slice(payload);
+
+    Some(14 + total_len)
+}
+
 /// Parse a decimal number from a byte slice
 fn parse_decimal(buf: &[u8]) -> Option<usize> {
     let mut result = 0usize;
@@ -248,5 +334,83 @@ mod tests {
         assert_eq!(parse_decimal(b"1468"), Some(1468));
         assert_eq!(parse_decimal(b"abc"), None);
         assert_eq!(parse_decimal(b"12a3"), None);
+    }
+
+    /// Build a minimal Ethernet+IPv4+UDP frame with the given UDP payload.
+    fn build_test_frame(payload: &[u8]) -> [u8; 1514] {
+        let mut frame = [0u8; 1514];
+        build_udp_frame(
+            &[0x52, 0x54, 0x00, 0x12, 0x34, 0x5b],
+            &[10, 0, 2, 15],
+            &[10, 0, 2, 2],
+            68,
+            69,
+            payload,
+            &mut frame,
+        );
+        frame
+    }
+
+    #[test]
+    fn test_build_udp_frame() {
+        let payload = b"hello";
+        let frame = build_test_frame(payload);
+
+        // Ethernet: broadcast dst, src MAC, IPv4 ethertype
+        assert_eq!(&frame[0..6], &[0xff; 6]);
+        assert_eq!(&frame[6..12], &[0x52, 0x54, 0x00, 0x12, 0x34, 0x5b]);
+        assert_eq!(&frame[12..14], &[0x08, 0x00]);
+
+        // IPv4: version/IHL, total length, protocol UDP
+        assert_eq!(frame[14], 0x45);
+        assert_eq!(frame[23], 17);
+        assert_eq!(&frame[16..18], &((20 + 8 + payload.len()) as u16).to_be_bytes());
+
+        // IP header checksum must be valid (sum of 16-bit words folds to 0)
+        let mut sum = 0u32;
+        for i in (14..34).step_by(2) {
+            sum += u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xFFFF);
+
+        // UDP: src/dst ports, length, payload placement
+        assert_eq!(&frame[34..36], &68u16.to_be_bytes());
+        assert_eq!(&frame[36..38], &69u16.to_be_bytes());
+        assert_eq!(&frame[38..40], &((8 + payload.len()) as u16).to_be_bytes());
+        assert_eq!(&frame[42..42 + payload.len()], payload);
+    }
+
+    #[test]
+    fn test_udp_payload_strips_fcs() {
+        let payload = b"TFTPDATA";
+        let mut frame = build_test_frame(payload);
+        // Total wire length: eth(14) + ip(20) + udp(8) + payload
+        let wire_len = 42 + payload.len();
+        // QEMU e1000 appends the 4-byte FCS to the RX descriptor length
+        let fcs_len = wire_len + 4;
+        frame[wire_len] = 0xDE;
+        frame[wire_len + 1] = 0xAD;
+        frame[wire_len + 2] = 0xBE;
+        frame[wire_len + 3] = 0xEF;
+
+        // udp_payload must exclude the trailing FCS bytes
+        assert_eq!(udp_payload(&frame, fcs_len), Some(payload as &[u8]));
+        // Exact-length frame also parses
+        assert_eq!(udp_payload(&frame, wire_len), Some(payload as &[u8]));
+    }
+
+    #[test]
+    fn test_udp_payload_rejects_bad_frames() {
+        // Non-IPv4 ethertype
+        let mut arp_frame = build_test_frame(b"x");
+        arp_frame[12] = 0x08;
+        arp_frame[13] = 0x06;
+        assert_eq!(udp_payload(&arp_frame, 100), None);
+        // Too short to hold Ethernet+IP+UDP headers
+        let ipv4_frame = build_test_frame(b"x");
+        assert_eq!(udp_payload(&ipv4_frame, 30), None);
     }
 }

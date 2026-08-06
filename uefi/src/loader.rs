@@ -77,6 +77,33 @@ pub fn execute_pe_coff(
     Ok(())
 }
 
+/// Execute a downloaded PXE file: `.lua` scripts run through the built-in
+/// `lua::run` interpreter (shared with the ARM64 bare-metal target), all other
+/// formats fall through to [`execute_file`].
+pub fn execute_pxe_file(
+    system_table: &EFI_SYSTEM_TABLE,
+    image_handle: EFI_HANDLE,
+    buffer: *mut u8,
+    size: usize,
+    filename: &str,
+    puts: fn(&str),
+) {
+    if filename.ends_with(".lua") {
+        puts("Executing Lua script\n");
+        let data = unsafe { core::slice::from_raw_parts(buffer, size) };
+        match lua::run(data, crate::u16_putc) {
+            Ok(()) => puts("Lua script done\n"),
+            Err(e) => {
+                puts("Lua error: ");
+                puts(e);
+                puts("\n");
+            }
+        }
+    } else {
+        execute_file(system_table, image_handle, buffer, size, puts);
+    }
+}
+
 /// Execute a file based on its detected format
 pub fn execute_file(
     system_table: &EFI_SYSTEM_TABLE,

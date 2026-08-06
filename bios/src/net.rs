@@ -284,12 +284,14 @@ fn tftp_download(
         }
         let sport = server_port.unwrap_or(69);
         
-        // Strip Ethernet+IP+UDP headers to get TFTP payload
-        if copy_len < 42 { continue; } // Minimum Ethernet(14)+IP(20)+UDP(8)
-        let ip_hdr_len = ((recv_buf[14] & 0x0F) as usize) * 4;
-        let udp_offset = 14 + ip_hdr_len;
-        if udp_offset + 8 > copy_len { continue; }
-        let tftp_payload = &recv_buf[udp_offset + 8..copy_len];
+        // Strip Ethernet+IP+UDP headers to get TFTP payload.
+        // Bounded by the UDP length field (not the raw frame length) so the
+        // 4-byte FCS that QEMU's e1000 appends to RX frames is never parsed
+        // as script/binary data.
+        let tftp_payload = match udp_payload(&recv_buf, copy_len) {
+            Some(p) => p,
+            None => continue,
+        };
         let tftp_len = tftp_payload.len();
         
         // Detect TFTP ERROR packets (opcode 5)
@@ -347,58 +349,4 @@ fn tftp_download(
     
     sink.finalize(total_size).ok()?;
     Some(total_size)
-}
-
-/// Build a UDP frame for TFTP
-fn build_udp_frame(
-    src_mac: &[u8; 6],
-    src_ip: &[u8; 4],
-    dst_ip: &[u8; 4],
-    src_port: u16,
-    dst_port: u16,
-    payload: &[u8],
-    frame: &mut [u8; 1514],
-) -> Option<usize> {
-    // Ethernet header
-    frame[0..6].copy_from_slice(&[0xff; 6]); // broadcast for now
-    frame[6..12].copy_from_slice(src_mac);
-    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // IPv4
-    
-    // IPv4 header
-    let ip_hdr_len = 20;
-    let udp_hdr_len = 8;
-    let total_len = ip_hdr_len + udp_hdr_len + payload.len();
-    
-    frame[14] = 0x45; // version 4, IHL 5
-    frame[15] = 0x00; // DSCP/ECN
-    frame[16..18].copy_from_slice(&(total_len as u16).to_be_bytes());
-    frame[18..20].copy_from_slice(&0u16.to_be_bytes()); // identification
-    frame[20..22].copy_from_slice(&0x4000u16.to_be_bytes()); // flags/fragment
-    frame[22] = 64; // TTL
-    frame[23] = 17; // UDP protocol
-    frame[24..26].copy_from_slice(&0u16.to_be_bytes()); // checksum placeholder
-    frame[26..30].copy_from_slice(src_ip);
-    frame[30..34].copy_from_slice(dst_ip);
-    
-    // Compute IP header checksum
-    let mut sum = 0u32;
-    for i in (14..14 + ip_hdr_len).step_by(2) {
-        sum += u16::from_be_bytes([frame[i], frame[i + 1]]) as u32;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let cksum = !(sum as u16);
-    frame[24..26].copy_from_slice(&cksum.to_be_bytes());
-    
-    // UDP header
-    frame[34..36].copy_from_slice(&src_port.to_be_bytes());
-    frame[36..38].copy_from_slice(&dst_port.to_be_bytes());
-    frame[38..40].copy_from_slice(&((udp_hdr_len + payload.len()) as u16).to_be_bytes());
-    frame[40..42].copy_from_slice(&0u16.to_be_bytes()); // checksum (skip for now)
-    
-    // Payload
-    frame[42..42 + payload.len()].copy_from_slice(payload);
-    
-    Some(14 + total_len)
 }
