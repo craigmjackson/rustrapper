@@ -189,7 +189,20 @@ pub fn parse_response(buf: &[u8], len: usize, xid: u32, mac: &[u8; 6]) -> Option
     let mut subnet = [255u8; 4];
     let mut gateway = [0u8; 4];
     let mut dns = [0u8; 4];
+    // Bootfile name: default from the BOOTP `file` field (bytes 108-235), which
+    // is what QEMU's built-in TFTP server populates. DHCP option 67 overrides it.
     let mut bootfile = [0u8; 128];
+    {
+        let mut n = 0usize;
+        for b in buf[dhcp_off + 108..dhcp_off + 235].iter() {
+            if *b == 0 {
+                break;
+            }
+            bootfile[n] = *b;
+            n += 1;
+        }
+        bootfile[n] = 0;
+    }
     let mut dhcp_msg_type = 0u8;
     let mut off = dhcp_off + 240;
 
@@ -483,6 +496,37 @@ mod tests {
         let frame = build_response_frame_opts(0x12345678, &m, [10, 0, 2, 15], 2, true, true, true);
         let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
         assert_eq!(cfg.dns, [10, 0, 0, 2]);
+    }
+
+    #[test]
+    fn test_parse_response_bootfile_from_file_field() {
+        let m = mac();
+        // QEMU's built-in TFTP server puts the bootfile in the BOOTP `file`
+        // field (offset dhcp_off+108), not in DHCP option 67.
+        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, true, true);
+        frame[42 + 108..42 + 116].copy_from_slice(b"test.lua");
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(&cfg.bootfile[..8], b"test.lua");
+        assert_eq!(cfg.bootfile[8], 0);
+    }
+
+    #[test]
+    fn test_parse_response_option67_overrides_file_field() {
+        let m = mac();
+        let mut frame = build_response_frame(0x12345678, &m, [10, 0, 2, 15], 2, true, true);
+        frame[42 + 108..42 + 115].copy_from_slice(b"old.lua");
+        // Insert option 67 into the options area (before the 255 terminator).
+        let opt_off = 42 + 240;
+        let mut o = opt_off;
+        while frame[o] != 255 {
+            o += 2 + frame[o + 1] as usize;
+        }
+        frame[o] = 67;
+        frame[o + 1] = 7;
+        frame[o + 2..o + 9].copy_from_slice(b"new.lua");
+        frame[o + 9] = 255;
+        let cfg = parse_response(&frame, frame.len(), 0x12345678, &m).unwrap();
+        assert_eq!(&cfg.bootfile[..7], b"new.lua");
     }
 
     #[test]

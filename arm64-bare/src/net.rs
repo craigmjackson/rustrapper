@@ -171,13 +171,28 @@ fn pxe_boot(base: u64, mac: &[u8; 6], cfg: &DhcpConfig) {
             puts("    PXE: Downloaded ");
             print_dec(size as u64);
             puts(" bytes\n");
-            
-            // Execute the downloaded file
-            crate::loader::execute_file(
-                sink.buffer_addr() as *mut u8,
-                size,
-                puts,
-            );
+
+            if filename.ends_with(".lua") {
+                puts("    PXE: Executing Lua script\n");
+                let data = unsafe {
+                    core::slice::from_raw_parts(sink.buffer_addr() as *const u8, size)
+                };
+                match lua::run(data, putc) {
+                    Ok(()) => puts("    PXE: Lua script done\n"),
+                    Err(e) => {
+                        puts("    PXE: Lua error: ");
+                        puts(e);
+                        putc(b'\n');
+                    }
+                }
+            } else {
+                // Execute the downloaded file
+                crate::loader::execute_file(
+                    sink.buffer_addr() as *mut u8,
+                    size,
+                    puts,
+                );
+            }
         }
         None => {
             puts("    PXE: Download failed\n");
@@ -296,7 +311,11 @@ fn tftp_download(
         let ip_hdr_len = ((recv_buf[14] & 0x0F) as usize) * 4;
         let udp_offset = 14 + ip_hdr_len;
         if udp_offset + 8 > copy_len { continue; }
-        let tftp_payload = &recv_buf[udp_offset + 8..copy_len];
+        let udp_len = u16::from_be_bytes([recv_buf[udp_offset + 4], recv_buf[udp_offset + 5]]) as usize;
+        let payload_off = udp_offset + 8;
+        let payload_end = (udp_offset + udp_len).min(copy_len);
+        if payload_off > payload_end { continue; }
+        let tftp_payload = &recv_buf[payload_off..payload_end];
         let tftp_len = tftp_payload.len();
         
         if pkt_count <= 5 {

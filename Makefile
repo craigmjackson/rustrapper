@@ -98,7 +98,7 @@ i386-bios-rom: $(BIN)/rustrapper_bios.rom
 
 # ── ARM64 Bare-metal ──────────────────────────────────────────────
 $(BIN)/rustrapper_arm64_bare.elf: TARGET := aarch64-bare
-$(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common -name '*.rs') \
+$(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common lua -name '*.rs') \
                                 arm64-bare/link.ld Cargo.toml | $(BIN) check-deps
 	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-arg=-T$(CURDIR)/arm64-bare/link.ld -C link-arg=-N" \
 		$(CARGO) build --target $(BARE_ARM64_TARGET) --package arm64-bare --release
@@ -191,6 +191,7 @@ tftp-root: $(BIN)/rustrapper.efi $(BIN)/rust_payload.bin
 	cp $(BIN)/rustrapper.efi tftp-root/
 	cp $(BIN)/rust_payload.bin tftp-root/
 	echo "PXE boot successful!" > tftp-root/test.txt
+	cp lua/demo/test.lua tftp-root/test.lua
 
 pxe-start: openwrt tftp-root
 	@echo "Starting OpenWrt PXE server..."

@@ -75,7 +75,7 @@ config dhcp 'lan'
     option dhcpv6 'disabled'
     option ra 'disabled'
     list dhcp_option '66,10.0.0.1'
-    list dhcp_option '67,test.txt'
+    list dhcp_option '67,test.lua'
 EOF
     
     # Extract partition 2

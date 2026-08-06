@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "common",
+    "lua",
     "uefi",
     "arm64-bare",
     "romwrap",

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, and PCI expansion ROMs. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP).
+Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, and PCI expansion ROMs. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP). The ARM64 bare-metal PXE path can execute `.lua` scripts served over TFTP with a built-in no_std Lua interpreter (`lua/` crate).
 
 ## Agent Rules
 
@@ -12,7 +12,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ```
 .
-├── Cargo.toml              # Workspace root (5 member crates)
+├── Cargo.toml              # Workspace root (6 member crates)
 ├── Makefile                # Build orchestration (make all, make run-*)
 ├── AGENTS.md               # This file
 ├── bios/                   # Rust 32-bit BIOS stage2 (nightly only)
@@ -43,6 +43,14 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │       ├── dhcp.rs         # DHCP frame build/parse, IP checksum, DhcpConfig (incl. DNS server, PXE options)
 │       ├── tftp.rs         # TFTP client (RFC 1350) with block size negotiation (RFC 2348), streaming transfer
 │       └── loader.rs       # File format detection (PE/COFF, ELF32, ELF64, Multiboot, text, binary)
+├── lua/                    # Minimal no_std Lua interpreter (no heap, fixed static buffers)
+│   ├── Cargo.toml
+│   ├── demo/test.lua       # PXE demo script served via QEMU built-in TFTP
+│   └── src/
+│       ├── lib.rs          # LuaState (~38KB), sizing constants, run(), intern(), host tests
+│       ├── lex.rs          # Tokenizer (ints, strings, comments, symbols)
+│       ├── parse.rs        # Recursive-descent parser → AST (nodes + parallel next[] chains)
+│       └── eval.rs         # Tree-walking evaluator (functions, tables, control flow)
 ├── uefi/                   # Rust UEFI binary (x86_64 + ARM64)
 │   ├── Cargo.toml
 │   └── src/
@@ -68,6 +76,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 └── tftp-root/              # Files served via QEMU's built-in TFTP server (auto-generated)
     ├── rustrapper.efi      # UEFI bootloader
     ├── rust_payload.bin    # BIOS bootloader
+    ├── test.lua            # Lua PXE demo (copy of lua/demo/test.lua)
     └── test.txt            # Test file for PXE boot verification
 ```
 
@@ -140,6 +149,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - UART output via MMIO PL011 at `0x09000000` (QEMU virt machine).
 - PCI ECAM at `0x4010_0000_00` (QEMU virt v11+).
 - Load address: `0x4020_0000` (above DTB at `0x4000_0000`).
+- Stack is 512 KB above BSS (`link.ld` `. += 0x80000`). The Lua interpreter's ~38 KB `LuaState` frame plus the TFTP/DHCP packet buffers overflowed the original 64 KB stack, silently corrupting BSS (no vector table ⇒ no fault, just a hang).
 - Presents the `[1]/[2]` menu via `common::menu::show_menu`, reading from the PL011 UART (`uart::getc`), and dispatches to `scan::scan_devices` or `net::scan_network` based on the choice.
 
 ### `arm64-bare/src/net.rs` — ARM64 bare-metal e1000 NIC + DHCP
@@ -148,6 +158,8 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the PL011 UART.
 - `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
 - `print_mac` and `print_ip` are tiny local helpers that format MAC/IP to the global print sink.
+- `pxe_boot` TFTP-downloads the bootfile into an `Arm64MemorySink`; if the bootfile name ends with `.lua`, it executes the downloaded buffer in place with `lua::run(data, putc)`, otherwise it hands the buffer to `loader::execute_file`.
+- `tftp_download` bounds the TFTP payload slice by the UDP length field, NOT the raw Ethernet frame length — QEMU's e1000 model appends the 4-byte FCS to received frames, so the RX descriptor length returned by `try_receive` is 4 bytes too long on the final DATA packet. Without the UDP-length bound, the trailing FCS bytes get parsed as script/binary data (a `.lua` script fails with "unexpected character", and the downloaded size is 4 bytes too large).
 - Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
 
 ### `arm64-bare/src/mem.rs` — ARM64 bare-metal memory allocation
@@ -289,11 +301,11 @@ The following details apply to the common e1000 driver used by all three targets
 
 - `DhcpConfig` struct: `yiaddr`, `subnet`, `gateway`, `dns`, `next_server`, `bootfile` — the result of a successful DHCP exchange.
 - `next_server` is the TFTP server IP (from DHCP option 66, or fallback to siaddr field).
-- `bootfile` is the boot filename (from DHCP option 67, null-terminated).
+- `bootfile` is the boot filename (null-terminated), from DHCP option 67 or the classic BOOTP `file` field (`dhcp_off + 108`) when the server omits option 67. QEMU's built-in TFTP server (`-netdev user,tftp=...`) only fills the BOOTP `file` field, so this fallback is required for PXE boot against it.
 - `ip_checksum(buf) -> u16` — standard Internet checksum (one's complement of one's complement sum of 16-bit words).
 - `build_discover(xid, mac) -> [u8; 300]` — DHCPDISCOVER payload with magic cookie 0x63825363, option 53=1 (DISCOVER), option 55=param request list (1/3/6/66/67), option 255=end.
 - `build_eth_ip_udp(mac, dhcp_payload, dhcp_len, frame) -> usize` — wraps the DHCP payload in Ethernet + IPv4 + UDP headers (including IP checksum), returns total frame length.
-- `parse_response(buf, len, xid, mac) -> Option<DhcpConfig>` — validates EtherType, IP protocol, UDP offset, magic cookie, transaction ID, MAC match, then walks options for type 53 (OFFER or ACK), type 1 (subnet), type 3 (gateway), type 6 (DNS server), type 66 (TFTP server), type 67 (bootfile).
+- `parse_response(buf, len, xid, mac) -> Option<DhcpConfig>` — validates EtherType, IP protocol, UDP offset, magic cookie, transaction ID, MAC match, then walks options for type 53 (OFFER or ACK), type 1 (subnet), type 3 (gateway), type 6 (DNS server), type 66 (TFTP server), type 67 (bootfile). If no option 67 is present, the bootfile is taken from the BOOTP `file` field.
 
 ### `common/src/tftp.rs` — TFTP client (RFC 1350) with block size negotiation (RFC 2348)
 
@@ -337,6 +349,15 @@ The following details apply to the common e1000 driver used by all three targets
 - `dns_lookup_e1000(base, src_mac, src_ip, dst_mac, dst_ip, name) -> Option<[u8; 4]>` — sends DNS query via e1000, polls for response (20 retries × 100M iters each).
 - `dns_resolve_and_print(base, mac, cfg)` — full flow: print DNS server, determine next-hop (on-subnet DNS or gateway), ARP resolve, query google.com, print result. Uses `common::print` for output (shared by BIOS and ARM64 bare-metal). Guarded with `#[cfg(not(test))]` because it depends on `e1000::try_receive`.
 
+### `lua/` — no_std Lua interpreter (no heap)
+
+- The whole interpreter uses fixed static buffers inside `LuaState` (~38 KB: 1024 AST nodes × 16 B, 4 KB string arena, 128-slot value stack, 16 frames × 16 locals, 32 functions, 64 globals, 16 tables × 8 slots). `LuaState` is passed by `&mut` everywhere — no global mutable state, so host tests run in parallel.
+- `NO_NODE = u16::MAX` is the sentinel for "no node"/end-of-chain; node `0` is a real node. `parse_if_tail` returns `NO_NODE` (not `0`) for a missing `else` — an `IfStmt` with `els = 0` executes node 0 (`Var`) and fails with "internal error: statement expected".
+- Tables are per-table fixed slot arrays `TableRec { slots: [TableSlot; 8], len: u8 }`. A shared slot pool was abandoned because nested table literals interleaved pool slots, so one table's fields landed outside its search range ("attempt to index a non-table value").
+- Supported subset: ints, strings, booleans, `nil`, locals/globals, `+ - * / %`, comparisons, `and/or/not`, `..` concat, `if/elseif/else`, `while`, numeric `for`, named `function`/`return`, tables (array/`name =`/`[expr]` fields, `t.key`, `t[key]`), `print()`, `--` comments. No closures, floats, `repeat`, `break`, or multiple assignment.
+- `run(data, putc)` is the entry point: lex → parse → eval with a `MAX_STEPS` instruction cap. The `putc` callback does char output, so the same script runs under the host harness and on-device (PL011 UART via `uart::putc`).
+- `lua/demo/test.lua` is the PXE demo (fib, tables, for-loop, concat); its exact host output is asserted by the `demo_script` test.
+
 ### `romwrap/src/main.rs` — PCI expansion ROM wrapper
 
 - Wraps a binary into a PCI expansion ROM container usable by UEFI firmware (OVMF) or legacy BIOS (SeaBIOS).
@@ -355,7 +376,7 @@ The following details apply to the common e1000 driver used by all three targets
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - `i386-bios` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
 - `run-i386-bios` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
-- All `run-*` targets automatically create `tftp-root/` directory and use QEMU's built-in TFTP server (`-netdev user,tftp=tftp-root,bootfile=...`) for PXE boot testing. No root privileges or external TFTP server required.
+- All `run-*` targets automatically create `tftp-root/` directory (copying the UEFI/BIOS binaries plus `lua/demo/test.lua` as `test.lua`) and use QEMU's built-in TFTP server (`-netdev user,tftp=tftp-root,bootfile=...`) for PXE boot testing. No root privileges or external TFTP server required.
 
 ### PXE Boot Flow
 
@@ -373,6 +394,7 @@ All targets support PXE boot via DHCP options 66 (TFTP server) and 67 (bootfile 
    - **UEFI**: PE/COFF files → `LoadImage` + `StartImage` via Boot Services.
    - **BIOS**: ELF32 files → parse headers, load segments, jump to entry. Multiboot files → validate magic, set up info struct, jump.
    - **ARM64 bare-metal**: ELF64 files → parse headers, load segments, jump to entry.
+   - **ARM64 bare-metal**: `.lua` files → execute in place with the built-in Lua interpreter (`lua::run`).
    - **All targets**: Text files → display via `puts`. Binary files → print size only.
 
 ### QEMU Built-in TFTP Server
@@ -380,9 +402,9 @@ All targets support PXE boot via DHCP options 66 (TFTP server) and 67 (bootfile 
 QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server that requires no root privileges:
 
 - `tftp=<directory>` — serves files from the specified directory.
-- `bootfile=<filename>` — sets the bootfile name in DHCP responses (option 67).
+- `bootfile=<filename>` — sets the bootfile name in DHCP responses. Note: QEMU puts it in the classic BOOTP `file` field, not DHCP option 67 (see `common/src/dhcp.rs` fallback).
 - The TFTP server IP is automatically set to the QEMU gateway IP (typically 10.0.2.2) in DHCP option 66.
-- Files in `tftp-root/` are auto-generated by the Makefile and include bootloader binaries and a test file.
+- Files in `tftp-root/` are auto-generated by the Makefile and include bootloader binaries, `test.lua` (the Lua PXE demo), and a test file.
 - This approach is simpler than running a separate TFTP server (e.g., dnsmasq or OpenWrt VM) and works in unprivileged environments.
 
 ## Key Gotchas
@@ -478,6 +500,12 @@ QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server tha
 
 55. **ARM64 UEFI PXE boot limitations**: ARM64 UEFI only supports virtio-net-pci (no e1000), so we can't use direct MMIO for TFTP. The virtio SNP has reliability issues with receive operations and single-transmit limits. Full PXE boot (DHCP + ARP + DNS + TFTP) is not reliably supported on ARM64 UEFI. The current implementation supports DHCP with restart_snp, but ARP/DNS/TFTP may fail. For reliable PXE boot on ARM64, use the bare-metal target (`aarch64-bare`) with e1000.
 
+### ARM64 bare-metal Lua / TFTP
+
+56. **ARM64 bare-metal stack must fit the Lua interpreter**: `LuaState` is ~38 KB and lives on the stack, and the DHCP/TFTP path already holds ~7 KB of packet buffers. With a 64 KB stack (`link.ld` `. += 0x10000`) the frame overflows into BSS below the stack — no vector table means the CPU silently fetches garbage from address `0x200` and looks like a hang with no error. Enlarged to 512 KB (`. += 0x80000`). Symptom check: an on-device `print("hi")` script produced no `hi` and no error, only silence after "Executing Lua script".
+
+57. **QEMU e1000 appends the 4-byte FCS to RX frames**: The e1000 RX descriptor length (what `try_receive` returns) is the frame length + 4 on QEMU's model. For the final TFTP DATA packet this makes the downloaded buffer 4 bytes too long and the FCS bytes land in the script/binary data (a `.lua` script fails with "unexpected character"; the reported size is 4 bytes too large). Always bound TFTP payload parsing by the UDP length field (`frame[udp_offset+4..udp_offset+6]`), not the raw Ethernet frame length.
+
 ## Makefile Targets
 
 ```bash
@@ -525,8 +553,9 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 174 tests across all crates
-cargo test --package common   # 96 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection)
+cargo test --workspace        # All 189 tests across all crates
+cargo test --package common   # 94 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection, bootfile BOOTP-file fallback)
+cargo test --package lua      # 17 tests (lexer, parser, evaluator, demo script output)
 cargo test --package uefi     # 33 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
 cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
@@ -534,12 +563,13 @@ cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, ent
 
 | Crate | Tests | What's tested |
 |-------|-------|---------------|
-| `common` | 96 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask), TFTP RRQ/OACK/DATA/ACK packet build/parse, block size negotiation, file format detection (PE/COFF, ELF32, ELF64, Multiboot, Multiboot2, text, binary) |
-| `uefi`/`efi` | 24 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
+| `common` | 94 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask), TFTP RRQ/OACK/DATA/ACK packet build/parse, block size negotiation, file format detection (PE/COFF, ELF32, ELF64, Multiboot, Multiboot2, text, binary), DHCP bootfile from BOOTP `file` field with option 67 override |
+| `lua` | 17 | Lexer tokens, parser AST structure (if/elseif/else, while, numeric for, function args, table fields), evaluator (arithmetic, comparisons, locals/globals, recursion, nested tables, concat, `print`), demo script exact output |
+| `uefi`/`efi` | 33 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
 | `arm64-bare`/`pci` | 21 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 12 subclass codes including unassigned, unknown fallback) |
-| `romwrap` | 33 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`/`0x00`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, BIOS entry routine, block count consistency, PCIR length field matching, empty/boundary-aligned/overlapping payload sizes |
+| `romwrap` | 24 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`/`0x00`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, BIOS entry routine, block count consistency, PCIR length field matching, empty/boundary-aligned/overlapping payload sizes |
 
-**Test architecture**: `common` tests run directly on the host. `uefi` tests run on the host by guarding platform-specific code with `#[cfg(not(test))]` and using `#[cfg_attr(not(test), no_std)]` / `#[cfg_attr(not(test), no_main)]` so the standard test harness can drive them. `arm64-bare` tests similarly guard the ARM64 `global_asm!` entry point and the `extern "C" fn main` behind `#[cfg(not(test))]`, exposing only pure functions (`pci_off`, `storage_name`) for host testing.
+**Test architecture**: `common` tests run directly on the host. `lua` tests run on the host via `extern crate std` under `#[cfg(test)]` while target builds stay `#![no_std]`. `uefi` tests run on the host by guarding platform-specific code with `#[cfg(not(test))]` and using `#[cfg_attr(not(test), no_std)]` / `#[cfg_attr(not(test), no_main)]` so the standard test harness can drive them. `arm64-bare` tests similarly guard the ARM64 `global_asm!` entry point and the `extern "C" fn main` behind `#[cfg(not(test))]`, exposing only pure functions (`pci_off`, `storage_name`) for host testing.
 
 The `print` module separates formatting from I/O: `format_hex`/`format_dec` write to caller-provided byte buffers and return `&str`, while `print_hex`/`print_dec` call `puts` through the global `PUTC_FN` callback. Tests exercise the pure formatting functions directly, avoiding the `static mut` callback.
 
