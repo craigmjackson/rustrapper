@@ -140,12 +140,12 @@ fn print_ip(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, ip: &[u8; 4]) {
 // printing the DHCP result, so we keep the init/send/recv/dhcp logic in
 // common and only add the UEFI output adapter here.
 
-struct DirectMmioE1000 {
+pub(crate) struct DirectMmioE1000 {
     base: u64,
 }
 
 impl DirectMmioE1000 {
-    fn new(bar0: u64) -> Self {
+    pub(crate) fn new(bar0: u64) -> Self {
         Self { base: bar0 }
     }
 
@@ -237,14 +237,14 @@ fn find_e1000_bar0() -> Option<u64> {
 }
 
 /// TFTP download using direct e1000 MMIO (same path as BIOS)
-fn tftp_download_e1000(
+pub(crate) fn tftp_download_e1000(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
     e1000: &DirectMmioE1000,
     mac: &[u8; 6],
     src_ip: &[u8; 4],
     dst_ip: &[u8; 4],
     filename: &str,
-    sink: &mut crate::mem::UefiMemorySink,
+    sink: &mut impl common::tftp::TftpSink,
 ) -> Option<usize> {
     use common::tftp::*;
 
@@ -1344,6 +1344,7 @@ fn pxe_boot_snp(
                     w16(con_out, "  PXE: Downloaded ");
                     put_dec(con_out, size as u64);
                     w16(con_out, " bytes\r\n");
+                    crate::fetch::set_context(system_table, bar0, mac, cfg);
                     crate::loader::execute_pxe_file(
                         system_table,
                         image_handle,
@@ -1376,6 +1377,9 @@ fn pxe_boot_snp(
             put_dec(con_out, size as u64);
             w16(con_out, " bytes\r\n");
             
+            // No direct e1000 available on this path, so `fetch()` in Lua
+            // scripts cannot transfer further files (base=0).
+            crate::fetch::set_context(system_table, 0, mac, cfg);
             crate::loader::execute_pxe_file(
                 system_table,
                 image_handle,
@@ -1425,6 +1429,7 @@ fn pxe_boot_e1000(
             put_dec(con_out, size as u64);
             w16(con_out, " bytes\r\n");
             
+            crate::fetch::set_context(system_table, e1000.base, mac, cfg);
             crate::loader::execute_pxe_file(
                 system_table,
                 image_handle,

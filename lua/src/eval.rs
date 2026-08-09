@@ -240,6 +240,27 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<Value, &'static str> {
             emit(s, b'\n');
             Value::Nil
         }
+        Value::Native(1) => {
+            // fetch(filename) -> byte count, or nil if the download failed.
+            if argc != 1 {
+                return Err("fetch expects 1 argument");
+            }
+            match argbuf[0] {
+                Value::Str(r) => {
+                    let fetch = s.fetch;
+                    let name = core::str::from_utf8(s.str_bytes(r))
+                        .map_err(|_| "fetch filename must be ASCII")?;
+                    match fetch {
+                        Some(f) => match f(name) {
+                            Some(n) => Value::Num(n as i64),
+                            None => Value::Nil,
+                        },
+                        None => return Err("fetch not available"),
+                    }
+                }
+                _ => return Err("fetch expects a string filename"),
+            }
+        }
         Value::Func(idx) => {
             let fd = s.funcs[idx as usize];
             s.push_frame()?;

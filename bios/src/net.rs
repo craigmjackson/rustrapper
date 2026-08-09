@@ -169,12 +169,28 @@ fn pxe_boot(base: u64, mac: &[u8; 6], cfg: &DhcpConfig) {
             print_dec(size as u64);
             puts(" bytes\n");
             
-            // Execute the downloaded file
-            crate::loader::execute_file(
-                sink.buffer_addr() as *mut u8,
-                size,
-                puts,
-            );
+            if filename.ends_with(".lua") {
+                puts("    PXE: Executing Lua script\n");
+                crate::fetch::set_context(base, mac, cfg);
+                let data = unsafe {
+                    core::slice::from_raw_parts(sink.buffer_addr() as usize as *const u8, size)
+                };
+                match lua::run_with_fetch(data, putc, crate::fetch::fetch_file) {
+                    Ok(()) => puts("    PXE: Lua script done\n"),
+                    Err(e) => {
+                        puts("    PXE: Lua error: ");
+                        puts(e);
+                        putc(b'\n');
+                    }
+                }
+            } else {
+                // Execute the downloaded file
+                crate::loader::execute_file(
+                    sink.buffer_addr() as usize as *mut u8,
+                    size,
+                    puts,
+                );
+            }
         }
         None => {
             puts("    PXE: Download failed\n");
@@ -193,13 +209,13 @@ fn extract_src_port(frame: &[u8], len: usize) -> u16 {
 }
 
 /// TFTP download using e1000
-fn tftp_download(
+pub fn tftp_download(
     base: u64,
     mac: &[u8; 6],
     src_ip: &[u8; 4],
     dst_ip: &[u8; 4],
     filename: &str,
-    sink: &mut crate::mem::BiosExtendedMemorySink,
+    sink: &mut impl common::tftp::TftpSink,
 ) -> Option<usize> {
     use common::tftp::*;
     

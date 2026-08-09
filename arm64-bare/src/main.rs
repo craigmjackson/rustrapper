@@ -10,6 +10,8 @@ mod net;
 mod mem;
 #[cfg(not(test))]
 mod loader;
+#[cfg(not(test))]
+mod fetch;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;

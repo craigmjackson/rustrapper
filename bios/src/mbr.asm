@@ -38,7 +38,7 @@ start:
 
 .loaded:
     mov dl, [drive_num]
-    jmp 0x0100:0x0000
+    jmp 0x0800:0x0000
 
 ; Print null-terminated string at DS:SI via INT 10h
 puts:
@@ -63,11 +63,14 @@ drive_num: db 0
 msg_err: db 'Boot error', 0x0D, 0x0A, 0
 
 ; Disk Address Packet for extended read
+; Buffer at 0x8000: 0x8000 + 80*512 = 0x14000, well above the MBR at 0x7C00.
+; Loading at 0x1000 with >= 54 sectors would overwrite the running MBR code.
 dap:
     db 0x10        ; size
     db 0x00        ; reserved
-    dw 32          ; sectors to read (LBA 1-32 = bytes 0x200-0x40FF)
-    dw 0x1000      ; buffer offset
+    dw 80          ; sectors to read (LBA 1-80 = bytes 0x200-0xA1FF) — covers the
+                   ; entry stub + Rust payload (~36 KB, incl. the Lua interpreter)
+    dw 0x8000      ; buffer offset
     dw 0x0000      ; buffer segment
     dq 1           ; start LBA
 

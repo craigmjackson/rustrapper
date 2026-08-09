@@ -3,7 +3,7 @@
 # All code is Rust. The only non-Rust pieces are:
 #   - bios/src/mbr.asm          (512-byte MBR, loads sector 1+ and jumps to it)
 #   - bios/src/stage2_entry.nasm (enables A20, switches to PM, copies Rust payload
-#     from 0x1200 to 0x100000, zeros BSS, calls Rust _start)
+#     from 0x8200 to 0x100000, zeros BSS, calls Rust _start)
 
 CARGO    := cargo
 NASM     := nasm
@@ -31,8 +31,8 @@ $(BIN):
 	mkdir -p $(BIN)
 
 # ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
-# Loads 16 sectors (LBA 1-16, 8192 bytes) to 0x1000 and jumps there.
-# The 512-byte stub at 0x1000 (stage2_entry.nasm) then takes over.
+# Loads 80 sectors (LBA 1-80, 40960 bytes) to 0x8000 and jumps there.
+# The 512-byte stub at 0x8000 (stage2_entry.nasm) then takes over.
 $(BIN)/bios.bin: TARGET := i386-bios
 $(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN) check-deps
 	$(NASM) -f bin -o $@ $<
@@ -43,7 +43,7 @@ BIOS_RUST_TARGET := $(CURDIR)/targets/i386-unknown-none.json
 CARGO_NIGHTLY    := cargo +nightly
 
 $(BIN)/rust_payload.bin: TARGET := i386-bios
-$(BIN)/rust_payload.bin: $(shell find bios common -name '*.rs') \
+$(BIN)/rust_payload.bin: $(shell find bios common lua -name '*.rs') \
                          bios/link.ld Cargo.toml $(BIOS_RUST_TARGET) | $(BIN) check-deps
 	CARGO_TARGET_DIR=target RUSTFLAGS="-C link-arg=-T$(CURDIR)/bios/link.ld -C link-arg=-N" \
 		$(CARGO_NIGHTLY) build -Zjson-target-spec -Zbuild-std=core \
@@ -52,7 +52,7 @@ $(BIN)/rust_payload.bin: $(shell find bios common -name '*.rs') \
 
 # Combined stage2 = entry stub + Rust payload (assembled by NASM, which
 # incbins the payload so it can compute copy offsets at assembly time)
-$(BIN)/stage2_entry.bin: $(BIN)/rust_payload.bin | $(BIN)
+$(BIN)/stage2_entry.bin: $(BIN)/rust_payload.bin $(BIOS_SRC)/stage2_entry.nasm | $(BIN)
 	cd $(BIOS_SRC) && $(NASM) -f bin -o ../../$@ stage2_entry.nasm
 
 i386-bios: $(BIN)/bios.bin $(BIN)/stage2_entry.bin
@@ -120,7 +120,8 @@ $(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
 
 run-i386-bios: TARGET := run-i386-bios
 run-i386-bios: $(BIN)/bios.img pxe-start check-deps
-	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw \
+	qemu-system-x86_64 -boot order=c \
+		-drive file=$(BIN)/bios.img,format=raw \
 		-netdev socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:57 \
 		-nographic
@@ -153,7 +154,8 @@ run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root px
 
 run-i386-bios-rom: TARGET := run-i386-bios-rom
 run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom pxe-start check-deps
-	qemu-system-x86_64 -drive file=$(BIN)/bios.img,format=raw \
+	qemu-system-x86_64 -boot order=c \
+		-drive file=$(BIN)/bios.img,format=raw \
 		-netdev socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0,mac=52:54:00:12:34:5a \
 		-nographic

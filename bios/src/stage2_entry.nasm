@@ -1,11 +1,11 @@
 ; Stage 2 entry stub
-; Loaded by MBR at physical 0x1000 (16 sectors = 8192 bytes max).
+; Loaded by MBR at physical 0x8000 (80 sectors max).
 ; Enables A20, enters protected mode, copies the embedded Rust payload
 ; from the high portion of the loaded blob to 1 MB, and jumps there.
 ;
-; After extending the MBR's load count, the first 512 bytes of this file
-; are the entry stub itself.  Everything after the 512-byte mark is the
-; Rust payload, copied verbatim to 0x100000.
+; The first 512 bytes of this file are the entry stub itself.
+; Everything after the 512-byte mark is the Rust payload, copied
+; verbatim to 0x100000.
 
 %macro serial 1
     push dx
@@ -17,7 +17,7 @@
     pop dx
 %endmacro
 
-[org 0x1000]
+[org 0x8000]
 [bits 16]
 
 start:
@@ -26,10 +26,10 @@ start:
 
     mov [boot_drive], dl
 
-    ; Stack just below our loaded location
+    ; Stack just below our loaded location (0x8000), above the MBR
     xor ax, ax
     mov ss, ax
-    mov sp, 0x1000
+    mov sp, 0x7C00
 
     ; Set VGA text mode 80x25
     mov ax, 0x0003
@@ -69,8 +69,8 @@ pmode_start:
     ; Stack in low RAM (well below BIOS ROM at 0xF0000)
     mov esp, 0x00070000
 
-    ; Copy Rust payload from 0x1200 → 0x100000
-    mov esi, 0x1200
+    ; Copy Rust payload from 0x8200 → 0x100000
+    mov esi, 0x8200
     mov edi, 0x100000
     mov ecx, RUST_PAYLOAD_BYTES
     rep movsb
@@ -109,7 +109,7 @@ gdtr:
     dw gdt_end - gdt - 1
     dd gdt
 
-; Pad to 512 bytes so the Rust payload starts at a known offset (0x1200)
+; Pad to 512 bytes so the Rust payload starts at a known offset (0x8200)
 times 512 - ($ - $$) db 0
 
 ; ── Rust payload embedded here ────────────────────────────────────────

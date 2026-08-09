@@ -10,6 +10,10 @@
 //! - Named functions `function name(a, b) ... end` and `return`
 //! - Tables: array fields, `name =` fields, `[expr]` fields, `t.key`, `t[key]`
 //! - `print(...)` builtin, `--` line comments
+//! - `fetch("file")` builtin: downloads a file from the TFTP server (DHCP
+//!   `next_server`) into host memory and returns its byte count as a number,
+//!   or `nil` if the download fails. Requires a host callback, so scripts
+//!   using it must run through [`LuaState::run_with_fetch`] / [`run_with_fetch`].
 //!
 //! Not supported: closures/upvalues, floats, `local function`, anonymous
 //! function literals, string methods, `repeat`, `break`, multiple assignment.
@@ -75,7 +79,7 @@ pub enum Value {
     Str(StrRef),
     Table(u16),
     Func(u16),
-    /// Builtin function; only `print` exists today (`Native(0)`).
+    /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`.
     Native(u8),
 }
 
@@ -220,6 +224,10 @@ pub struct LuaState {
     pub steps: u64,
     /// Character output callback used by `print()`.
     pub putc: fn(u8),
+    /// Host callback for the `fetch()` builtin: downloads `name` from the
+    /// TFTP server and returns its byte count, or `None` on failure. Set by
+    /// [`LuaState::run_with_fetch`]; `None` means `fetch()` errors out.
+    pub fetch: Option<fn(&str) -> Option<usize>>,
 }
 
 fn noop(_c: u8) {}
@@ -266,6 +274,7 @@ impl LuaState {
             ntables: 0,
             steps: 0,
             putc: noop,
+            fetch: None,
         }
     }
 
@@ -277,11 +286,25 @@ impl LuaState {
         self.putc = putc;
         let print_name = self.intern(b"print")?;
         self.set_global(print_name, Value::Native(0));
+        let fetch_name = self.intern(b"fetch")?;
+        self.set_global(fetch_name, Value::Native(1));
         let first = {
             let mut p = parse::Parser::new(source, self);
             p.parse_script()?
         };
         eval::exec_script(self, first)
+    }
+
+    /// Run a script with a host `fetch()` callback installed, so the script
+    /// can call `fetch("file")` to download files from the TFTP server.
+    pub fn run_with_fetch(
+        &mut self,
+        source: &[u8],
+        putc: fn(u8),
+        fetch: fn(&str) -> Option<usize>,
+    ) -> Result<(), &'static str> {
+        self.fetch = Some(fetch);
+        self.run(source, putc)
     }
 
     fn reset(&mut self) {
@@ -489,6 +512,17 @@ pub fn run(source: &[u8], putc: fn(u8)) -> Result<(), &'static str> {
     state.run(source, putc)
 }
 
+/// Convenience wrapper: run a script with a fresh [`LuaState`] and a host
+/// `fetch()` callback installed.
+pub fn run_with_fetch(
+    source: &[u8],
+    putc: fn(u8),
+    fetch: fn(&str) -> Option<usize>,
+) -> Result<(), &'static str> {
+    let mut state = LuaState::new();
+    state.run_with_fetch(source, putc, fetch)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -660,13 +694,67 @@ mod tests {
         assert!(exec("while true do end").is_err());
     }
 
+    /// Mock `fetch()` host callback matching the two files the demo fetches.
+    fn fetch_demo(name: &str) -> Option<usize> {
+        match name {
+            "test.txt" => Some(21),
+            "rust_payload.bin" => Some(7400),
+            _ => None,
+        }
+    }
+
     #[test]
     fn demo_script() {
         let src = std::fs::read_to_string("demo/test.lua").unwrap();
+        OUT.with(|o| o.borrow_mut().clear());
+        super::run_with_fetch(src.as_bytes(), putc_test, fetch_demo).unwrap();
+        let out = OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap());
         assert_eq!(
-            exec(&src).unwrap(),
-            "Hello from Lua!\nfib(10) = 55\nrustrapper\tarm64\t2\nsum = 15\n"
+            out,
+            "Hello from Lua!\nfib(10) = 55\nrustrapper\tarm64\t2\nsum = 15\n\
+             fetch test.txt: 21 bytes\nfetch rust_payload.bin: 7400 bytes\n"
         );
+    }
+
+    /// Mock `fetch()` host callback: returns a size for known names, `None`
+    /// for anything else (simulating a TFTP download failure).
+    fn fetch_count(name: &str) -> Option<usize> {
+        match name {
+            "a.txt" => Some(5),
+            "b.txt" => Some(12),
+            _ => None,
+        }
+    }
+
+    fn exec_fetch(src: &str) -> Result<String, &'static str> {
+        OUT.with(|o| o.borrow_mut().clear());
+        super::run_with_fetch(src.as_bytes(), putc_test, fetch_count)?;
+        Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
+    }
+
+    #[test]
+    fn fetch_builtin() {
+        assert_eq!(exec_fetch("print(fetch(\"a.txt\"))").unwrap(), "5\n");
+        assert_eq!(exec_fetch("s = fetch(\"b.txt\")\nprint(s)").unwrap(), "12\n");
+        // Missing file (download failure) -> nil
+        assert_eq!(exec_fetch("print(fetch(\"missing.txt\"))").unwrap(), "nil\n");
+        // Filename can come from a variable
+        assert_eq!(exec_fetch("f = \"a.txt\"\nprint(fetch(f))").unwrap(), "5\n");
+        // Multiple downloads in one script
+        assert_eq!(
+            exec_fetch("a = fetch(\"a.txt\")\nb = fetch(\"b.txt\")\nprint(a + b)").unwrap(),
+            "17\n"
+        );
+    }
+
+    #[test]
+    fn fetch_errors() {
+        // Wrong arity or argument type
+        assert!(exec_fetch("fetch()").is_err());
+        assert!(exec_fetch("fetch(5)").is_err());
+        assert!(exec_fetch("fetch(true)").is_err());
+        // No host callback installed (plain `run`) -> clear error
+        assert!(exec("print(fetch(\"a.txt\"))").is_err());
     }
 }
 

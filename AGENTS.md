@@ -45,7 +45,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │       └── loader.rs       # File format detection (PE/COFF, ELF32, ELF64, Multiboot, text, binary)
 ├── lua/                    # Minimal no_std Lua interpreter (no heap, fixed static buffers)
 │   ├── Cargo.toml
-│   ├── demo/test.lua       # PXE demo script served via QEMU built-in TFTP
+│   ├── demo/test.lua       # PXE demo script (includes fetch() on 2 sample files)
 │   └── src/
 │       ├── lib.rs          # LuaState (~38KB), sizing constants, run(), intern(), host tests
 │       ├── lex.rs          # Tokenizer (ints, strings, comments, symbols)
@@ -59,7 +59,8 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │       ├── scan.rs         # UEFI device scan (LocateHandleBuffer + OpenProtocol)
 │       ├── net.rs          # SNP + 4-tier e1000 DHCP, PXE boot (uses common::e1000 + common::dhcp + common::tftp)
 │       ├── mem.rs          # UEFI memory allocation (AllocatePool/FreePool)
-│       └── loader.rs       # PE/COFF execution (LoadImage/StartImage)
+│       ├── loader.rs       # PE/COFF execution (LoadImage/StartImage)
+│       └── fetch.rs        # Lua `fetch()` host callback (AllocatePool slots for multi-file PXE)
 ├── arm64-bare/             # Rust ARM64 bare-metal binary (no firmware)
 │   ├── Cargo.toml
 │   └── src/
@@ -68,12 +69,13 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │       ├── net.rs          # PCI + e1000 scan, DHCP, PXE boot (thin wrapper over common)
 │       ├── mem.rs          # Fixed RAM region allocation
 │       ├── loader.rs       # ELF64 execution
+│       ├── fetch.rs        # Lua `fetch()` host callback (static BSS slots, no heap)
 │       └── uart.rs         # PL011 UART driver
 ├── romwrap/                # Rust CLI tool (PCI expansion ROM wrapper)
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
-└── tftp-root/              # Files served via QEMU's built-in TFTP server (auto-generated)
+└── tftp-root/              # Files served via the OpenWrt PXE server (auto-generated)
     ├── rustrapper.efi      # UEFI bootloader
     ├── rust_payload.bin    # BIOS bootloader
     ├── test.lua            # Lua PXE demo (copy of lua/demo/test.lua)
@@ -103,7 +105,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - Stores a global reference to the system table for console input.
 - Presents the `[1]/[2]` menu via `common::menu::show_menu`, using `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` for non-blocking input.
 - Dispatches to `scan_storage_devices` or `net::scan_network_devices` based on the choice.
-- `u16_putc(c: u8)` is `pub` — it is the `fn(u8)` output callback passed to `lua::run` from `loader::execute_pxe_file` (each byte is converted to u16 and emitted via `OutputString`).
+- `u16_putc(c: u8)` is `pub` — it is the `fn(u8)` output callback passed to `lua::run_with_fetch` from `loader::execute_pxe_file` (each byte is converted to u16 and emitted via `OutputString`).
 
 ### `uefi/src/scan.rs` — UEFI storage scan
 
@@ -142,8 +144,15 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - Uses `LoadImage` (offset 0xC8) with `SourceBuffer` parameter to load from memory.
 - Uses `StartImage` (offset 0xD0) to execute the loaded image.
 - `execute_file(system_table, image_handle, buffer, size, puts)` — detects format via `common::loader::detect_format`, dispatches to PE/COFF executor or displays text/binary info.
-- `execute_pxe_file(system_table, image_handle, buffer, size, filename, puts)` — the PXE entry point (all three `pxe_boot_*` call sites in `net.rs`). If the bootfile name ends with `.lua`, runs it in place with `lua::run(data, crate::u16_putc)`; everything else falls through to `execute_file`. Mirrors `arm64-bare/src/net.rs::pxe_boot`, reusing the same `lua` crate.
+- `execute_pxe_file(system_table, image_handle, buffer, size, filename, puts)` — the PXE entry point (all three `pxe_boot_*` call sites in `net.rs`). If the bootfile name ends with `.lua`, runs it in place with `lua::run_with_fetch(data, crate::u16_putc, crate::fetch::fetch_file)`; everything else falls through to `execute_file`. Mirrors `arm64-bare/src/net.rs::pxe_boot`, reusing the same `lua` crate.
 - PE/COFF files are executed; text files are displayed; binary files print size only.
+
+### `uefi/src/fetch.rs` — UEFI Lua `fetch()` host callback
+
+- `set_context(st, base, mac, cfg)` records the system table, e1000 BAR0 MMIO base, MAC, and `DhcpConfig` (src IP + `next_server`) and resets the slots. Called from `pxe_boot_snp`/`pxe_boot_e1000` right before `execute_pxe_file` runs a Lua script.
+- `fetch_file(name: &str) -> Option<usize>` is the `LuaState.fetch` callback: TFTP-downloads `name` from `cfg.next_server` via direct MMIO e1000 (`DirectMmioE1000` + `net::tftp_download_e1000`) into a lazily-allocated 16 MB `AllocatePool` region (`BOOT_SVC_ALLOCATE_POOL` offset 0x40, `EFI_LOADER_DATA`), split into 4 fixed windows (`MAX_FETCH_FILES`). Returns the byte count or `None` (invalid name, no context/base, `base == 0` meaning SNP-only path, or transfer failure).
+- `FetchSink` implements `TftpSink` writing into one slot window; slots record `{name, base, len, used}`.
+- Slots are global `static mut` (single-threaded bootloader, matches codebase pattern).
 
 ### `arm64-bare/src/main.rs` — ARM64 bare-metal entry
 
@@ -161,7 +170,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the PL011 UART.
 - `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
 - `print_mac` and `print_ip` are tiny local helpers that format MAC/IP to the global print sink.
-- `pxe_boot` TFTP-downloads the bootfile into an `Arm64MemorySink`; if the bootfile name ends with `.lua`, it executes the downloaded buffer in place with `lua::run(data, putc)`, otherwise it hands the buffer to `loader::execute_file`.
+- `pxe_boot` TFTP-downloads the bootfile into an `Arm64MemorySink`; if the bootfile name ends with `.lua`, it calls `crate::fetch::set_context(base, mac, cfg)` and executes the downloaded buffer in place with `lua::run_with_fetch(data, putc, crate::fetch::fetch_file)`, otherwise it hands the buffer to `loader::execute_file`.
 - `tftp_download` bounds the TFTP payload slice by the UDP length field via `common::tftp::udp_payload`, NOT the raw Ethernet frame length — QEMU's e1000 model appends the 4-byte FCS to received frames, so the RX descriptor length returned by `try_receive` is 4 bytes too long on the final DATA packet. Without the UDP-length bound, the trailing FCS bytes get parsed as script/binary data (a `.lua` script fails with "unexpected character", and the downloaded size is 4 bytes too large).
 - Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
 
@@ -170,6 +179,13 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `Arm64MemorySink` implements `TftpSink` — writes TFTP blocks to physical memory at fixed address.
 - Uses fixed RAM region at `0x50000000` (1.25GB on QEMU virt machine).
 - Tracks current offset and capacity for streaming TFTP transfers.
+
+### `arm64-bare/src/fetch.rs` — ARM64 bare-metal Lua `fetch()` host callback
+
+- Mirrors `uefi/src/fetch.rs` but with no heap: fetched files land in a 16 MB static BSS buffer (`FETCH_BUFFER`) split into 4 fixed windows (`MAX_FETCH_FILES`).
+- `set_context(base, mac, cfg)` records the e1000 BAR0 MMIO base, MAC, and `DhcpConfig` (src IP + `next_server`) and resets the slots. Called from `pxe_boot` right before `lua::run_with_fetch`.
+- `fetch_file(name: &str) -> Option<usize>` is the `LuaState.fetch` callback: TFTP-downloads `name` from `cfg.next_server` via `net::tftp_download` into a free slot, returns the byte count or `None` (invalid name, no context/base, or transfer failure).
+- `FetchSink` implements `TftpSink` writing into one slot window; slots record `{name, base, len, used}`.
 
 ### `arm64-bare/src/loader.rs` — ARM64 bare-metal executable loader
 
@@ -203,22 +219,24 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `bios/src/mbr.asm` — 16-bit MBR stage-1
 
-- 512-byte MBR that loads 32 sectors (LBA 1-32, 16384 bytes) to physical `0x1000` and jumps to `0x0100:0x0000`.
-- The DAP (Disk Address Packet) at line 69 sets the sector count to 16. Increase this if the entry stub + payload grows past 16 sectors.
+- 512-byte MBR that loads 80 sectors (LBA 1-80, 40960 bytes) to physical `0x8000` and jumps to `0x0800:0x0000`.
+- The DAP (Disk Address Packet) sets the sector count to 80. Increase this if the entry stub + payload grows past 80 sectors.
+- **Load buffer must be above the MBR code at `0x7C00`**: any read with count ≥ 54 sectors (0x1000 + 54*512 > 0x7C00) overwrites the running MBR with disk data, so after `int 0x13` returns the CPU executes corrupted instructions (silent hang). Keep the buffer at `0x8000` (80 sectors → `0x14000`, no overlap). Do NOT move it back to `0x1000` unless the count stays < 54.
 - "MZ" at offset 0 executes as `dec bp; pop dx`, which overwrites DL (the boot-drive value). Always set DL explicitly before `int 0x13`.
 
 ### `bios/src/stage2_entry.nasm` — BIOS entry stub for Rust stage2
 
-- Loaded by MBR at physical `0x1000` (part of the 16-sector load). First 512 bytes are the stub itself; the Rust payload (`incbin`'d) follows at offset 512.
+- Loaded by MBR at physical `0x8000` (part of the 80-sector load). First 512 bytes are the stub itself; the Rust payload (`incbin`'d) follows at offset 512.
+- `[org 0x8000]` matches the MBR load address, so all symbol references (GDT, `gdtr`, `boot_drive`) are correctly relocated. Stack is set to `0x7C00` (below the stub, above the MBR area).
 - Enables A20 gate (fast method via port `0x92`).
 - Loads a minimal GDT (32-bit code/data segments, flat at 0-4G).
 - Enters protected mode via `mov cr0, eax; jmp 0x08:pmode_start`.
-- Copies Rust payload from `0x1200` → `0x100000` using `rep movsb`.
+- Copies Rust payload from `0x8200` (stub + 512) → `0x100000` using `rep movsb`.
 - Zeros 0x2000 bytes of BSS immediately after the payload with `rep stosb`.
 - **Stack must NOT be in BIOS ROM area** (`0xF0000`–`0xFFFFF`). The BIOS ROM is read-only; pushes silently drop, corrupting return addresses, causing triple faults. Stack is at `0x00070000` (low RAM, well below BIOS area).
 - **`cli` before calling Rust**: no IDT is set up in protected mode. A hardware timer interrupt with no IDT causes a triple fault. `cli` disables interrupts for the duration of the Rust code.
 - Pushes `boot_drive` on the stack, calls `_start(0x100000)` via `call eax`.
-- Total size = 512 B stub + Rust payload (currently ~7.4 KB = ~15 sectors total, under 16-sector limit).
+- Total size = 512 B stub + Rust payload (currently ~35.4 KB = ~71 sectors total, under 80-sector load).
 
 ### `bios/src/main.rs` — Rust BIOS stage2 entry
 
@@ -360,7 +378,8 @@ The following details apply to the common e1000 driver used by all three targets
 - Tables are per-table fixed slot arrays `TableRec { slots: [TableSlot; 8], len: u8 }`. A shared slot pool was abandoned because nested table literals interleaved pool slots, so one table's fields landed outside its search range ("attempt to index a non-table value").
 - Supported subset: ints, strings, booleans, `nil`, locals/globals, `+ - * / %`, comparisons, `and/or/not`, `..` concat, `if/elseif/else`, `while`, numeric `for`, named `function`/`return`, tables (array/`name =`/`[expr]` fields, `t.key`, `t[key]`), `print()`, `--` comments. No closures, floats, `repeat`, `break`, or multiple assignment.
 - `run(data, putc)` is the entry point: lex → parse → eval with a `MAX_STEPS` instruction cap. The `putc` callback does char output, so the same script runs under the host harness and on-device (PL011 UART via `uart::putc`).
-- `lua/demo/test.lua` is the PXE demo (fib, tables, for-loop, concat); its exact host output is asserted by the `demo_script` test.
+- `run_with_fetch(data, putc, fetch)` / `LuaState::run_with_fetch` register a host `fetch` callback before running. The host sets `LuaState.fetch: Option<fn(&str) -> Option<usize>>` (default `None`); the `fetch("file")` builtin calls it with the filename and returns the downloaded byte count as a Lua number, or `nil` on failure. `None` callback → runtime error `"fetch not available"`. Value dispatch: `Value::Native(0)` = `print`, `Value::Native(1)` = `fetch` (both registered as globals in `LuaState::run`).
+- `lua/demo/test.lua` is the PXE demo (fib, tables, for-loop, concat) and also calls `fetch("test.txt")` / `fetch("rust_payload.bin")`, printing each file's byte count or `FAILED`. Its exact host output is asserted by the `demo_script` test with a mock fetch callback.
 
 ### `romwrap/src/main.rs` — PCI expansion ROM wrapper
 
@@ -380,8 +399,8 @@ The following details apply to the common e1000 driver used by all three targets
 - Uses `CARGO_TARGET_DIR=target` and per-target `RUSTFLAGS` for UEFI (needs `/NODEFAULTLIB` on x86_64).
 - The `rustrapper.efi`, `rustrapper_arm64.efi`, and `rustrapper_arm64_bare.elf` targets list `$(shell find ... lua -name '*.rs')` in their deps so all three rebuild when the `lua/` crate changes (all three link the interpreter).
 - `i386-bios` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
-- `run-i386-bios` uses `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
-- All `run-*` targets automatically create `tftp-root/` directory (copying the UEFI/BIOS binaries plus `lua/demo/test.lua` as `test.lua`) and use QEMU's built-in TFTP server (`-netdev user,tftp=tftp-root,bootfile=...`) for PXE boot testing. No root privileges or external TFTP server required.
+- `run-i386-bios` and `run-i386-bios-rom` use `-boot order=c` so SeaBIOS boots the hard disk first (skipping the e1000's iPXE option-ROM network-boot attempt, which otherwise stalls ~90s fighting the running PXE server before falling through to disk). They also use `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
+- All `run-*` targets automatically create `tftp-root/` (copying the UEFI/BIOS binaries and `lua/demo/test.lua` as `test.lua`), start the OpenWrt PXE VM (`pxe-start`, DHCP/TFTP on 10.0.0.1 serving `/tftpboot`), and boot QEMU with `-netdev socket` multicast networking. No root privileges or external TFTP server required.
 
 ### PXE Boot Flow
 
@@ -396,11 +415,12 @@ All targets support PXE boot via DHCP options 66 (TFTP server) and 67 (bootfile 
    - Bootloader writes each block to memory via `TftpSink` trait and sends ACK.
    - Transfer ends when received block < blksize (EOF marker).
 4. **File Execution**: Bootloader detects file format via `common::loader::detect_format`:
-   - **UEFI**: PE/COFF files → `LoadImage` + `StartImage` via Boot Services. `.lua` files → execute in place with the built-in Lua interpreter (`lua::run`) via `loader::execute_pxe_file`.
+   - **UEFI**: PE/COFF files → `LoadImage` + `StartImage` via Boot Services. `.lua` files → execute in place with the built-in Lua interpreter (`lua::run_with_fetch` with the host `fetch_file` callback) via `loader::execute_pxe_file`.
    - **BIOS**: ELF32 files → parse headers, load segments, jump to entry. Multiboot files → validate magic, set up info struct, jump.
    - **ARM64 bare-metal**: ELF64 files → parse headers, load segments, jump to entry.
-   - **ARM64 bare-metal**: `.lua` files → execute in place with the built-in Lua interpreter (`lua::run`).
+   - **ARM64 bare-metal**: `.lua` files → execute in place with the built-in Lua interpreter (`lua::run_with_fetch` with the host `fetch_file` callback).
    - **All targets**: Text files → display via `puts`. Binary files → print size only.
+5. **`fetch()` builtin**: While a PXE `.lua` script runs, the host registers a TFTP download callback (`fetch_file`). `fetch("file")` downloads `file` from the DHCP `next_server` and returns its byte count (or `nil` on failure), so scripts can pull multiple files (e.g. a kernel + initrd). Downloaded files are kept in host memory: `uefi/src/fetch.rs` uses a lazily-allocated 16 MB `AllocatePool` region split into 4 slots (`MAX_FETCH_FILES`); `arm64-bare/src/fetch.rs` uses a 16 MB static BSS buffer (no heap). Both are reset per script run by `set_context`, called right before `lua::run_with_fetch` in `pxe_boot_*` / `pxe_boot`.
 
 ### QEMU Built-in TFTP Server
 
@@ -432,7 +452,7 @@ QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server tha
 13. **`cli` before Rust code in protected mode**: No IDT is set up after the protected mode switch. A hardware timer interrupt with no IDT causes a triple fault. Always `cli` before calling Rust code from the entry stub.
 14. **Inline `asm!` for serial I/O**: Use separate `asm!` blocks for the LSR poll (`in al, dx`) and data output (`out dx, al`). The poll block must NOT use `options(pure)` (I/O port reads are NOT idempotent — `pure` causes the compiler to optimize the poll loop into `jmp $`). Pass the output byte via `in("al") c` — do NOT let the compiler choose the register, as `in al, dx` clobbers AL.
 15. **BSS_ZERO_SIZE must cover actual BSS**: The entry stub zeros `BSS_ZERO_SIZE` bytes after the payload. If BSS grows (e1000 descriptor rings + packet buffers ~4.3 KB), increase `BSS_ZERO_SIZE` from `0x1000` to `0x2000`. Check with `readelf -S target/i386-unknown-none/release/bios | grep .bss`.
-16. **MBR sector count must match payload**: The MBR loads 32 sectors (16384 bytes). The entry stub + Rust payload is ~10.8 KB = 22 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further.
+16. **MBR sector count + buffer must match payload**: The MBR loads 80 sectors (40960 bytes) to buffer `0x8000`. The entry stub + Rust payload is ~35.4 KB = ~71 sectors. Increase the `dap` sector count in `mbr.asm` if the payload grows further, and remember the buffer at `0x8000` + count*512 must stay above the MBR at `0x7C00` (any count ≥ 54 overwrites the running MBR → silent hang). The `stage2_entry.bin` build depends on `stage2_entry.nasm` (added to the Makefile after it was missed once, causing a stale stub to be assembled into the image).
 17. **PCI Bus Master must be enabled for e1000 DMA**: SeaBIOS enables Memory Space (bit 1) but may NOT enable Bus Master (bit 2) in the PCI Command register. Without Bus Master, the e1000 can read descriptors (MMIO works) but TX descriptor write-back (DMA) silently fails — TDH advances but the status DD bit is never set. `pci_enable_bars` must always set command bits 0-2 (I/O + Memory + Bus Master), even if some are already set. Do NOT re-assign BARs if firmware already assigned them (check if BAR0 is non-zero before sizing).
 
 18. **e1000 TX descriptor index must track TDT**: The `send` function uses the TX descriptor at the current TDT index (not always descriptor 0). After each send, TDT advances by 1, so the next send must use the next descriptor. All TX descriptors' `addr` fields are set to `TX_BUF` during init. Always using descriptor 0 while incrementing TDT causes the second send to fail silently — hardware processes the wrong descriptor (the one at TDH, not 0) while software polls descriptor 0's DD bit forever.
