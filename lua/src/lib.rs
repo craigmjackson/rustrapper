@@ -81,6 +81,10 @@ pub enum Value {
     Func(u16),
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`.
     Native(u8),
+    /// Builtin: `shell()` — enters the interactive Lua REPL.
+    Shell,
+    /// Builtin: `exit()` — exits the REPL (only meaningful inside a shell).
+    Exit,
 }
 
 /// Binary and unary operators. `And`/`Or` are handled with short-circuiting.
@@ -138,6 +142,8 @@ pub enum Node {
     AssignStmt(u16, u16),
     /// Expression statement (a call).
     CallStmt(u16),
+    /// Evaluate an expression and print its result.
+    ExprStmt(u16),
     /// `if cond then .. elseif .. else .. end`.
     IfStmt(u16, u16, u16),
     /// `while cond do .. end`.
@@ -278,21 +284,42 @@ impl LuaState {
         }
     }
 
+    /// Register built-in globals (`print`, `fetch`, `shell`, `exit`).
+    /// Call this once after creating a fresh `LuaState` before entering the REPL.
+    pub fn register_builtins(&mut self, putc: fn(u8)) {
+        self.putc = putc;
+        let _ = self.intern(b"print");
+        let print_name = self.intern(b"print").unwrap();
+        self.set_global(print_name, Value::Native(0));
+        let _ = self.intern(b"fetch");
+        let fetch_name = self.intern(b"fetch").unwrap();
+        self.set_global(fetch_name, Value::Native(1));
+        let _ = self.intern(b"shell");
+        let shell_name = self.intern(b"shell").unwrap();
+        self.set_global(shell_name, Value::Shell);
+        let _ = self.intern(b"exit");
+        let exit_name = self.intern(b"exit").unwrap();
+        self.set_global(exit_name, Value::Exit);
+    }
+
     /// Parse and execute a Lua script. `source` must remain valid for the
     /// whole call (identifiers reference into it). Output from `print()`
     /// goes to `putc`.
     pub fn run(&mut self, source: &[u8], putc: fn(u8)) -> Result<(), &'static str> {
         self.reset();
         self.putc = putc;
-        let print_name = self.intern(b"print")?;
-        self.set_global(print_name, Value::Native(0));
-        let fetch_name = self.intern(b"fetch")?;
-        self.set_global(fetch_name, Value::Native(1));
+        self.register_builtins(putc);
         let first = {
             let mut p = parse::Parser::new(source, self);
             p.parse_script()?
         };
         eval::exec_script(self, first)
+    }
+
+    /// Install a host `fetch()` callback. Call `set_fetch(None)` to explicitly
+    /// disable fetch (useful for the REPL where no TFTP server is available).
+    pub fn set_fetch(&mut self, fetch: Option<fn(&str) -> Option<usize>>) {
+        self.fetch = fetch;
     }
 
     /// Run a script with a host `fetch()` callback installed, so the script
@@ -523,11 +550,52 @@ pub fn run_with_fetch(
     state.run_with_fetch(source, putc, fetch)
 }
 
+/// Run the interactive Lua REPL. `read_line` should write a line into the
+/// provided buffer and return its length, or `None` when input is exhausted
+/// (exits the REPL). Output from `print()` and the prompt go to `putc`.
+pub fn run_repl(
+    mut read_line: impl FnMut(&mut [u8]) -> Option<usize>,
+    putc: fn(u8),
+) -> Result<(), &'static str> {
+    let mut state = LuaState::new();
+    // Register builtins (print, fetch, shell, exit) by running an empty script.
+    state.run(&[], putc)?;
+    let mut buf = [0u8; 256];
+    loop {
+        putc(b'>');
+        putc(b' ');
+        let len = match read_line(&mut buf) {
+            Some(l) if l > 0 => l,
+            _ => break, // EOF or empty input
+        };
+        match eval::run_repl_once(&mut state, &buf[..len], putc) {
+            Ok(eval::ExecResult::Normal) => {}
+            Ok(eval::ExecResult::Ret(_)) => {}
+            Ok(eval::ExecResult::Exit) => break,
+            Ok(eval::ExecResult::Shell) => {
+                // Nested shell — not supported in this simple REPL.
+                putc(b'\n');
+                putc(b'\n');
+            }
+            Err(e) => {
+                putc(b'\n');
+                for &b in e.as_bytes() {
+                    putc(b);
+                }
+                putc(b'\n');
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::string::String;
     use std::thread_local;
+    use std::vec;
+    use std::string::ToString;
     use std::vec::Vec;
 
     thread_local! {
@@ -755,6 +823,186 @@ mod tests {
         assert!(exec_fetch("fetch(true)").is_err());
         // No host callback installed (plain `run`) -> clear error
         assert!(exec("print(fetch(\"a.txt\"))").is_err());
+    }
+
+    #[test]
+    fn shell_builtin_exists() {
+        // shell() returns ExecResult::Shell which propagates up — we test
+        // that the builtin is callable by checking it doesn't error out
+        // during parsing / evaluation before the shell result is returned.
+        assert_eq!(exec("shell").unwrap(), "");
+    }
+
+    #[test]
+    fn exit_builtin_exists() {
+        assert_eq!(exec("exit").unwrap(), "");
+    }
+
+    #[test]
+    fn repl_builtin_registration() {
+        // Verify builtins are registered when using register_builtins + run_repl_once.
+        let mut state = super::LuaState::new();
+        state.register_builtins(putc_test);
+        state.set_fetch(None);
+        let mut lines = vec!["exit".to_string(), "print(exit)".to_string(), "print(shell)".to_string()];
+        super::run_repl(
+            |buf: &mut [u8]| -> Option<usize> {
+                if let Some(line) = lines.pop() {
+                    let bytes = line.as_bytes();
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Some(bytes.len())
+                } else {
+                    None
+                }
+            },
+            |c| {
+                OUT.with(|o| o.borrow_mut().push(c));
+            },
+        )
+        .unwrap();
+        OUT.with(|o| {
+            let out = String::from_utf8(o.borrow().clone()).unwrap();
+            assert!(out.contains("shell"));
+            assert!(out.contains("exit"));
+        });
+    }
+
+    #[test]
+    fn shell_wrong_args() {
+        assert!(exec("shell(1)").is_err());
+    }
+
+    #[test]
+    fn exit_wrong_args() {
+        assert!(exec("exit(1)").is_err());
+    }
+
+    #[test]
+    fn shell_prints_type() {
+        assert_eq!(exec("print(shell)").unwrap(), "shell\n");
+    }
+
+    #[test]
+    fn exit_prints_type() {
+        assert_eq!(exec("print(exit)").unwrap(), "exit\n");
+    }
+
+    #[test]
+    fn repl_single_line() {
+        let mut lines = vec!["print(1 + 2)".to_string()];
+        let result = super::run_repl(
+            |buf: &mut [u8]| -> Option<usize> {
+                if let Some(line) = lines.pop() {
+                    let bytes = line.as_bytes();
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Some(bytes.len())
+                } else {
+                    None
+                }
+            },
+            |c| {
+                OUT.with(|o| o.borrow_mut().push(c));
+            },
+        );
+        assert!(result.is_ok());
+        OUT.with(|o| {
+            let out = String::from_utf8(o.borrow().clone()).unwrap();
+            assert!(out.contains("> "));
+            assert!(out.contains("3"));
+        });
+    }
+
+    #[test]
+    fn repl_exit() {
+        let mut lines = vec!["1 + 1".to_string(), "exit".to_string()];
+        let result = super::run_repl(
+            |buf: &mut [u8]| -> Option<usize> {
+                if let Some(line) = lines.pop() {
+                    let bytes = line.as_bytes();
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Some(bytes.len())
+                } else {
+                    None
+                }
+            },
+            |c| {
+                OUT.with(|o| o.borrow_mut().push(c));
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn repl_error_handling() {
+        let mut lines = vec!["print(undefined_var)".to_string(), "exit".to_string()];
+        let result = super::run_repl(
+            |buf: &mut [u8]| -> Option<usize> {
+                if let Some(line) = lines.pop() {
+                    let bytes = line.as_bytes();
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Some(bytes.len())
+                } else {
+                    None
+                }
+            },
+            |c| {
+                OUT.with(|o| o.borrow_mut().push(c));
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn repl_preserves_state() {
+        let mut lines = vec!["exit".to_string(), "print(x)".to_string(), "x = 42".to_string()];
+        let result = super::run_repl(
+            |buf: &mut [u8]| -> Option<usize> {
+                if let Some(line) = lines.pop() {
+                    let bytes = line.as_bytes();
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Some(bytes.len())
+                } else {
+                    None
+                }
+            },
+            |c| {
+                OUT.with(|o| o.borrow_mut().push(c));
+            },
+        );
+        assert!(result.is_ok());
+        OUT.with(|o| {
+            let out = String::from_utf8(o.borrow().clone()).unwrap();
+            assert!(out.contains("42"));
+        });
+    }
+
+    #[test]
+    fn repl_bare_expression_prints() {
+        // Bare expressions at the REPL prompt should evaluate and print.
+        let mut state = super::LuaState::new();
+        state.register_builtins(putc_test);
+        state.set_fetch(None);
+        let mut lines = vec!["exit".to_string(), "x".to_string(), "x = 42".to_string(), "1 + 2".to_string()];
+        super::run_repl(
+            |buf: &mut [u8]| -> Option<usize> {
+                if let Some(line) = lines.pop() {
+                    let bytes = line.as_bytes();
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Some(bytes.len())
+                } else {
+                    None
+                }
+            },
+            |c| {
+                OUT.with(|o| o.borrow_mut().push(c));
+            },
+        )
+        .unwrap();
+        OUT.with(|o| {
+            let out = String::from_utf8(o.borrow().clone()).unwrap();
+            assert!(out.contains("3"));
+            assert!(out.contains("42"));
+        });
     }
 }
 

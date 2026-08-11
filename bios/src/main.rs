@@ -46,6 +46,54 @@ pub extern "C" fn _start(_boot_drive: u32) -> ! {
                 print::puts("\n");
                 net::scan_network();
             }
+            MenuAction::LuaShell => {
+                print::puts("\nLua Shell (type 'exit' to return)\n\n");
+                let mut state = lua::LuaState::new();
+                state.register_builtins(common::print::putc);
+                state.set_fetch(None);
+                let mut buf = [0u8; 256];
+                let mut len = 0u32;
+                loop {
+                    let c = serial::getc();
+                    match c {
+                        Some(b'\r') | Some(b'\n') => {
+                            if len > 0 {
+                                print::putc(b'\n');
+                                let line = &buf[..len as usize];
+                                match lua::eval::run_repl_once(&mut state, line, common::print::putc) {
+                                    Ok(lua::eval::ExecResult::Normal) => {}
+                                    Ok(lua::eval::ExecResult::Exit) => break,
+                                    Ok(lua::eval::ExecResult::Shell) => {
+                                        print::puts("\n(nested shell not supported)\n\n");
+                                    }
+                                    Ok(lua::eval::ExecResult::Ret(_)) => {}
+                                    Err(e) => {
+                                        print::puts("Lua error: ");
+                                        print::puts(e);
+                                        print::putc(b'\n');
+                                    }
+                                }
+                                len = 0;
+                            }
+                        }
+                        Some(b'\x7f') | Some(b'\x08') => {
+                            if len > 0 {
+                                len -= 1;
+                                print::putc(b'\x08');
+                                print::putc(b' ');
+                                print::putc(b'\x08');
+                            }
+                        }
+                        Some(ch) if ch >= 0x20 && ch < 0x7f && len < buf.len() as u32 - 1 => {
+                            buf[len as usize] = ch;
+                            len += 1;
+                            print::putc(ch);
+                        }
+                        _ => {}
+                    }
+                }
+                print::puts("\n");
+            }
         }
     }
 }

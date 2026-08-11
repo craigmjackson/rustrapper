@@ -45,6 +45,7 @@ pub fn ip_checksum(buf: &[u8]) -> u16 {
 /// Options: magic cookie 0x63825363, DHCP type 1 (DISCOVER), parameter
 /// request list for subnet (1), router (3), DNS (6), TFTP server (66),
 /// bootfile (67), end (255).
+#[allow(unused_assignments)]
 pub fn build_discover(xid: u32, mac: &[u8; 6]) -> [u8; 300] {
     let mut pkt = [0u8; 300];
     pkt[0] = 1; // op = BOOTREQUEST

@@ -1,6 +1,7 @@
 pub enum MenuAction {
     StorageScan,
     NetworkBoot,
+    LuaShell,
 }
 
 pub fn show_menu(
@@ -12,6 +13,7 @@ pub fn show_menu(
         puts("\nMenu:\n");
         puts("  [1] List storage devices\n");
         puts("  [2] Boot from network\n");
+        puts("  [3] Lua Shell\n");
         puts("Choose: ");
         let key = loop {
             if let Some(k) = get_key() {
@@ -23,6 +25,7 @@ pub fn show_menu(
         match key {
             b'1' => return MenuAction::StorageScan,
             b'2' => return MenuAction::NetworkBoot,
+            b'3' => return MenuAction::LuaShell,
             _ => puts("Invalid choice, try again.\n"),
         }
     }

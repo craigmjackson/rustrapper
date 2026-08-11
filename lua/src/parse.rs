@@ -237,7 +237,7 @@ impl<'s, 'l> Parser<'s, 'l> {
 
     // ── Expression precedence climbing ──────────────────────────────────────
 
-    fn parse_expr(&mut self) -> Result<u16, &'static str> {
+    pub fn parse_expr(&mut self) -> Result<u16, &'static str> {
         self.parse_or()
     }
 

@@ -37,18 +37,24 @@ const TCTL_PSP: u32 = 0x0000_0008;
 const TCTL_CT_SHIFT: u32 = 4;
 const TCTL_COLD_SHIFT: u32 = 12;
 
+#[allow(dead_code)]
 const CMD_EOP: u8 = 0x01;
+#[allow(dead_code)]
 const CMD_IFCS: u8 = 0x02;
+#[allow(dead_code)]
 const CMD_RS: u8 = 0x08;
 
+#[allow(dead_code)]
 const RX_STATUS_DD: u8 = 0x01;
 const TX_STATUS_DD: u8 = 0x01;
 
+#[allow(dead_code)]
 const RX_BUFFER_SIZE: usize = 2048;
 
 pub const NUM_RX_DESC: usize = 8;
 pub const NUM_TX_DESC: usize = 8;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct RxDesc {
@@ -60,6 +66,7 @@ struct RxDesc {
     special: u16,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct TxDesc {
@@ -72,9 +79,11 @@ struct TxDesc {
     special: u16,
 }
 
+#[allow(dead_code)]
 #[repr(align(16))]
 struct RxDescs([RxDesc; NUM_RX_DESC]);
 
+#[allow(dead_code)]
 #[repr(align(16))]
 struct TxDescs([TxDesc; NUM_TX_DESC]);
 

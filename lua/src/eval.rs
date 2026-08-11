@@ -7,6 +7,8 @@ use super::{LuaState, Node, Op, Value, NO_NODE};
 pub enum ExecResult {
     Normal,
     Ret(Value),
+    Shell,
+    Exit,
 }
 
 /// Execute the top-level script (its own scope frame).
@@ -36,6 +38,48 @@ fn exec_chain(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> 
     Ok(ExecResult::Normal)
 }
 
+/// Execute a single line of input in the REPL (resets step counter only).
+/// Returns `Ok(ExecResult::Shell)` to continue the REPL, or `Ok(ExecResult::Exit)`
+/// if the line was `exit()`.
+pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<ExecResult, &'static str> {
+    // Reset step counter so each line gets a fresh budget.
+    s.steps = 0;
+    // Reset the value stack and frame (but preserve globals, strings, tables).
+    s.vsp = 0;
+    s.fsp = 0;
+    // Check if the first token is a bare expression (not a keyword).
+    // If so, parse it as an expression and print the result (Lua REPL behavior).
+    // But skip if it's an assignment (name = ...).
+    let mut lex = super::lex::Lexer::new(line);
+    let tok = lex.next_token();
+    let is_expr_start = matches!(tok, Ok(super::lex::Tok::Name(_, _) | super::lex::Tok::Num(_) | super::lex::Tok::Str(_) | super::lex::Tok::LParen | super::lex::Tok::True | super::lex::Tok::False | super::lex::Tok::Nil | super::lex::Tok::Dot | super::lex::Tok::Minus | super::lex::Tok::Not));
+    if is_expr_start {
+        // Skip assignments: "x = ..." should not be treated as a bare expression.
+        let mut lex2 = super::lex::Lexer::new(line);
+        let _ = lex2.next_token(); // skip first token
+        let next = lex2.next_token();
+        if next != Ok(super::lex::Tok::Equals) {
+            let mut p = super::parse::Parser::new(line, s);
+            let e = p.parse_expr()?;
+            let v = eval(s, e)?;
+            match v {
+                Value::Exit => return Ok(ExecResult::Exit),
+                Value::Shell => return Ok(ExecResult::Shell),
+                _ => {
+                    tostring(s, v)?;
+                    emit(s, b'\n');
+                }
+            }
+            return Ok(ExecResult::Normal);
+        }
+    }
+    let first = {
+        let mut p = super::parse::Parser::new(line, s);
+        p.parse_script()?
+    };
+    exec_script(s, first).map(|_| ExecResult::Normal)
+}
+
 /// Run a block with its own fresh scope frame.
 fn exec_block(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> {
     s.push_frame()?;
@@ -58,7 +102,18 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             Ok(ExecResult::Normal)
         }
         Node::CallStmt(e) => {
-            eval(s, e)?;
+            let v = eval(s, e)?;
+            match v {
+                Value::Exit => return Ok(ExecResult::Exit),
+                Value::Shell => return Ok(ExecResult::Shell),
+                _ => {}
+            }
+            Ok(ExecResult::Normal)
+        }
+        Node::ExprStmt(e) => {
+            let v = eval(s, e)?;
+            tostring(s, v)?;
+            emit(s, b'\n');
             Ok(ExecResult::Normal)
         }
         Node::IfStmt(cond, then_b, els) => {
@@ -194,7 +249,12 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
                 }
                 n = s.next[n as usize];
             }
-            call(s, fv, argc)
+            match call(s, fv, argc)? {
+                ExecResult::Normal => Ok(Value::Nil),
+                ExecResult::Ret(v) => Ok(v),
+                ExecResult::Shell => Ok(Value::Shell),
+                ExecResult::Exit => Ok(Value::Exit),
+            }
         }
         Node::FuncLit(i) => Ok(Value::Func(i)),
         Node::TableLit(first_field) => {
@@ -217,7 +277,7 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
 }
 
 /// Call a function value with `argc` args on the value stack.
-fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<Value, &'static str> {
+fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static str> {
     if argc as usize > s.vsp as usize {
         return Err("internal error: arg stack underflow");
     }
@@ -238,7 +298,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<Value, &'static str> {
                 tostring(s, *a)?;
             }
             emit(s, b'\n');
-            Value::Nil
+            ExecResult::Normal
         }
         Value::Native(1) => {
             // fetch(filename) -> byte count, or nil if the download failed.
@@ -252,14 +312,26 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<Value, &'static str> {
                         .map_err(|_| "fetch filename must be ASCII")?;
                     match fetch {
                         Some(f) => match f(name) {
-                            Some(n) => Value::Num(n as i64),
-                            None => Value::Nil,
+                            Some(n) => ExecResult::Ret(Value::Num(n as i64)),
+                            None => ExecResult::Ret(Value::Nil),
                         },
-                        None => return Err("fetch not available"),
+                        None => return Err("fetch not available (no TFTP server)"),
                     }
                 }
                 _ => return Err("fetch expects a string filename"),
             }
+        }
+        Value::Shell => {
+            if argc != 0 {
+                return Err("shell expects no arguments");
+            }
+            ExecResult::Shell
+        }
+        Value::Exit => {
+            if argc != 0 {
+                return Err("exit expects no arguments");
+            }
+            ExecResult::Exit
         }
         Value::Func(idx) => {
             let fd = s.funcs[idx as usize];
@@ -272,8 +344,10 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<Value, &'static str> {
             let r = exec_chain(s, fd.body);
             s.pop_frame();
             match r {
-                Ok(ExecResult::Normal) => Value::Nil,
-                Ok(ExecResult::Ret(v)) => v,
+                Ok(ExecResult::Normal) => ExecResult::Normal,
+                Ok(ExecResult::Ret(v)) => ExecResult::Ret(v),
+                Ok(ExecResult::Shell) => ExecResult::Shell,
+                Ok(ExecResult::Exit) => ExecResult::Exit,
                 Err(e) => return Err(e),
             }
         }
@@ -407,6 +481,8 @@ fn tostring(s: &LuaState, v: Value) -> Result<(), &'static str> {
         Value::Table(_) => emit_str(s, b"table"),
         Value::Func(_) => emit_str(s, b"function"),
         Value::Native(_) => emit_str(s, b"native"),
+        Value::Shell => emit_str(s, b"shell"),
+        Value::Exit => emit_str(s, b"exit"),
     }
     Ok(())
 }

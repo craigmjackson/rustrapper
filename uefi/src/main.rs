@@ -80,6 +80,61 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
         match show_menu(u16_puts, u16_putc, get_key) {
             MenuAction::StorageScan => scan::scan_storage_devices(image_handle, system_table),
             MenuAction::NetworkBoot => net::scan_network_devices(image_handle, system_table),
+            MenuAction::LuaShell => {
+                net::w16(con_out, "\nLua Shell (type 'exit' to return)\n\n");
+                let mut state = lua::LuaState::new();
+                state.register_builtins(u16_putc);
+                state.set_fetch(None);
+                let mut buf = [0u16; 256];
+                let mut len = 0u32;
+                loop {
+                    let c = get_key();
+                    match c {
+                        Some(b'\r') | Some(b'\n') => {
+                            if len > 0 {
+                                net::w16(con_out, "\n");
+                                let line = unsafe {
+                                    core::str::from_utf8_unchecked(
+                                        &core::slice::from_raw_parts(
+                                            buf.as_ptr() as *const u8,
+                                            len as usize,
+                                        )
+                                    )
+                                };
+                                match lua::eval::run_repl_once(&mut state, line.as_bytes(), u16_putc) {
+                                    Ok(lua::eval::ExecResult::Normal) => {}
+                                    Ok(lua::eval::ExecResult::Exit) => break,
+                                    Ok(lua::eval::ExecResult::Shell) => {
+                                        net::w16(con_out, "\n(nested shell not supported)\n\n");
+                                    }
+                                    Ok(lua::eval::ExecResult::Ret(_)) => {}
+                                    Err(e) => {
+                                        net::w16(con_out, "Lua error: ");
+                                        net::w16(con_out, e);
+                                        net::w16(con_out, "\n");
+                                    }
+                                }
+                                len = 0;
+                            }
+                        }
+                        Some(b'\x7f') | Some(b'\x08') => {
+                            if len > 0 {
+                                len -= 1;
+                                u16_putc(b'\x08');
+                                u16_putc(b' ');
+                                u16_putc(b'\x08');
+                            }
+                        }
+                        Some(ch) if ch >= 0x20 && ch < 0x7f && len < buf.len() as u32 - 1 => {
+                            buf[len as usize] = ch as u16;
+                            len += 1;
+                            u16_putc(ch);
+                        }
+                        _ => {}
+                    }
+                }
+                net::w16(con_out, "\n");
+            }
         }
     }
 }

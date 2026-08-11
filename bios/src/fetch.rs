@@ -20,6 +20,7 @@ const PER_FILE_CAP: usize = FETCH_TOTAL_CAP / MAX_FETCH_FILES;
 const FETCH_BASE: usize = 0x2000000;
 
 /// One downloaded file.
+#[allow(dead_code)]
 pub struct FetchFile {
     pub name: [u8; 64],
     pub base: usize,

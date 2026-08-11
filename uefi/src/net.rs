@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use core::ptr::NonNull;
 
 use crate::efi::*;
 
@@ -165,39 +166,44 @@ impl DirectMmioE1000 {
         common::e1000::try_receive(self.base, buf, 200_000_000)
     }
 
+    #[allow(dangerous_implicit_autorefs)]
     fn dhcp_run(&self) -> Option<common::dhcp::DhcpConfig> {
         let mac = self.read_mac();
         let xid = 0x12345678;
         let mut frame = [0u8; 1514];
         let dhcp_payload = common::dhcp::build_discover(xid, &mac);
         let frame_len = common::dhcp::build_eth_ip_udp(&mac, &dhcp_payload, 300, &mut frame);
-        w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Building DHCP discover frame...\r\n");
+        let st = unsafe {
+            let ptr = core::ptr::addr_of!(crate::SYSTEM_TABLE);
+            (*ptr).as_ref().unwrap()
+        };
+        w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Building DHCP discover frame...\r\n");
         if !self.send(&frame[..frame_len]) {
-            w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Send failed\r\n");
+            w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Send failed\r\n");
             return None;
         }
-        w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Sent, waiting for response...\r\n");
+        w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Sent, waiting for response...\r\n");
         
         // Loop to skip non-DHCP packets (like ARP)
         for _attempt in 0..100 {
             if let Some(len) = self.receive_into(&mut frame) {
-                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Received packet (");
-                put_dec(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, len as u64);
-                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, " bytes, ethertype=0x");
-                put_hex_byte(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, frame[12]);
-                put_hex_byte(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, frame[13]);
-                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, ")\r\n");
+                w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Received packet (");
+                put_dec(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, len as u64);
+                w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, " bytes, ethertype=0x");
+                put_hex_byte(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, frame[12]);
+                put_hex_byte(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, frame[13]);
+                w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, ")\r\n");
                 
                 // Check if it's IPv4
                 if frame[12] != 0x08 || frame[13] != 0x00 {
-                    w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Skipping non-IPv4 packet\r\n");
+                    w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Skipping non-IPv4 packet\r\n");
                     continue;
                 }
                 
                 // Check if it's UDP
                 let ip_off = 14;
                 if frame[ip_off + 9] != 17 {
-                    w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Skipping non-UDP packet\r\n");
+                    w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Skipping non-UDP packet\r\n");
                     continue;
                 }
                 
@@ -205,10 +211,10 @@ impl DirectMmioE1000 {
                 if let Some(cfg) = common::dhcp::parse_response(&frame, len, xid, &mac) {
                     return Some(cfg);
                 }
-                w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Not a valid DHCP response\r\n");
+                w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Not a valid DHCP response\r\n");
             }
         }
-        w16(unsafe { &*(*crate::SYSTEM_TABLE.as_ref().unwrap()).con_out }, "    Receive timeout\r\n");
+        w16(unsafe { NonNull::new(st.con_out).unwrap().as_ref() }, "    Receive timeout\r\n");
         None
     }
 }
@@ -515,7 +521,7 @@ fn scan_pci_direct(
 
 fn scan_e1000_devices(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
-    gbs: *mut c_void,
+    #[allow(unused_variables)] gbs: *mut c_void,
     image_handle: EFI_HANDLE,
     system_table: &EFI_SYSTEM_TABLE,
 ) -> Option<common::dhcp::DhcpConfig> {
@@ -586,6 +592,7 @@ fn scan_e1000_devices(
     None
 }
 
+#[allow(dead_code)]
 fn e1000_init_and_dhcp(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, bar0: u64) -> Option<common::dhcp::DhcpConfig> {
     w16(con_out, "e1000 init at BAR0=0x");
     put_dec(con_out, bar0);
@@ -633,6 +640,7 @@ fn e1000_init_and_dhcp(con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL, bar0: u64) -> Opti
     Some(config)
 }
 
+#[allow(dead_code)]
 fn try_loaded_image_path(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
     gbs: *mut c_void,
@@ -795,6 +803,7 @@ fn pci_write_config32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
     unsafe { core::ptr::write_volatile(addr as *mut u32, val) }
 }
 
+#[allow(dead_code)]
 fn try_device_path(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
     gbs: *mut c_void,
@@ -895,6 +904,7 @@ fn try_device_path(
     None
 }
 
+#[allow(dead_code)]
 fn scan_pci_io_handle(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
     handle: EFI_HANDLE,
@@ -1086,6 +1096,7 @@ fn try_receive(
 /// driver doesn't support `Initialize` (returns `EFI_UNSUPPORTED`), so
 /// TX buffers are never recycled — the ring fills up after a few transmits.
 /// Calling `Stop` + `Start` + `Initialize` fully restarts the driver.
+#[allow(dead_code)]
 fn restart_snp(snp: &EFI_SIMPLE_NETWORK_PROTOCOL) {
     unsafe {
         (snp.shutdown)(snp as *const _ as *mut _);
@@ -1242,6 +1253,7 @@ fn dns_resolve_snp(
 }
 
 /// DNS resolve + print for the direct e1000 path. Uses con_out for output.
+#[allow(dead_code)]
 fn dns_resolve_e1000(
     con_out: &SIMPLE_TEXT_OUTPUT_PROTOCOL,
     base: u64,
@@ -1291,7 +1303,7 @@ fn dns_resolve_e1000(
 /// Helper function for execute_file callback
 fn uefi_puts(s: &str) {
     if let Some(st) = unsafe { crate::SYSTEM_TABLE } {
-        let con_out = unsafe { &*st.con_out };
+        let con_out = unsafe { NonNull::new(st.con_out).unwrap().as_ref() };
         w16(con_out, s);
     }
 }
