@@ -96,6 +96,16 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             s.declare_local(name, v)?;
             Ok(ExecResult::Normal)
         }
+        Node::GlobalDecl(name_node, val_node) => {
+            let v = if val_node != NO_NODE {
+                eval(s, val_node)?
+            } else {
+                Value::Nil
+            };
+            let name = node_name(s, name_node);
+            s.set_global(name, v);
+            Ok(ExecResult::Normal)
+        }
         Node::AssignStmt(t, v) => {
             let vv = eval(s, v)?;
             assign(s, t, vv)?;

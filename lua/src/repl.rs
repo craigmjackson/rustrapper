@@ -323,6 +323,14 @@ mod tests {
     }
 
     #[test]
+    fn global_works_in_repl() {
+        // `global` is a keyword, so the line is parsed as a statement (not a
+        // bare expression), and the global persists across REPL lines.
+        let out = run_session(b"global g = 42\rprint(g)\rexit\r");
+        assert!(out.contains("42"));
+    }
+
+    #[test]
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
         for cmd in ["help", "exit", "print", "fetch", "shell"] {

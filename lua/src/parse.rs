@@ -98,6 +98,19 @@ impl<'s, 'l> Parser<'s, 'l> {
                 let name_node = self.alloc(Node::Var(name))?;
                 self.alloc(Node::LocalDecl(name_node, v))
             }
+            Tok::Global => {
+                self.advance()?;
+                let name = self.expect_name()?;
+                let v = if self.cur == Tok::Equals {
+                    self.advance()?;
+                    self.parse_expr()?
+                } else {
+                    NO_NODE
+                };
+                self.opt_semi();
+                let name_node = self.alloc(Node::Var(name))?;
+                self.alloc(Node::GlobalDecl(name_node, v))
+            }
             Tok::Function => {
                 self.advance()?;
                 let name = self.expect_name()?;

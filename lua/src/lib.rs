@@ -2,7 +2,9 @@
 //!
 //! Supported subset:
 //! - Integer numbers, strings (single/double quotes with escapes), booleans, `nil`
-//! - `local` and global variables
+//! - `local` and `global` variable declarations (assignment to a plain name
+//!   updates an existing local or creates a global; `global name = v` forces a
+//!   write to the global table even when a local shadows it)
 //! - Arithmetic `+ - * / %`, comparison `== ~= < <= > >=`
 //! - `and` / `or` (short-circuit) / `not`, string concat `..`
 //! - `if` / `elseif` / `else` / `end`, `while ... do ... end`
@@ -139,6 +141,9 @@ pub enum Node {
     Field(u16, u16),
     /// `local name = value`.
     LocalDecl(u16, u16),
+    /// `global name [= value]` — force a write to the global table, ignoring
+    /// any local that shadows `name`.
+    GlobalDecl(u16, u16),
     /// `target = value`.
     AssignStmt(u16, u16),
     /// Expression statement (a call).
@@ -632,6 +637,43 @@ mod tests {
         assert_eq!(exec("x = 5\nx = x + 2\nprint(x)").unwrap(), "7\n");
         assert_eq!(exec("local x = 10\nprint(x)").unwrap(), "10\n");
         assert_eq!(exec("local x = 10\nx = 3\nprint(x)").unwrap(), "3\n");
+    }
+
+    #[test]
+    fn global_keyword() {
+        // Basic declaration and init.
+        assert_eq!(exec("global g = 7\nprint(g)").unwrap(), "7\n");
+        // No value -> nil.
+        assert_eq!(exec("global g\nprint(g)").unwrap(), "nil\n");
+        // Global set from inside a function scope.
+        assert_eq!(
+            exec("function set()\nglobal g = 42\nend\nset()\nprint(g)").unwrap(),
+            "42\n"
+        );
+        // `global` bypasses a shadowing local (plain `x = 3` would write the local).
+        assert_eq!(
+            exec("x = 1\nfunction f()\nlocal x = 2\nglobal x = 3\nend\nf()\nprint(x)").unwrap(),
+            "3\n"
+        );
+        // A local still shadows READS, but `global` writes the global table so
+        // the value is visible once the local goes out of scope.
+        assert_eq!(
+            exec("global g = 1\nlocal g = 2\nprint(g)\nglobal g = 9\nprint(g)").unwrap(),
+            "2\n2\n"
+        );
+        assert_eq!(
+            exec("function f()\nlocal g = 2\nglobal g = 9\nprint(g)\nend\nf()\nprint(g)").unwrap(),
+            "2\n9\n"
+        );
+        // Global can be updated incrementally.
+        assert_eq!(exec("global c = 1\nglobal c = c + 1\nprint(c)").unwrap(), "2\n");
+    }
+
+    #[test]
+    fn global_syntax_errors() {
+        assert!(exec("global").is_err());
+        assert!(exec("global 5").is_err());
+        assert!(exec("global x + 1").is_err());
     }
 
     #[test]
