@@ -31,6 +31,7 @@ extern crate std;
 pub mod eval;
 pub mod lex;
 pub mod parse;
+pub mod repl;
 
 // ── Sizing constants (all memory is fixed static buffers) ──────────────────
 

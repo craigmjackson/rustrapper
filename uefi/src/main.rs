@@ -54,17 +54,103 @@ pub fn u16_putc(c: u8) {
     }
 }
 
+// State for multi-byte escape sequences (ESC [ 3 ~ etc.) that arrive across
+// several ReadKeyStroke polls (serial-terminal input under -nographic).
+#[cfg(not(test))]
+const ESC_BUF_LEN: usize = 8;
+#[cfg(not(test))]
+static mut ESC_SEQ: [u8; ESC_BUF_LEN] = [0; ESC_BUF_LEN];
+#[cfg(not(test))]
+static mut ESC_N: usize = 0;
+
+// Temporary diagnostic: report raw scan/unicode for unrecognized keys so the
+// ARM64 UEFI backspace/delete key delivery can be identified precisely.
+#[cfg(not(test))]
+fn debug_key(scan: u16, unicode: u16) {
+    let hex = b"0123456789ABCDEF";
+    let mut buf = [0u8; 24];
+    let mut i = 0;
+    for &(label, v) in &[(b's', scan), (b'u', unicode)] {
+        buf[i] = label;
+        i += 1;
+        buf[i] = b'=';
+        i += 1;
+        for shift in [12u32, 8, 4, 0] {
+            buf[i] = hex[((v >> shift) & 0xF) as usize];
+            i += 1;
+        }
+        buf[i] = b' ';
+        i += 1;
+    }
+    buf[i] = b'\r';
+    i += 1;
+    buf[i] = b'\n';
+    i += 1;
+    let s = core::str::from_utf8(&buf[..i]).unwrap_or("");
+    u16_puts(s);
+}
+
 #[cfg(not(test))]
 fn get_key() -> Option<u8> {
-    unsafe {
-        let st = SYSTEM_TABLE?;
-        let con_in = &*(st.con_in as *mut EFI_SIMPLE_TEXT_INPUT_PROTOCOL);
-        let mut key = EFI_INPUT_KEY { scan_code: 0, unicode_char: 0 };
-        let status = (con_in.read_key_stroke)(con_in as *const _ as *mut _, &mut key);
-        if status == EFI_SUCCESS {
-            Some(key.unicode_char as u8)
-        } else {
-            None
+    loop {
+        unsafe {
+            let st = SYSTEM_TABLE?;
+            let con_in = &*(st.con_in as *mut EFI_SIMPLE_TEXT_INPUT_PROTOCOL);
+            let mut key = EFI_INPUT_KEY { scan_code: 0, unicode_char: 0 };
+            let status = (con_in.read_key_stroke)(con_in as *const _ as *mut _, &mut key);
+            if status != EFI_SUCCESS {
+                return None;
+            }
+            let scan = key.scan_code;
+            let unicode = key.unicode_char;
+            let ch = unicode as u8;
+
+            // Continue a partially-received escape sequence across polls.
+            if ESC_N > 0 {
+                // ESC followed by anything but '['/'O' is a lone ESC, not a
+                // sequence: cancel and reprocess this key normally.
+                let cancel = ESC_N == 1 && ch != b'[' && ch != b'O';
+                if !cancel {
+                    if ESC_N < ESC_BUF_LEN {
+                        ESC_SEQ[ESC_N] = ch;
+                    }
+                    ESC_N += 1;
+                    // Sequences end at '~', 'M', or a letter.
+                    if ch == b'~' || ch == b'M' || ch.is_ascii_alphabetic() {
+                        // Only ESC [ 3 ~ (Delete) maps to backspace; arrows and
+                        // other sequences are discarded.
+                        let delete = ESC_N == 4
+                            && ESC_SEQ[0] == b'\x1B'
+                            && ESC_SEQ[1] == b'['
+                            && ESC_SEQ[2] == b'3'
+                            && ESC_SEQ[3] == b'~';
+                        ESC_N = 0;
+                        return if delete { Some(b'\x7F') } else { None };
+                    }
+                    return None;
+                }
+                ESC_N = 0;
+            }
+
+            // Backspace: unicode 0x08 / 0x7F (DEL), or EDK2 SCAN_DELETE (0x0008).
+            if ch == b'\x08' || ch == b'\x7F' || scan == 0x0008 {
+                return Some(b'\x7F');
+            }
+            // Escape: unicode 0x1B or EDK2 SCAN_ESC (0x0017) starts a sequence.
+            if ch == b'\x1B' || scan == 0x0017 {
+                ESC_SEQ[0] = b'\x1B';
+                ESC_N = 1;
+                return None;
+            }
+            // Enter / line feeds must reach the REPL's enter handling.
+            if ch == b'\r' || ch == b'\n' {
+                return Some(ch);
+            }
+            if unicode > 0 && ch >= 0x20 && ch < 0x7F {
+                return Some(ch);
+            }
+            debug_key(scan, unicode);
+            return None;
         }
     }
 }
@@ -81,59 +167,10 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
             MenuAction::StorageScan => scan::scan_storage_devices(image_handle, system_table),
             MenuAction::NetworkBoot => net::scan_network_devices(image_handle, system_table),
             MenuAction::LuaShell => {
-                net::w16(con_out, "\nLua Shell (type 'exit' to return)\n\n");
                 let mut state = lua::LuaState::new();
                 state.register_builtins(u16_putc);
                 state.set_fetch(None);
-                let mut buf = [0u16; 256];
-                let mut len = 0u32;
-                loop {
-                    let c = get_key();
-                    match c {
-                        Some(b'\r') | Some(b'\n') => {
-                            if len > 0 {
-                                net::w16(con_out, "\n");
-                                let line = unsafe {
-                                    core::str::from_utf8_unchecked(
-                                        &core::slice::from_raw_parts(
-                                            buf.as_ptr() as *const u8,
-                                            len as usize,
-                                        )
-                                    )
-                                };
-                                match lua::eval::run_repl_once(&mut state, line.as_bytes(), u16_putc) {
-                                    Ok(lua::eval::ExecResult::Normal) => {}
-                                    Ok(lua::eval::ExecResult::Exit) => break,
-                                    Ok(lua::eval::ExecResult::Shell) => {
-                                        net::w16(con_out, "\n(nested shell not supported)\n\n");
-                                    }
-                                    Ok(lua::eval::ExecResult::Ret(_)) => {}
-                                    Err(e) => {
-                                        net::w16(con_out, "Lua error: ");
-                                        net::w16(con_out, e);
-                                        net::w16(con_out, "\n");
-                                    }
-                                }
-                                len = 0;
-                            }
-                        }
-                        Some(b'\x7f') | Some(b'\x08') => {
-                            if len > 0 {
-                                len -= 1;
-                                u16_putc(b'\x08');
-                                u16_putc(b' ');
-                                u16_putc(b'\x08');
-                            }
-                        }
-                        Some(ch) if ch >= 0x20 && ch < 0x7f && len < buf.len() as u32 - 1 => {
-                            buf[len as usize] = ch as u16;
-                            len += 1;
-                            u16_putc(ch);
-                        }
-                        _ => {}
-                    }
-                }
-                net::w16(con_out, "\n");
+                lua::repl::repl_loop(&mut state, get_key, u16_putc, u16_puts);
             }
         }
     }
