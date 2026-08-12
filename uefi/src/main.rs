@@ -29,6 +29,13 @@ use crate::efi::*;
 pub static mut SYSTEM_TABLE: Option<&'static EFI_SYSTEM_TABLE> = None;
 
 #[cfg(not(test))]
+#[cfg(target_arch = "aarch64")]
+fn read_boot_svc_fn<T>(gbs: *const core::ffi::c_void, offset: usize) -> T {
+    let ptr = (gbs as usize + offset) as *const *const core::ffi::c_void;
+    unsafe { core::mem::transmute_copy(&*ptr) }
+}
+
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
@@ -162,6 +169,54 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
     let con_out = unsafe { &*system_table.con_out };
     net::w16(con_out, "Rustrapper UEFI\r\n");
 
+    // ARM64 UEFI gives loaded images a small firmware stack (the `LuaState`
+    // alone is ~38 KB and overflows it with a synchronous exception). Run the
+    // whole menu loop on a large custom stack allocated from Boot Services.
+    #[cfg(target_arch = "aarch64")]
+    {
+        const BOOT_SVC_ALLOCATE_PAGES: usize = 0x28;
+        const EFI_LOADER_DATA: u32 = 2;
+        const STACK_PAGES: u64 = 256; // 1 MiB
+
+        type AllocatePagesFn = unsafe extern "efiapi" fn(
+            allocate_type: u32,
+            memory_type: u32,
+            pages: u64,
+            memory: *mut u64,
+        ) -> EFI_STATUS;
+
+        let allocate_pages: AllocatePagesFn =
+            read_boot_svc_fn(system_table.boot_services, BOOT_SVC_ALLOCATE_PAGES);
+        let mut base: u64 = 0;
+        let status = unsafe { allocate_pages(0, EFI_LOADER_DATA, STACK_PAGES, &mut base) };
+        if status == EFI_SUCCESS && base != 0 {
+            let top = (base as usize + STACK_PAGES as usize * 4096) & !15;
+            unsafe {
+                core::arch::asm!(
+                    "mov sp, {top}",
+                    "mov x0, {ih}",
+                    "mov x1, {st}",
+                    "b {func}",
+                    top = in(reg) top,
+                    ih = in(reg) image_handle as usize,
+                    st = in(reg) system_table as *const _ as usize,
+                    func = sym boot_loop,
+                    options(noreturn),
+                );
+            }
+        }
+        boot_loop(image_handle, system_table);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    boot_loop(image_handle, system_table);
+}
+
+/// The main menu/action loop. Kept separate so `efi_main` can switch to a
+/// large custom stack (ARM64 UEFI) before running it.
+#[cfg(not(test))]
+#[inline(never)]
+fn boot_loop(image_handle: EFI_HANDLE, system_table: &'static EFI_SYSTEM_TABLE) -> ! {
     loop {
         match show_menu(u16_puts, u16_putc, get_key) {
             MenuAction::StorageScan => scan::scan_storage_devices(image_handle, system_table),
@@ -169,7 +224,11 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
             MenuAction::LuaShell => {
                 let mut state = lua::LuaState::new();
                 state.register_builtins(u16_putc);
-                state.set_fetch(None);
+                if net::setup_fetch_context() {
+                    state.set_fetch(Some(crate::fetch::fetch_file));
+                } else {
+                    state.set_fetch(None);
+                }
                 lua::repl::repl_loop(&mut state, get_key, u16_putc, u16_puts);
             }
         }

@@ -318,7 +318,10 @@ impl LuaState {
     }
 
     /// Install a host `fetch()` callback. Call `set_fetch(None)` to explicitly
-    /// disable fetch (useful for the REPL where no TFTP server is available).
+    /// disable fetch (e.g. when no TFTP server is reachable). REPL entry
+    /// points set this to the target's `fetch_file` callback when networking
+    /// is available so `fetch("file")` works interactively, not just in PXE
+    /// scripts.
     pub fn set_fetch(&mut self, fetch: Option<fn(&str) -> Option<usize>>) {
         self.fetch = fetch;
     }

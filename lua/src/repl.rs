@@ -33,17 +33,20 @@ pub fn repl_loop(
                 Some(b'\r') | Some(b'\n') => {
                     if len > 0 {
                         putc(b'\n');
-                        match eval::run_repl_once(state, &buf[..len as usize], putc) {
-                            Ok(eval::ExecResult::Normal) => {}
-                            Ok(eval::ExecResult::Exit) => exited = true,
-                            Ok(eval::ExecResult::Shell) => {
-                                puts("\n(nested shell not supported)\n\n");
-                            }
-                            Ok(eval::ExecResult::Ret(_)) => {}
-                            Err(e) => {
-                                puts("Lua error: ");
-                                puts(e);
-                                putc(b'\n');
+                        let line = &buf[..len as usize];
+                        if !handle_help(line, puts) {
+                            match eval::run_repl_once(state, line, putc) {
+                                Ok(eval::ExecResult::Normal) => {}
+                                Ok(eval::ExecResult::Exit) => exited = true,
+                                Ok(eval::ExecResult::Shell) => {
+                                    puts("\n(nested shell not supported)\n\n");
+                                }
+                                Ok(eval::ExecResult::Ret(_)) => {}
+                                Err(e) => {
+                                    puts("Lua error: ");
+                                    puts(e);
+                                    putc(b'\n');
+                                }
                             }
                         }
                         len = 0;
@@ -68,6 +71,120 @@ pub fn repl_loop(
         }
     }
     puts("\n");
+}
+
+/// One REPL command described in the `help` output.
+struct HelpEntry {
+    name: &'static str,
+    short: &'static str,
+    detail: &'static str,
+}
+
+const HELP_COMMANDS: &[HelpEntry] = &[
+    HelpEntry {
+        name: "help",
+        short: "Show this help; 'help <cmd>' for details",
+        detail: "help [command]\n\
+                  No argument lists all REPL commands.\n\
+                  'help <cmd>' shows detailed help for one command.\n",
+    },
+    HelpEntry {
+        name: "exit",
+        short: "Exit the Lua shell and return to the menu",
+        detail: "exit\n\
+                  Leaves the Lua shell and returns to the main menu.\n\
+                  May also be written exit() in a script.\n",
+    },
+    HelpEntry {
+        name: "print",
+        short: "Print one or more values",
+        detail: "print(v1, v2, ...)\n\
+                  Prints values separated by tabs, followed by a newline.\n\
+                  Example: print(1 + 2) -> 3\n",
+    },
+    HelpEntry {
+        name: "fetch",
+        short: "Download a file from the TFTP server",
+        detail: "fetch(\"file\")\n\
+                  Downloads 'file' from the TFTP server (DHCP next_server) and\n\
+                  returns its byte count, or nil on failure.\n\
+                  Works in PXE scripts and in the REPL when a TFTP server is\n\
+                  reachable (the network is set up when the shell starts).\n",
+    },
+    HelpEntry {
+        name: "shell",
+        short: "Enter a nested Lua shell",
+        detail: "shell()\n\
+                  Tries to enter a nested interactive shell.\n\
+                  Not supported inside the REPL.\n",
+    },
+    HelpEntry {
+        name: "lua",
+        short: "Run Lua expressions and statements",
+        detail: "lua\n\
+                  Every line is evaluated as Lua: bare expressions print their\n\
+                  result; statements (assignment, if/while/for, functions,\n\
+                  tables) run normally.\n",
+    },
+];
+
+/// Trim leading/trailing spaces and tabs from a byte slice.
+fn trim(b: &[u8]) -> &[u8] {
+    let mut s = 0;
+    let mut e = b.len();
+    while s < e && (b[s] == b' ' || b[s] == b'\t') {
+        s += 1;
+    }
+    while e > s && (b[e - 1] == b' ' || b[e - 1] == b'\t') {
+        e -= 1;
+    }
+    &b[s..e]
+}
+
+fn print_general_help(puts: fn(&str)) {
+    puts("Commands:\n");
+    for e in HELP_COMMANDS {
+        puts("  ");
+        puts(e.name);
+        for _ in e.name.len()..8 {
+            puts(" ");
+        }
+        puts(e.short);
+        puts("\n");
+    }
+    puts("\nType 'help <cmd>' for details on a command.\n");
+}
+
+/// Intercept `help` / `help <cmd>` lines before they reach the Lua parser.
+/// Returns `true` if the line was a help command (already printed), `false`
+/// if it should be passed to the interpreter as normal input.
+fn handle_help(line: &[u8], puts: fn(&str)) -> bool {
+    let target: Option<&[u8]> = if line == &b"help"[..] {
+        Some(&[])
+    } else if line.starts_with(&b"help "[..]) {
+        Some(trim(&line[5..]))
+    } else {
+        None
+    };
+    match target {
+        None => return false,
+        Some(sub) if sub.is_empty() => print_general_help(puts),
+        Some(sub) => {
+            let mut found = false;
+            for e in HELP_COMMANDS {
+                if e.name.as_bytes() == sub {
+                    puts(e.detail);
+                    found = true;
+                }
+            }
+            if !found {
+                puts("Unknown command: ");
+                puts(core::str::from_utf8(sub).unwrap_or("?"));
+                puts("\n");
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -116,6 +233,40 @@ mod tests {
         state.set_fetch(None);
         repl_loop(&mut state, get_key, putc, puts);
         OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap())
+    }
+
+    /// Mock `fetch()` host callback: returns a size for known names, `None`
+    /// for anything else (simulating a TFTP download failure).
+    fn mock_fetch(name: &str) -> Option<usize> {
+        match name {
+            "a.txt" => Some(5),
+            "b.txt" => Some(12),
+            _ => None,
+        }
+    }
+
+    /// Run a full REPL session with a mock `fetch()` callback installed.
+    fn run_session_with_fetch(keys: &[u8]) -> String {
+        feed(keys);
+        OUT.with(|o| o.borrow_mut().clear());
+        let mut state = LuaState::new();
+        state.register_builtins(putc);
+        state.set_fetch(Some(mock_fetch));
+        repl_loop(&mut state, get_key, putc, puts);
+        OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap())
+    }
+
+    #[test]
+    fn fetch_works_in_repl() {
+        let out = run_session_with_fetch(b"print(fetch(\"a.txt\"))\rexit\r");
+        assert!(out.contains("5\n"));
+    }
+
+    #[test]
+    fn fetch_failure_in_repl() {
+        // Download failure -> nil, does not kill the REPL.
+        let out = run_session_with_fetch(b"print(fetch(\"missing.txt\"))\rexit\r");
+        assert!(out.contains("nil\n"));
     }
 
     #[test]
@@ -169,5 +320,32 @@ mod tests {
     fn state_persists_across_lines() {
         let out = run_session(b"x = 42\rprint(x)\rexit\r");
         assert!(out.contains("42"));
+    }
+
+    #[test]
+    fn help_lists_commands() {
+        let out = run_session(b"help\rexit\r");
+        for cmd in ["help", "exit", "print", "fetch", "shell"] {
+            assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
+        }
+        assert!(out.contains("Type 'help <cmd>'"));
+    }
+
+    #[test]
+    fn help_detail_for_command() {
+        let out = run_session(b"help exit\rexit\r");
+        assert!(out.contains("Leaves the Lua shell"));
+    }
+
+    #[test]
+    fn help_unknown_command() {
+        let out = run_session(b"help bogus\rexit\r");
+        assert!(out.contains("Unknown command: bogus"));
+    }
+
+    #[test]
+    fn help_does_not_break_lua() {
+        let out = run_session(b"help\rprint(1 + 2)\rexit\r");
+        assert!(out.contains("3\n"));
     }
 }

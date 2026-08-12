@@ -71,7 +71,11 @@ pub extern "C" fn main() -> ! {
             MenuAction::LuaShell => {
                 let mut state = lua::LuaState::new();
                 state.register_builtins(common::print::putc);
-                state.set_fetch(None);
+                if net::setup_fetch_context() {
+                    state.set_fetch(Some(crate::fetch::fetch_file));
+                } else {
+                    state.set_fetch(None);
+                }
                 lua::repl::repl_loop(&mut state, uart::getc, common::print::putc, common::print::puts);
             }
         }

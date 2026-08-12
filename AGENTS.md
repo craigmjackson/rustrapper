@@ -90,6 +90,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `extern "efiapi"` calling convention is the EFI ABI on both x86_64 and ARM64.
 - Function pointers that dereference raw pointers (e.g. `output_string`) must be `unsafe extern "efiapi" fn(...)`, NOT `extern "efiapi" fn(...)`. Using safe `extern "efiapi" fn` causes "unnecessary `unsafe` block" warnings when wrapping calls.
 - **Boot Services function offsets** (hardcoded, verified on OVMF/EDK2):
+  - `0x28` — `AllocatePages` (used by ARM64 `efi_main` for the large stack)
   - `0x40` — `AllocatePool`
   - `0x48` — `FreePool`
   - `0xC8` — `LoadImage`
@@ -103,8 +104,9 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 - `efi_main` is `extern "efiapi" fn(image_handle, system_table) -> !`.
 - Stores a global reference to the system table for console input.
-- Presents the `[1]/[2]` menu via `common::menu::show_menu`, using `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` for non-blocking input.
-- Dispatches to `scan_storage_devices` or `net::scan_network_devices` based on the choice.
+- **On ARM64, `efi_main` switches to a large custom stack (1 MiB, allocated via `AllocatePages` offset 0x28) before running the menu loop**: the firmware stack for loaded images on ARM64 UEFI is too small for the ~38 KB `LuaState` (which lives on the stack), so the PXE `.lua` path and the Lua Shell fault with a synchronous exception when the interpreter starts. x86_64 OVMF's stack is large enough, so x86_64 uses the firmware stack. The loop runs in `boot_loop` (a separate `#[inline(never)]` fn so the stack switch is clean); a failed allocation falls back to the firmware stack.
+- Presents the `[1]/[2]/[3]` menu via `common::menu::show_menu`, using `EFI_SIMPLE_TEXT_INPUT_PROTOCOL.ReadKeyStroke` for non-blocking input.
+- Dispatches to `scan_storage_devices` or `net::scan_network_devices` based on the choice. The Lua Shell choice runs `net::setup_fetch_context()` first and registers `crate::fetch::fetch_file` with the interpreter (or `None` if no network), so `fetch()` works interactively in the REPL.
 - `u16_putc(c: u8)` is `pub` — it is the `fn(u8)` output callback passed to `lua::run_with_fetch` from `loader::execute_pxe_file` (each byte is converted to u16 and emitted via `OutputString`).
 
 ### `uefi/src/scan.rs` — UEFI storage scan
@@ -129,6 +131,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - `try_receive` calls `SNP.Receive` with non-null `SrcAddr`, `DestAddr`, and `Protocol` output pointers; some firmware requires them.
 - The ARM64 virtio SNP only supports one transmit per session (no buffer recycling without `Initialize`), so `send_udp_dhcp` sends one DHCPDISCOVER and accepts the OFFER as final. x86_64 e1000 works normally with full DISCOVER→OFFER→REQUEST→ACK.
 - **PXE boot flow**: After DHCP succeeds, the bootloader attempts TFTP download via direct MMIO e1000 (bypassing SNP). This works around OVMF's SNP receive issues. The flow is: find e1000 BAR0 via PCI scan → initialize e1000 → send TFTP RRQ → receive OACK/DATA packets → send ACKs → execute downloaded file.
+- `setup_fetch_context` finds e1000 BAR0 via PCI scan, initializes it with `DirectMmioE1000`, runs DHCP, and records the fetch context via `crate::fetch::set_context` so the Lua REPL's `fetch()` works. Returns `true` on success.
 - TFTP payload extraction and frame building use the shared `common::tftp::udp_payload` / `common::tftp::build_udp_frame` helpers (same as BIOS and ARM64 bare-metal). Both `tftp_download_e1000` and `tftp_download_snp` bound the TFTP payload by the UDP length field (not the raw RX length) so the 4-byte FCS QEMU appends is never parsed as file data.
 
 ### `uefi/src/mem.rs` — UEFI memory allocation
@@ -162,14 +165,15 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 - PCI ECAM at `0x4010_0000_00` (QEMU virt v11+).
 - Load address: `0x4020_0000` (above DTB at `0x4000_0000`).
 - Stack is 512 KB above BSS (`link.ld` `. += 0x80000`). The Lua interpreter's ~38 KB `LuaState` frame plus the TFTP/DHCP packet buffers overflowed the original 64 KB stack, silently corrupting BSS (no vector table ⇒ no fault, just a hang).
-- Presents the `[1]/[2]` menu via `common::menu::show_menu`, reading from the PL011 UART (`uart::getc`), and dispatches to `scan::scan_devices` or `net::scan_network` based on the choice.
+- Presents the `[1]/[2]/[3]` menu via `common::menu::show_menu`, reading from the PL011 UART (`uart::getc`), and dispatches to `scan::scan_devices` or `net::scan_network` based on the choice. The Lua Shell choice runs `net::setup_fetch_context()` first and registers `crate::fetch::fetch_file` with the interpreter (or `None` if no network), so `fetch()` works interactively in the REPL.
 
 ### `arm64-bare/src/net.rs` — ARM64 bare-metal e1000 NIC + DHCP
 
 - Thin wrapper around `common::e1000` and `common::dhcp`. All e1000 register access, descriptor ring setup, and DHCP frame build/parse are in `common/`; this file only handles the PCI scan, output, and glue.
 - `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the PL011 UART.
-- `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
+- `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations per try, up to 4 tries), and parses via `dhcp::parse_response`. It tolerates `try_receive` timeouts (does NOT `?`-abort on the first one) because dnsmasq runs ARP conflict-detection probes before sending the OFFER — see gotcha 60.
 - `print_mac` and `print_ip` are tiny local helpers that format MAC/IP to the global print sink.
+- `setup_fetch_context` walks PCI for a class-0x02 device, inits the e1000, runs DHCP, and records the fetch context via `crate::fetch::set_context` so the Lua REPL's `fetch()` works. Returns `true` on success.
 - `pxe_boot` TFTP-downloads the bootfile into an `Arm64MemorySink`; if the bootfile name ends with `.lua`, it calls `crate::fetch::set_context(base, mac, cfg)` and executes the downloaded buffer in place with `lua::run_with_fetch(data, putc, crate::fetch::fetch_file)`, otherwise it hands the buffer to `loader::execute_file`.
 - `tftp_download` bounds the TFTP payload slice by the UDP length field via `common::tftp::udp_payload`, NOT the raw Ethernet frame length — QEMU's e1000 model appends the 4-byte FCS to received frames, so the RX descriptor length returned by `try_receive` is 4 bytes too long on the final DATA packet. Without the UDP-length bound, the trailing FCS bytes get parsed as script/binary data (a `.lua` script fails with "unexpected character", and the downloaded size is 4 bytes too large).
 - Uses `-nic user,model=e1000` in `run-aarch64-bare` (not `-net none`); QEMU's e1000 emulation works normally with full ARP/DHCP over user-mode (slirp) networking on both x86_64 and aarch64 hosts.
@@ -200,7 +204,7 @@ The following details apply to the common e1000 driver used by all three targets
 - Descriptor rings (`RxDescs`/`TxDescs`) are `#[repr(align(16))]` wrapper structs around `#[repr(C, packed)]` descriptor arrays; QEMU's e1000 requires 16-byte-aligned ring base addresses for `RDBAL`/`TDBAL`.
 - **`RDLEN`/`TDLEN` minimum is 128 bytes** on QEMU's e1000 model — rings smaller than 8 descriptors (16 bytes each) are silently rejected (register reads back as the last valid value, not what was written).
 - **`RDT` must be set to `NUM_RX_DESC - 1` after init**, not `0`. `RDH == RDT` means zero descriptors are owned by hardware (empty ring) — a very easy off-by-one that results in silently receiving nothing.
-- All RX descriptors point at a single shared `RX_BUF` (2048 bytes); fine for the single in-flight DHCP transaction this driver performs, but would corrupt data under concurrent multi-packet traffic.
+- Each RX descriptor has its OWN buffer (`RX_BUFS: [[u8; 2048]; NUM_RX_DESC]`). An earlier version pointed all descriptors at a single shared `RX_BUF`, which corrupted data under concurrent multi-packet traffic: when the DHCP OFFER and dnsmasq's ARP conflict-detection probes arrived together, a later packet's DMA overwrote the earlier one, so `try_receive` returned descriptor A's length (360) but descriptor B's content (ethertype `0x0806`) and the DHCP loop skipped the OFFER forever — "stuck" receiving ARPs. Per-descriptor buffers make concurrent packets independent.
 - DHCP RX polling must be RAM-only status checks (`RX_DESCS.0[idx].status & RX_STATUS_DD`), not MMIO register polling (`reg_read32(base, REG_RDH)`) in a tight loop — repeated MMIO reads under QEMU TCG are drastically slower than cached RAM reads and can make a poll loop take far longer than intended for the same iteration count.
 - The RX poll loop needs roughly 100 million iterations (~1 second of wall time) for QEMU's slirp (`-nic user`) DHCP server to respond; smaller counts (e.g. 2 million, ~0.1s) reliably miss the OFFER even though the packet is delivered on the wire (verified with `-object filter-dump,netdev=net0,file=...` producing a valid pcap showing both DISCOVER and OFFER).
 
@@ -213,8 +217,8 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `common/src/menu.rs` — Shared menu logic
 
-- `MenuAction` enum: `StorageScan` / `NetworkBoot`.
-- `show_menu(puts, putc, get_key)` prints `[1]/[2]` and polls `get_key` until the user presses a valid choice.
+- `MenuAction` enum: `StorageScan` / `NetworkBoot` / `LuaShell`.
+- `show_menu(puts, putc, get_key)` prints `[1]/[2]/[3]` and polls `get_key` until the user presses a valid choice.
 - `puts`/`putc` are function pointers, so the same function can be used with ASCII (UART/BIOS) and UEFI (wrapped to u16 `OutputString`) output.
 
 ### `bios/src/mbr.asm` — 16-bit MBR stage-1
@@ -244,8 +248,8 @@ The following details apply to the common e1000 driver used by all three targets
 - **Dual output**: VGA text-mode driver (`vga.rs`) writing directly to `0xB8000` via `write_volatile` (COL/ROW statics in BSS, with scrolling when row ≥ 25), and serial output (`serial.rs`) via COM1 (`0x3F8`) using inline `asm!` for `in al, dx` / `out dx, al`.
 - Both VGA and serial `putc` auto-translate `\n` → `\r\n` (matching `arm64-bare/src/uart.rs`).
 - Serial `putc` polls LSR (0x3FD) bit 5 (THRE) before writing; `flush` waits for TEMT (bit 6); `getc` polls LSR bit 0 (Data Ready) for non-blocking input.
-- Uses `common::print::init(dual_putc)` to wire the global print callback, then `common::menu::show_menu` for the `[1]/[2]` menu, and `common::scan::scan_devices` for storage scan — same pattern as `arm64-bare/src/main.rs`.
-- Presents the `[1]/[2]` menu via `common::menu::show_menu`, reading from serial COM1 (`serial::getc`), and dispatches to `scan::scan_devices(pci::detect_device)` or `net::scan_network()`.
+- Uses `common::print::init(dual_putc)` to wire the global print callback, then `common::menu::show_menu` for the `[1]/[2]/[3]` menu, and `common::scan::scan_devices` for storage scan — same pattern as `arm64-bare/src/main.rs`.
+- Presents the `[1]/[2]/[3]` menu via `common::menu::show_menu`, reading from serial COM1 (`serial::getc`), and dispatches to `scan::scan_devices(pci::detect_device)` or `net::scan_network()`. The Lua Shell choice runs `net::setup_fetch_context()` first and registers `crate::fetch::fetch_file` with the interpreter (or `None` if no network), so `fetch()` works interactively in the REPL.
 - `#[cfg(not(test))]` guards on `_start` and `#[panic_handler]` so the crate can be compiled in the host test harness.
 - Custom `link.ld` links at `0x100000` (where the entry stub copies the payload).
 
@@ -262,8 +266,9 @@ The following details apply to the common e1000 driver used by all three targets
 
 - Thin wrapper around `common::e1000` and `common::dhcp`. All e1000 register access, descriptor ring setup, and DHCP frame build/parse are in `common/`; this file only handles the PCI scan, output, and glue.
 - `scan_network` walks PCI bus 0 for network class (0x02) devices, enables BARs, calls `e1000_common::init(bar0 as u64)`, runs DHCP, prints IP/subnet/gateway to the global print sink (serial + VGA).
-- `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations, ~1 second), and parses via `dhcp::parse_response`.
+- `dhcp_run` builds a DISCOVER via `dhcp::build_discover`, sends via `e1000_common::send`, polls via `e1000_common::try_receive` (100M iterations per try, up to 4 tries), and parses via `dhcp::parse_response`. It tolerates `try_receive` timeouts (does NOT `?`-abort on the first one) because dnsmasq runs ARP conflict-detection probes before sending the OFFER — see gotcha 60.
 - `print_mac` and `print_ip` are tiny local helpers (12 and 9 lines) that format MAC/IP to the global print sink.
+- `setup_fetch_context` walks PCI for a class-0x02 device, inits the e1000, runs DHCP, and records the fetch context via `crate::fetch::set_context` so the Lua REPL's `fetch()` works. Returns `true` on success.
 - `tftp_download` uses the shared `common::tftp::udp_payload` / `common::tftp::build_udp_frame` helpers (same as UEFI and ARM64 bare-metal).
 
 ### `bios/src/mem.rs` — BIOS extended memory allocation
@@ -378,7 +383,7 @@ The following details apply to the common e1000 driver used by all three targets
 - Tables are per-table fixed slot arrays `TableRec { slots: [TableSlot; 8], len: u8 }`. A shared slot pool was abandoned because nested table literals interleaved pool slots, so one table's fields landed outside its search range ("attempt to index a non-table value").
 - Supported subset: ints, strings, booleans, `nil`, locals/globals, `+ - * / %`, comparisons, `and/or/not`, `..` concat, `if/elseif/else`, `while`, numeric `for`, named `function`/`return`, tables (array/`name =`/`[expr]` fields, `t.key`, `t[key]`), `print()`, `--` comments. No closures, floats, `repeat`, `break`, or multiple assignment.
 - `run(data, putc)` is the entry point: lex → parse → eval with a `MAX_STEPS` instruction cap. The `putc` callback does char output, so the same script runs under the host harness and on-device (PL011 UART via `uart::putc`).
-- `run_with_fetch(data, putc, fetch)` / `LuaState::run_with_fetch` register a host `fetch` callback before running. The host sets `LuaState.fetch: Option<fn(&str) -> Option<usize>>` (default `None`); the `fetch("file")` builtin calls it with the filename and returns the downloaded byte count as a Lua number, or `nil` on failure. `None` callback → runtime error `"fetch not available"`. Value dispatch: `Value::Native(0)` = `print`, `Value::Native(1)` = `fetch` (both registered as globals in `LuaState::run`).
+- `run_with_fetch(data, putc, fetch)` / `LuaState::run_with_fetch` register a host `fetch` callback before running. The host sets `LuaState.fetch: Option<fn(&str) -> Option<usize>>` (default `None`); the `fetch("file")` builtin calls it with the filename and returns the downloaded byte count as a Lua number, or `nil` on failure. `None` callback → runtime error `"fetch not available"`. Value dispatch: `Value::Native(0)` = `print`, `Value::Native(1)` = `fetch` (both registered as globals in `LuaState::run`). The REPL is fed the same callback by the menu's Lua Shell choice (see each target's `main.rs`), so `fetch()` also works interactively, not just from PXE scripts.
 - `lua/demo/test.lua` is the PXE demo (fib, tables, for-loop, concat) and also calls `fetch("test.txt")` / `fetch("rust_payload.bin")`, printing each file's byte count or `FAILED`. Its exact host output is asserted by the `demo_script` test with a mock fetch callback.
 
 ### `romwrap/src/main.rs` — PCI expansion ROM wrapper
@@ -420,7 +425,7 @@ All targets support PXE boot via DHCP options 66 (TFTP server) and 67 (bootfile 
    - **ARM64 bare-metal**: ELF64 files → parse headers, load segments, jump to entry.
    - **ARM64 bare-metal**: `.lua` files → execute in place with the built-in Lua interpreter (`lua::run_with_fetch` with the host `fetch_file` callback).
    - **All targets**: Text files → display via `puts`. Binary files → print size only.
-5. **`fetch()` builtin**: While a PXE `.lua` script runs, the host registers a TFTP download callback (`fetch_file`). `fetch("file")` downloads `file` from the DHCP `next_server` and returns its byte count (or `nil` on failure), so scripts can pull multiple files (e.g. a kernel + initrd). Downloaded files are kept in host memory: `uefi/src/fetch.rs` uses a lazily-allocated 16 MB `AllocatePool` region split into 4 slots (`MAX_FETCH_FILES`); `arm64-bare/src/fetch.rs` uses a 16 MB static BSS buffer (no heap). Both are reset per script run by `set_context`, called right before `lua::run_with_fetch` in `pxe_boot_*` / `pxe_boot`.
+5. **`fetch()` builtin**: The host registers a TFTP download callback (`fetch_file`) on the Lua interpreter both for PXE `.lua` scripts (via `lua::run_with_fetch`) and for the interactive REPL (the menu's Lua Shell choice calls `net::setup_fetch_context()` first). `fetch("file")` downloads `file` from the DHCP `next_server` and returns its byte count (or `nil` on failure), so scripts can pull multiple files (e.g. a kernel + initrd). Downloaded files are kept in host memory: `uefi/src/fetch.rs` uses a lazily-allocated 16 MB `AllocatePool` region split into 4 slots (`MAX_FETCH_FILES`); `arm64-bare/src/fetch.rs` uses a 16 MB static BSS buffer (no heap). Both are reset per script run by `set_context`, called right before `lua::run_with_fetch` in `pxe_boot_*` / `pxe_boot`, and by `net::setup_fetch_context()` when the Lua Shell menu choice is entered.
 
 ### QEMU Built-in TFTP Server
 
@@ -523,13 +528,23 @@ QEMU's user-mode networking (`-netdev user`) includes a built-in TFTP server tha
 
 54. **ARM64 UEFI DHCP requires restart_snp**: The ARM64 virtio SNP driver has a single-transmit limit. After one transmit, subsequent transmits fail with `EFI_NOT_READY`. Fix: call `restart_snp` before each DHCP transmit attempt on ARM64 (`#[cfg(target_arch = "aarch64")]`). This resets the SNP driver state and recycles TX buffers.
 
-55. **ARM64 UEFI PXE boot limitations**: ARM64 UEFI only supports virtio-net-pci (no e1000), so we can't use direct MMIO for TFTP. The virtio SNP has reliability issues with receive operations and single-transmit limits. Full PXE boot (DHCP + ARP + DNS + TFTP) is not reliably supported on ARM64 UEFI. The current implementation supports DHCP with restart_snp, but ARP/DNS/TFTP may fail. For reliable PXE boot on ARM64, use the bare-metal target (`aarch64-bare`) with e1000.
+55. **ARM64 UEFI PXE boot via direct e1000 works**: With an e1000 NIC (as `run-aarch64-uefi` uses), ARM64 UEFI finds no SNP (the firmware only exposes SNP for `virtio-net-pci`), falls to tier 4 (direct PCI scan + direct MMIO e1000), and DHCP + TFTP + Lua execution + `fetch()` all work. The old SNP-only `restart_snp` dance is only needed on the virtio-net-pci path. The direct PCI scan prints "Trying direct PCI scan via I/O ports..." even on ARM64 (the strings are not cfg-gated) but actually accesses config space via ECAM.
 
 ### ARM64 bare-metal Lua / TFTP
 
 56. **ARM64 bare-metal stack must fit the Lua interpreter**: `LuaState` is ~38 KB and lives on the stack, and the DHCP/TFTP path already holds ~7 KB of packet buffers. With a 64 KB stack (`link.ld` `. += 0x10000`) the frame overflows into BSS below the stack — no vector table means the CPU silently fetches garbage from address `0x200` and looks like a hang with no error. Enlarged to 512 KB (`. += 0x80000`). Symptom check: an on-device `print("hi")` script produced no `hi` and no error, only silence after "Executing Lua script".
 
-57. **QEMU e1000 appends the 4-byte FCS to RX frames**: The e1000 RX descriptor length (what `try_receive` returns) is the frame length + 4 on QEMU's model. For the final TFTP DATA packet this makes the downloaded buffer 4 bytes too long and the FCS bytes land in the script/binary data (a `.lua` script fails with "unexpected character"; the reported size is 4 bytes too large). All four TFTP receive loops (BIOS, ARM64 bare-metal, and both UEFI paths) bound the payload by the UDP length field via the shared `common::tftp::udp_payload` helper, not the raw Ethernet frame length.
+### ARM64 UEFI stack
+
+57. **ARM64 UEFI firmware stack is too small for the Lua interpreter**: Loaded-image stacks on QEMU virt's EDK2 (aarch64 `QEMU_EFI.fd`) are far smaller than x86_64 OVMF's. The ~38 KB `LuaState` plus the inlined boot path overflows it, producing a data abort (`Synchronous Exception at 0x...`, no register dump) right as `execute_pxe_file` starts — before "Executing Lua script" prints. The whole call chain up to that point shares one inlined frame (`efi_main` → ... → `pxe_boot_e1000`), so SP does not move until the interpreter's `LuaState::new()` drops it ~57 KB below entry SP. Fix: on ARM64, `efi_main` allocates a 1 MiB `AllocatePages` region and switches SP onto it before running `boot_loop`. x86_64 OVMF's stack is large enough and does not need this.
+
+58. **`find_e1000_bar0` must enable the PCI command register**: ARM64 UEFI firmware does NOT configure the e1000 (no SNP), so its PCI command register reads 0. `find_e1000_bar0` now writes `cmd | 0x06` (Memory Space + Bus Master) before returning BAR0; without this, `DirectMmioE1000::init` fails on ARM64 (MMIO reset works but link/DMA does not — gotcha 17 applies). The tier-4 `scan_pci_direct` path already did this; the REPL `setup_fetch_context` (added for REPL `fetch()`) now does too via `find_e1000_bar0`.
+
+59. **QEMU e1000 appends the 4-byte FCS to RX frames**: The e1000 RX descriptor length (what `try_receive` returns) is the frame length + 4 on QEMU's model. For the final TFTP DATA packet this makes the downloaded buffer 4 bytes too long and the FCS bytes land in the script/binary data (a `.lua` script fails with "unexpected character"; the reported size is 4 bytes too large). All four TFTP receive loops (BIOS, ARM64 bare-metal, and both UEFI paths) bound the payload by the UDP length field via the shared `common::tftp::udp_payload` helper, not the raw Ethernet frame length.
+
+60. **DHCP OFFER arrives late — the poll window must tolerate timeouts**: dnsmasq (the OpenWrt PXE server) runs ARP conflict-detection probes before sending the DHCP OFFER, so the OFFER can land well after the DISCOVER. The old `dhcp_run` in `bios/src/net.rs` and `arm64-bare/src/net.rs` did `try_receive(base, &mut buf, 25_000_000)?` — the `?` aborts on the FIRST timeout, so the total wait was just one 25M window (~0.25 s under TCG) and DHCP failed ~1/3 of the time against the OpenWrt server even though the OFFER demonstrably arrived at the NIC (verified with `filter-dump` pcaps). Fix: `try_receive` at 100M iterations per try and tolerate timeouts (no `?`) across up to 4 tries, parsing each received packet and discarding non-DHCP traffic. The UEFI direct-e1000 `dhcp_run` already used a large window (200M per receive, 100 attempts) and was never affected.
+
+61. **Shared RX buffer corrupts concurrent packets**: The e1000 RX descriptors originally all pointed at one shared `RX_BUF`, so when the DHCP OFFER and an ARP probe arrived back-to-back, the second DMA overwrote the first — `try_receive` then returned the OFFER descriptor's length (360) with the ARP's content (ethertype `0x0806`), the DHCP loop discarded it, and the shell spun "stuck" on ARPs forever. Symptom: `Received packet (360 bytes, ethertype=0x0806)` followed by endless 64-byte `0x0806` skips. Fix: per-descriptor buffers `RX_BUFS: [[u8; 2048]; NUM_RX_DESC]` (see `common/src/e1000.rs`).
 
 ## Makefile Targets
 
@@ -578,9 +593,9 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 192 tests across all crates
+cargo test --workspace        # All 219 tests across all crates
 cargo test --package common   # 97 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection, bootfile BOOTP-file fallback)
-cargo test --package lua      # 17 tests (lexer, parser, evaluator, demo script output)
+cargo test --package lua      # 44 tests (lexer, parser, evaluator, demo script output, REPL fetch)
 cargo test --package uefi     # 33 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
 cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
@@ -589,7 +604,7 @@ cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, ent
 | Crate | Tests | What's tested |
 |-------|-------|---------------|
 | `common` | 97 | `format_hex` edge cases (zero, leading-zero suppression, all nibbles, 64-bit, truncation), `format_dec` (zero, round numbers, max u64, powers of 10/2, boundaries), `DeviceInfo` construction, `scan_devices` with mock detectors (0/1/multiple devices, non-present skipping), ARP request build + reply parse (valid, wrong IP, not ARP, request not reply, too short), DNS query build (header, name encoding, single label), DNS frame build (layout, IP checksum), DNS response parse (valid, wrong ID, rcode error, no answers, not UDP, wrong src port), DNS name skip (normal, pointer, root), `same_subnet` (same, different, class B, full mask, zero mask), TFTP RRQ/OACK/DATA/ACK packet build/parse, block size negotiation, UDP frame build (headers, IP checksum, payload placement), `udp_payload` extraction (strips trailing FCS, rejects non-IPv4/too-short), file format detection (PE/COFF, ELF32, ELF64, Multiboot, Multiboot2, text, binary), DHCP bootfile from BOOTP `file` field with option 67 override |
-| `lua` | 17 | Lexer tokens, parser AST structure (if/elseif/else, while, numeric for, function args, table fields), evaluator (arithmetic, comparisons, locals/globals, recursion, nested tables, concat, `print`), demo script exact output |
+| `lua` | 44 | Lexer tokens, parser AST structure (if/elseif/else, while, numeric for, function args, table fields), evaluator (arithmetic, comparisons, locals/globals, recursion, nested tables, concat, `print`), demo script exact output, `fetch()` with mock callback, REPL (prompt, echo/backspace, error handling, state persistence, help, fetch works/fails) |
 | `uefi`/`efi` | 33 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
 | `arm64-bare`/`pci` | 21 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 12 subclass codes including unassigned, unknown fallback) |
 | `romwrap` | 24 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`/`0x00`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, BIOS entry routine, block count consistency, PCIR length field matching, empty/boundary-aligned/overlapping payload sizes |

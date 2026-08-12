@@ -93,6 +93,49 @@ pub fn scan_network() {
     puts("  No network adapters found.\n");
 }
 
+/// Establish network connectivity so the Lua REPL `fetch()` builtin can
+/// download files from the DHCP TFTP server. Walks PCI for a class-0x02
+/// device, initializes its e1000 NIC, runs DHCP, and records the fetch
+/// context via [`crate::fetch::set_context`]. Returns `true` on success.
+pub fn setup_fetch_context() -> bool {
+    puts("Setting up network for fetch()...\n");
+
+    for dev in 0..32u8 {
+        let id = pci::pci_read32(0, dev, 0, 0);
+        if id == 0xFFFF_FFFF {
+            continue;
+        }
+        let cls = pci::pci_class(0, dev, 0);
+        if cls != 0x02 {
+            continue;
+        }
+
+        pci::pci_enable_bars(0, dev, 0);
+        let bar0 = pci::pci_read32(0, dev, 0, 0x10) & !0xF;
+        if bar0 == 0 {
+            continue;
+        }
+
+        let bar0_u64 = bar0 as u64;
+        let mac = match e1000_common::init(bar0_u64) {
+            Some(mac) => mac,
+            None => continue,
+        };
+
+        match dhcp_run(bar0_u64, &mac) {
+            Some(cfg) => {
+                crate::fetch::set_context(bar0_u64, &mac, &cfg);
+                puts("  fetch() ready.\n");
+                return true;
+            }
+            None => continue,
+        }
+    }
+
+    puts("  fetch() unavailable (no network adapter).\n");
+    false
+}
+
 /// Print a MAC address as `XX:XX:XX:XX:XX:XX` to the global print sink.
 fn print_mac(mac: &[u8; 6]) {
     for i in 0..6 {
@@ -132,11 +175,17 @@ fn dhcp_run(base: u64, mac: &[u8; 6]) -> Option<DhcpConfig> {
     }
     puts("sent ");
 
+    // Poll for the DHCP OFFER. dnsmasq runs ARP conflict-detection probes
+    // before offering, so the OFFER can arrive well after the DISCOVER. A
+    // single `try_receive` window is too short under QEMU TCG (AGENTS.md), so
+    // tolerate timeouts instead of aborting on the first one and keep going
+    // past ARP/other traffic that parse_response discards.
     let mut buf = [0u8; 1514];
     for _retry in 0..4u32 {
-        let copy_len = e1000_common::try_receive(base, &mut buf, 25_000_000)?;
-        if let Some(cfg) = dhcp::parse_response(&buf, copy_len, xid, mac) {
-            return Some(cfg);
+        if let Some(copy_len) = e1000_common::try_receive(base, &mut buf, 100_000_000) {
+            if let Some(cfg) = dhcp::parse_response(&buf, copy_len, xid, mac) {
+                return Some(cfg);
+            }
         }
     }
     None

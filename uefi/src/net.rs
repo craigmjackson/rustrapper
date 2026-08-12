@@ -220,7 +220,8 @@ impl DirectMmioE1000 {
 }
 
 
-/// Scan PCI bus for e1000 and return its BAR0 address.
+/// Scan PCI bus for an e1000, enable its Memory Space + Bus Master command
+/// bits (needed for MMIO + DMA), and return its BAR0 address.
 fn find_e1000_bar0() -> Option<u64> {
     for bus in 0..=255u16 {
         for dev in 0..32u8 {
@@ -234,12 +235,55 @@ fn find_e1000_bar0() -> Option<u64> {
                 let device = (vendor_dev >> 16) as u16;
                 if vendor == 0x8086 && device == 0x100E {
                     let bar0 = pci_read_config32(bus as u8, dev, func, 0x10) & !0xF;
-                    if bar0 != 0 { return Some(bar0 as u64); }
+                    if bar0 != 0 {
+                        let cmd = pci_read_config32(bus as u8, dev, func, 0x04);
+                        pci_write_config32(bus as u8, dev, func, 0x04, cmd | 0x06);
+                        return Some(bar0 as u64);
+                    }
                 }
             }
         }
     }
     None
+}
+
+/// Establish network connectivity so the Lua REPL `fetch()` builtin can
+/// download files from the DHCP TFTP server. Uses the same direct MMIO e1000
+/// path as `fetch()` (SNP is not needed for TFTP). Returns `true` on success.
+pub fn setup_fetch_context() -> bool {
+    let st = match unsafe { crate::SYSTEM_TABLE } {
+        Some(st) => st,
+        None => return false,
+    };
+    let con_out = unsafe { &*st.con_out };
+
+    w16(con_out, "Setting up network for fetch()...\r\n");
+    let bar0 = match find_e1000_bar0() {
+        Some(b) => b,
+        None => {
+            w16(con_out, "  fetch() unavailable (no e1000 found).\r\n");
+            return false;
+        }
+    };
+
+    let e1000 = DirectMmioE1000::new(bar0);
+    if !e1000.init() {
+        w16(con_out, "  fetch() unavailable (e1000 init failed).\r\n");
+        return false;
+    }
+
+    let mac = e1000.read_mac();
+    match e1000.dhcp_run() {
+        Some(cfg) => {
+            crate::fetch::set_context(st, bar0, &mac, &cfg);
+            w16(con_out, "  fetch() ready.\r\n");
+            true
+        }
+        None => {
+            w16(con_out, "  fetch() unavailable (DHCP failed).\r\n");
+            false
+        }
+    }
 }
 
 /// TFTP download using direct e1000 MMIO (same path as BIOS)

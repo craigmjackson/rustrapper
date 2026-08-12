@@ -108,7 +108,7 @@ static mut TX_DESCS: TxDescs = TxDescs([TxDesc {
 }; NUM_TX_DESC]);
 
 #[cfg(not(test))]
-static mut RX_BUF: [u8; RX_BUFFER_SIZE] = [0u8; RX_BUFFER_SIZE];
+static mut RX_BUFS: [[u8; RX_BUFFER_SIZE]; NUM_RX_DESC] = [[0u8; RX_BUFFER_SIZE]; NUM_RX_DESC];
 #[cfg(not(test))]
 static mut TX_BUF: [u8; 2048] = [0u8; 2048];
 
@@ -199,9 +199,11 @@ pub fn init(base: u64) -> Option<[u8; 6]> {
 
     #[cfg(not(test))]
     unsafe {
-        let rx_buf_addr = core::ptr::addr_of!(RX_BUF) as *const u8 as u64;
+        // Each descriptor gets its own buffer so concurrent packets (e.g. the
+        // DHCP OFFER plus dnsmasq's ARP probes) can't overwrite each other.
         for i in 0..NUM_RX_DESC {
             let desc = &raw mut RX_DESCS.0[i];
+            let rx_buf_addr = core::ptr::addr_of!(RX_BUFS[i]) as *const u8 as u64;
             write_volatile(core::ptr::addr_of_mut!((*desc).addr), rx_buf_addr);
         }
         let tx_buf_addr = core::ptr::addr_of!(TX_BUF) as *const u8 as u64;
@@ -313,7 +315,7 @@ pub fn try_receive(base: u64, buf: &mut [u8; 1514], timeout_iters: u64) -> Optio
                     let len = read_volatile(core::ptr::addr_of!((*desc).length)) as usize;
                     let copy_len = if len > 1514 { 1514 } else { len };
                     core::ptr::copy_nonoverlapping(
-                        core::ptr::addr_of!(RX_BUF) as *const u8,
+                        core::ptr::addr_of!(RX_BUFS[idx]) as *const u8,
                         buf.as_mut_ptr(),
                         copy_len,
                     );
