@@ -22,13 +22,24 @@ BARE_ARM64_TARGET := aarch64-unknown-none
         run-x86_64-uefi run-aarch64-uefi run-aarch64-bare \
         run-x86_64-uefi-rom run-i386-bios-rom \
         i386-bios run-i386-bios check-deps \
-        pxe-start pxe-stop tftp-root
+        pxe-start pxe-stop tftp-root \
+        native run-native
 
-all: x86_64-uefi aarch64-uefi aarch64-bare i386-bios x86_64-uefi-rom i386-bios-rom
+all: x86_64-uefi aarch64-uefi aarch64-bare i386-bios x86_64-uefi-rom i386-bios-rom native
 
 # Create output directory
 $(BIN):
 	mkdir -p $(BIN)
+
+# ── Native Linux (host x86_64) ────────────────────────────────────────────
+# Runs the same menu + Lua interpreter as the firmware targets, with the
+# kernel handling networking. Fast iteration on the Lua interpreter.
+native: $(shell find native common lua -name '*.rs') Cargo.toml | $(BIN)
+	CARGO_TARGET_DIR=target $(CARGO) build --package native --release
+	cp target/release/native $(BIN)/rustrapper_native
+
+run-native: native
+	./$(BIN)/rustrapper_native
 
 # ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
 # Loads 80 sectors (LBA 1-80, 40960 bytes) to 0x8000 and jumps there.

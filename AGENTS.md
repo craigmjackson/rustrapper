@@ -2,7 +2,7 @@
 
 ## Overview
 
-Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, and PCI expansion ROMs. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP). The ARM64 bare-metal and both UEFI PXE paths can execute `.lua` scripts served over TFTP with a built-in no_std Lua interpreter (`lua/` crate).
+Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications, ARM64 bare-metal binaries, PCI expansion ROMs, and a native Linux x86_64 binary. On startup, all variants present a menu to choose between scanning storage devices or booting from network (DHCP). The ARM64 bare-metal and both UEFI PXE paths can execute `.lua` scripts served over TFTP with a built-in no_std Lua interpreter (`lua/` crate). The native target runs the same menu + Lua interpreter on the host OS with the kernel handling networking.
 
 ## Agent Rules
 
@@ -12,7 +12,7 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 
 ```
 .
-├── Cargo.toml              # Workspace root (6 member crates)
+├── Cargo.toml              # Workspace root (7 member crates)
 ├── Makefile                # Build orchestration (make all, make run-*)
 ├── AGENTS.md               # This file
 ├── bios/                   # Rust 32-bit BIOS stage2 (nightly only)
@@ -75,6 +75,14 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
+├── native/                 # Native Linux x86_64 binary (std, no_std deps)
+│   ├── Cargo.toml          # Depends only on common + lua (no external crates)
+│   └── src/
+│       ├── main.rs         # Menu loop, raw-terminal input (termios via inline
+│       │                   #   syscalls), storage scan via /sys/block
+│       ├── net.rs          # Kernel networking: gateway/IP from /proc + std UDP
+│       │                   #   TFTP client (reuses common::tftp wire protocol)
+│       └── fetch.rs        # Lua `dhcp` + `fetch()` host callbacks (std Mutex)
 └── tftp-root/              # Files served via the OpenWrt PXE server (auto-generated)
     ├── rustrapper.efi      # UEFI bootloader
     ├── rust_payload.bin    # BIOS bootloader
@@ -399,6 +407,14 @@ The following details apply to the common e1000 driver used by all three targets
 - Supports `--vendor=` and `--device=` flags for custom PCI IDs.
 - Supports `--bios` flag for legacy BIOS ROMs (accepts any binary, not just PE/COFF).
 
+### `native/` — Native Linux x86_64 target
+
+- A std binary (`x86_64-linux-gnu`) that links the `common` (menu/print/scan/tftp-protocol) and `lua` crates — both `#![no_std]` libs — so it runs the same menu and Lua interpreter as the firmware targets with **zero external crate dependencies**. Exists for fast iteration on the Lua interpreter.
+- `main.rs`: sets a raw terminal (termios via inline `syscall`s — no libc), presents the `[1]/[2]/[3]` menu via `common::menu::show_menu`, and runs the Lua REPL via `lua::repl::repl_loop`. Ctrl-C (ISIG cleared, byte 0x03) and Ctrl-D restore the terminal and exit. Storage scan enumerates `/sys/block`.
+- `net.rs`: the kernel handles networking. `setup_fetch_context` discovers the (TFTP server, local IP) from `/proc/net/route` (default gateway, little-endian hex) and the UDP connect-to-discover-local-IP trick; overridable via `RUSTWRAPPER_TFTP_SERVER` / `RUSTWRAPPER_TFTP_PORT` (default 69) / `RUSTWRAPPER_BOOTFILE` (default `test.lua`). `tftp_download` is a std UDP client reusing `common::tftp`'s `build_rrq`/`parse_data`/`build_ack`/`parse_oack` and the `TftpSink` trait (no e1000, no raw packets).
+- `fetch.rs`: `dhcp_fn` (the `dhcp` builtin) discovers the network and enables `fetch_file`; downloads are kept in `std::sync::Mutex`-backed Vecs.
+- Built by `make native` → `bin/rustrapper_native`; run with `make run-native`.
+
 ### `Makefile` — Build orchestration
 
 - Top-level targets: `all`, `x86_64-uefi`, `aarch64-uefi`, `aarch64-bare`, `x86_64-uefi-rom`, `i386-bios-rom`, `run-*`, `clean`.
@@ -557,12 +573,14 @@ make aarch64-uefi                # Build ARM64 UEFI binary
 make aarch64-bare                # Build Rust ARM64 bare-metal
 make x86_64-uefi-rom             # Build UEFI PCI expansion ROM from rustrapper.efi
 make i386-bios-rom               # Build BIOS PCI expansion ROM from rust_payload.bin
+make native                      # Build native Linux x86_64 binary
 make run-i386-bios                # BIOS stage2 (serial, Ctrl-A X to exit)
 make run-i386-bios-rom            # Legacy BIOS with PCI expansion ROM (rust_payload.bin)
 make run-x86_64-uefi             # x86_64 UEFI via FAT dir (e1000, full DHCP)
 make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
 make run-aarch64-uefi            # ARM64 UEFI from FAT directory
 make run-aarch64-bare            # ARM64 bare-metal + AHCI drive
+make run-native                  # Run the native Linux binary interactively
 make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
 make x86_64-seabios-clean        # Remove SeaBIOS checkout
 ```
@@ -583,6 +601,7 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 | `aarch64-unknown-uefi`          | ARM64  | UEFI              | `bin/rustrapper_arm64.efi`         |
 | `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/rustrapper_arm64_bare.elf`    |
 | `x86_64-linux-gnu` (romwrap)    | Host   | —                 | `target/debug/romwrap`           |
+| `x86_64-linux-gnu` (native)     | Host   | —                 | `bin/rustrapper_native`          |
 | `i386-unknown-none` (BIOS)      | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | `i386-unknown-none` (Rust BIOS) | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
@@ -594,12 +613,13 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 226 tests across all crates
+cargo test --workspace        # All 228 tests across all crates
 cargo test --package common   # 97 tests (formatting, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection, bootfile BOOTP-file fallback)
 cargo test --package lua      # 51 tests (lexer, parser, evaluator, global keyword, dhcp builtin, demo script output, REPL fetch/dhcp)
 cargo test --package uefi     # 33 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
 cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases)
+cargo test --package native   # 2 tests (route hex decode, RRQ build via common::tftp)
 ```
 
 | Crate | Tests | What's tested |
@@ -609,6 +629,7 @@ cargo test --package romwrap  # 24 tests (PCIR layout, BIOS/UEFI code types, ent
 | `uefi`/`efi` | 33 | Struct sizes under `repr(C)`, GUID byte values (all 5 GUIDs), `EFI_SUCCESS=0`, type consistency (UINTN=8 bytes, EFI_HANDLE=pointer size), GUID uniqueness, SNP mode layout, SNP transmit/receive function offsets, `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` / `EFI_INPUT_KEY` sizes, PCI IO protocol struct sizes, `EFI_PCI_IO_PROTOCOL_WIDTH` enum values, boot service offset consistency |
 | `arm64-bare`/`pci` | 21 | `pci_off` bit-field encoding (bus/dev/func/offset combinations, max values), `storage_name` mapping (all 12 subclass codes including unassigned, unknown fallback) |
 | `romwrap` | 24 | PCIR signature/offset/fields, ROM header `0xAA55`/init vector, code type `0x03`/`0x00`, indicator `0x80`, 512-byte alignment, vendor/device ID passthrough, PE/COFF preservation, BIOS entry routine, block count consistency, PCIR length field matching, empty/boundary-aligned/overlapping payload sizes |
+| `native` | 2 | `/proc/net/route` little-endian gateway hex decode, RRQ build reusing `common::tftp` |
 
 **Test architecture**: `common` tests run directly on the host. `lua` tests run on the host via `extern crate std` under `#[cfg(test)]` while target builds stay `#![no_std]`. `uefi` tests run on the host by guarding platform-specific code with `#[cfg(not(test))]` and using `#[cfg_attr(not(test), no_std)]` / `#[cfg_attr(not(test), no_main)]` so the standard test harness can drive them. `arm64-bare` tests similarly guard the ARM64 `global_asm!` entry point and the `extern "C" fn main` behind `#[cfg(not(test))]`, exposing only pure functions (`pci_off`, `storage_name`) for host testing.
 
