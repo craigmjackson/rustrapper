@@ -30,6 +30,7 @@ pub enum Tok {
     Break,
     Repeat,
     Until,
+    Goto,
     Function,
     Local,
     Global,
@@ -55,6 +56,7 @@ pub enum Tok {
     DotDot,
     Semi,
     Colon,
+    ColonColon,
     Equals,
     EqEq,
     Neq,
@@ -199,8 +201,13 @@ impl<'a> Lexer<'a> {
                 }
             }
             b':' => {
-                self.pos += 1;
-                Ok(Tok::Colon)
+                if self.pos + 1 < self.src.len() && self.src[self.pos + 1] == b':' {
+                    self.pos += 2;
+                    Ok(Tok::ColonColon)
+                } else {
+                    self.pos += 1;
+                    Ok(Tok::Colon)
+                }
             }
             b'=' => {
                 if self.pos + 1 < self.src.len() && self.src[self.pos + 1] == b'=' {
@@ -278,6 +285,7 @@ impl<'a> Lexer<'a> {
             b"in" => Tok::In,
             b"repeat" => Tok::Repeat,
             b"until" => Tok::Until,
+            b"goto" => Tok::Goto,
             b"function" => Tok::Function,
             b"local" => Tok::Local,
             b"global" => Tok::Global,

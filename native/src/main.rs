@@ -216,6 +216,7 @@ fn main() {
                 state.register_builtins(print::putc);
                 state.set_fetch(None);
                 state.set_dhcp(Some(net::dhcp_fn));
+                state.set_load(Some(crate::fetch::load_file));
                 lua::repl::repl_loop(&mut state, get_key, print::putc, print::puts);
             }
         }

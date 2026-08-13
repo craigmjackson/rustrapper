@@ -9,6 +9,9 @@ pub enum ExecResult {
     Ret(Value),
     /// `break` — unwinds to the innermost loop, which stops iterating.
     Break,
+    /// `goto` — jump to the label node. Unwinds through block frames until the
+    /// block whose chain contains the target, which resumes execution there.
+    Goto(u16),
     Shell,
     Exit,
 }
@@ -16,15 +19,42 @@ pub enum ExecResult {
 /// Execute the top-level script (its own scope frame).
 pub fn exec_script(s: &mut LuaState, first: u16) -> Result<(), &'static str> {
     s.push_frame()?;
-    let r = exec_chain(s, first);
+    let r = run_chain(s, first);
     s.pop_frame();
     match r {
         Ok(ExecResult::Normal) => Ok(()),
         Ok(ExecResult::Ret(_)) => Ok(()),
         Ok(ExecResult::Break) => Err("break outside loop"),
+        Ok(ExecResult::Goto(_)) => Err("unknown label"),
         Ok(ExecResult::Shell) | Ok(ExecResult::Exit) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Run a block's statement chain, resolving `goto` targets that land inside
+/// this chain (forward/backward jumps within the block). A `goto` whose target
+/// lies in an enclosing block's chain propagates upward as [`ExecResult::Goto`]
+/// after this block's frame has been popped.
+fn run_chain(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> {
+    let mut n = first;
+    loop {
+        match exec_chain(s, n)? {
+            ExecResult::Goto(t) if chain_contains(s, first, t) => n = t,
+            r => return Ok(r),
+        }
+    }
+}
+
+/// Whether `target` is a node in the chain that starts at `first`.
+fn chain_contains(s: &LuaState, first: u16, target: u16) -> bool {
+    let mut n = first;
+    while n != NO_NODE {
+        if n == target {
+            return true;
+        }
+        n = s.next[n as usize];
+    }
+    false
 }
 
 /// Run a statement chain in the current frame.
@@ -36,7 +66,12 @@ fn exec_chain(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> 
             return Err("step limit exceeded");
         }
         match exec_stmt(s, n)? {
-            ExecResult::Normal => n = s.next[n as usize],
+            ExecResult::Normal => {
+                n = match s.nodes[n as usize] {
+                    Node::Goto(t) => return Ok(ExecResult::Goto(t)),
+                    _ => s.next[n as usize],
+                }
+            }
             r => return Ok(r),
         }
     }
@@ -94,7 +129,7 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
 /// Run a block with its own fresh scope frame.
 fn exec_block(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> {
     s.push_frame()?;
-    let r = exec_chain(s, first);
+    let r = run_chain(s, first);
     s.pop_frame();
     r
 }
@@ -177,7 +212,7 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                     return Err("step limit exceeded");
                 }
                 s.push_frame()?;
-                let r = exec_chain(s, body);
+                let r = run_chain(s, body);
                 match r {
                     Ok(ExecResult::Normal) => {
                         // Evaluate the condition in the body's scope, so locals
@@ -286,6 +321,8 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             Ok(result)
         }
         Node::BreakStmt => Ok(ExecResult::Break),
+        Node::Label(_) => Ok(ExecResult::Normal),
+        Node::Goto(t) => Ok(ExecResult::Goto(t)),
         Node::ReturnStmt(v) => {
             let r = if v != NO_NODE { eval(s, v)? } else { Value::Nil };
             Ok(ExecResult::Ret(r))
@@ -356,6 +393,7 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
                 ExecResult::Normal => Ok(Value::Nil),
                 ExecResult::Ret(v) => Ok(v),
                 ExecResult::Break => Err("break outside loop"),
+                ExecResult::Goto(_) => Err("goto outside function"),
                 ExecResult::Shell => Ok(Value::Shell),
                 ExecResult::Exit => Ok(Value::Exit),
             }
@@ -425,6 +463,27 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 _ => return Err("fetch expects a string filename"),
             }
         }
+        Value::Native(2) => {
+            // dofile(filename): load, parse, and execute a Lua chunk, returning
+            // the chunk's return value (or nil). Errors propagate to the caller.
+            if argc != 1 {
+                return Err("dofile expects 1 argument");
+            }
+            match argbuf[0] {
+                Value::Str(r) => {
+                    let bytes = s.str_bytes(r);
+                    if bytes.len() >= 128 {
+                        return Err("dofile filename too long");
+                    }
+                    let mut nbuf = [0u8; 128];
+                    nbuf[..bytes.len()].copy_from_slice(bytes);
+                    let name = core::str::from_utf8(&nbuf[..bytes.len()])
+                        .map_err(|_| "dofile filename must be ASCII")?;
+                    ExecResult::Ret(dofile_exec(s, name)?)
+                }
+                _ => return Err("dofile expects a string filename"),
+            }
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");
@@ -451,12 +510,13 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 let val = if p < argc as usize { argbuf[p] } else { Value::Nil };
                 s.declare_local(name, val)?;
             }
-            let r = exec_chain(s, fd.body);
+            let r = run_chain(s, fd.body);
             s.pop_frame();
             match r {
                 Ok(ExecResult::Normal) => ExecResult::Normal,
                 Ok(ExecResult::Ret(v)) => ExecResult::Ret(v),
                 Ok(ExecResult::Break) => return Err("break outside loop"),
+                Ok(ExecResult::Goto(_)) => return Err("goto outside function"),
                 Ok(ExecResult::Shell) => ExecResult::Shell,
                 Ok(ExecResult::Exit) => ExecResult::Exit,
                 Err(e) => return Err(e),
@@ -467,6 +527,40 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
 
     s.vsp = base as u32;
     Ok(result)
+}
+
+/// `dofile(name)`: load a Lua chunk via the host `load` callback, parse it in
+/// the current state, and run it in a fresh frame. Returns the chunk's return
+/// value (`nil` if it doesn't return). The chunk shares globals with its
+/// caller but has its own locals; errors propagate to the caller.
+fn dofile_exec(s: &mut LuaState, name: &str) -> Result<Value, &'static str> {
+    let load = s.load;
+    let mut buf = [0u8; super::DOFILE_CAP];
+    let n = match load {
+        Some(f) => f(name, &mut buf),
+        None => return Err("dofile not available (no file loader)"),
+    };
+    let n = n.ok_or("cannot open file")?;
+    if n > buf.len() {
+        return Err("file too large");
+    }
+    let src = &buf[..n];
+    let first = {
+        let mut p = super::parse::Parser::new(src, s);
+        p.parse_script()?
+    };
+    s.push_frame()?;
+    let r = run_chain(s, first);
+    s.pop_frame();
+    match r {
+        Ok(ExecResult::Normal) => Ok(Value::Nil),
+        Ok(ExecResult::Ret(v)) => Ok(v),
+        Ok(ExecResult::Break) => Err("break outside loop"),
+        Ok(ExecResult::Goto(_)) => Err("unknown label"),
+        Ok(ExecResult::Shell) => Ok(Value::Shell),
+        Ok(ExecResult::Exit) => Ok(Value::Exit),
+        Err(e) => Err(e),
+    }
 }
 
 fn assign(s: &mut LuaState, target: u16, v: Value) -> Result<(), &'static str> {

@@ -91,7 +91,12 @@ pub fn execute_pxe_file(
     if filename.ends_with(".lua") {
         puts("Executing Lua script\n");
         let data = unsafe { core::slice::from_raw_parts(buffer, size) };
-        match lua::run_with_fetch(data, crate::u16_putc, crate::fetch::fetch_file) {
+        match lua::run_with_fetch_load(
+            data,
+            crate::u16_putc,
+            crate::fetch::fetch_file,
+            crate::fetch::load_file,
+        ) {
             Ok(()) => puts("Lua script done\n"),
             Err(e) => {
                 puts("Lua error: ");

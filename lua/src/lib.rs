@@ -10,6 +10,9 @@
 //! - `if` / `elseif` / `else` / `end`, `while ... do ... end`, `repeat ... until
 //!   cond` (runs the body at least once; locals from the body are visible in the
 //!   condition), `break` (inside `while` / `repeat` / `for` / `for ... in` loops)
+//! - `goto name` / `::name::` labels — jump to a label in the same block or an
+//!   enclosing block (can jump out of a block but not into a nested one, and
+//!   never across a function boundary)
 //! - Numeric `for i = a, b [, step] do ... end`
 //! - Generic `for k [, v] in table do ... end` (iterates a table's key/value
 //!   pairs; the `in` keyword) — array fields iterate `1..n`, named fields by key
@@ -23,6 +26,12 @@
 //!   `next_server`) into host memory and returns its byte count as a number,
 //!   or `nil` if the download fails. Requires a host callback, so scripts
 //!   using it must run through [`LuaState::run_with_fetch`] / [`run_with_fetch`].
+//! - `dofile("file")` builtin: loads a Lua source chunk by name (e.g. via
+//!   TFTP), executes it in the current interpreter state, and returns the
+//!   chunk's return value (`nil` if it doesn't return). Errors inside the
+//!   chunk propagate to the caller. Requires a host loader callback, so
+//!   scripts using it must run through [`LuaState::run_with_fetch_load`] /
+//!   [`run_with_fetch_load`].
 //!
 //! Not supported: closures/upvalues, floats, `local function`, anonymous
 //! function literals, string methods, multiple assignment.
@@ -67,6 +76,8 @@ pub const TABLE_SLOTS: usize = 8;
 pub const MAX_TABLES: usize = 16;
 /// Safety cap on total statements executed per script run.
 pub const MAX_STEPS: u64 = 5_000_000;
+/// Scratch buffer used by `dofile()` to hold a loaded Lua chunk while parsing.
+pub const DOFILE_CAP: usize = 4096;
 
 /// Sentinel for "no node" / end-of-chain. Node indices are well below this.
 pub const NO_NODE: u16 = u16::MAX;
@@ -89,7 +100,8 @@ pub enum Value {
     Str(StrRef),
     Table(u16),
     Func(u16),
-    /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`.
+    /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
+    /// `dofile` is `Native(2)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -173,6 +185,11 @@ pub enum Node {
     /// `repeat body until cond` — run `body` at least once, then repeat until
     /// `cond` is true. `cond` is evaluated in the body's scope.
     RepeatStmt(u16, u16),
+    /// `goto name` — jump to the `::name::` label. The payload is the resolved
+    /// label node index (filled in by the parser after block resolution).
+    Goto(u16),
+    /// `::name::` — a label; a no-op jump target for `goto`.
+    Label(StrRef),
     /// `return value` (value node index 0 means `return`).
     ReturnStmt(u16),
 }
@@ -262,6 +279,12 @@ pub struct LuaState {
     /// DHCP) and returns the `fetch` callback if a TFTP server is reachable.
     /// Set by the host before entering the REPL; `None` means `dhcp` errors.
     pub dhcp: Option<fn() -> Option<fn(&str) -> Option<usize>>>,
+    /// Host callback for the `dofile()` builtin: loads the Lua source for
+    /// `name` (e.g. via TFTP) into `buf` and returns its length, or `None` if
+    /// the file can't be loaded. The interpreter owns `buf` (`DOFILE_CAP`
+    /// bytes); the callback must not write past it. `None` means `dofile()`
+    /// errors out.
+    pub load: Option<fn(&str, &mut [u8]) -> Option<usize>>,
 }
 
 fn noop(_c: u8) {}
@@ -310,6 +333,7 @@ impl LuaState {
             putc: noop,
             fetch: None,
             dhcp: None,
+            load: None,
         }
     }
 
@@ -329,6 +353,9 @@ impl LuaState {
         let _ = self.intern(b"dhcp");
         let dhcp_name = self.intern(b"dhcp").unwrap();
         self.set_global(dhcp_name, Value::Dhcp);
+        let _ = self.intern(b"dofile");
+        let dofile_name = self.intern(b"dofile").unwrap();
+        self.set_global(dofile_name, Value::Native(2));
         let _ = self.intern(b"exit");
         let exit_name = self.intern(b"exit").unwrap();
         self.set_global(exit_name, Value::Exit);
@@ -362,6 +389,13 @@ impl LuaState {
         self.dhcp = dhcp;
     }
 
+    /// Install a host `dofile()` callback: loads the Lua source for a filename
+    /// (e.g. via TFTP) into a caller-provided buffer and returns its length.
+    /// Call `set_load(None)` to disable the `dofile` builtin.
+    pub fn set_load(&mut self, load: Option<fn(&str, &mut [u8]) -> Option<usize>>) {
+        self.load = load;
+    }
+
     /// Run the `dhcp` builtin: establish network connectivity and enable the
     /// `fetch` callback. Returns `true` on success, `false` if the network
     /// setup failed, or an error if no host callback is registered.
@@ -387,6 +421,21 @@ impl LuaState {
         fetch: fn(&str) -> Option<usize>,
     ) -> Result<(), &'static str> {
         self.fetch = Some(fetch);
+        self.run(source, putc)
+    }
+
+    /// Run a script with both a host `fetch()` callback and a `dofile()`
+    /// loader callback installed, so the script can download files and run
+    /// `.lua` chunks loaded by name.
+    pub fn run_with_fetch_load(
+        &mut self,
+        source: &[u8],
+        putc: fn(u8),
+        fetch: fn(&str) -> Option<usize>,
+        load: fn(&str, &mut [u8]) -> Option<usize>,
+    ) -> Result<(), &'static str> {
+        self.fetch = Some(fetch);
+        self.load = Some(load);
         self.run(source, putc)
     }
 
@@ -606,6 +655,18 @@ pub fn run_with_fetch(
     state.run_with_fetch(source, putc, fetch)
 }
 
+/// Convenience wrapper: run a script with a fresh [`LuaState`] and both host
+/// `fetch()` and `dofile()` callbacks installed.
+pub fn run_with_fetch_load(
+    source: &[u8],
+    putc: fn(u8),
+    fetch: fn(&str) -> Option<usize>,
+    load: fn(&str, &mut [u8]) -> Option<usize>,
+) -> Result<(), &'static str> {
+    let mut state = LuaState::new();
+    state.run_with_fetch_load(source, putc, fetch, load)
+}
+
 /// Run the interactive Lua REPL. `read_line` should write a line into the
 /// provided buffer and return its length, or `None` when input is exhausted
 /// (exits the REPL). Output from `print()` and the prompt go to `putc`.
@@ -627,6 +688,7 @@ pub fn run_repl(
         match eval::run_repl_once(&mut state, &buf[..len], putc) {
             Ok(eval::ExecResult::Normal) => {}
             Ok(eval::ExecResult::Break) => {}
+            Ok(eval::ExecResult::Goto(_)) => {}
             Ok(eval::ExecResult::Ret(_)) => {}
             Ok(eval::ExecResult::Exit) => break,
             Ok(eval::ExecResult::Shell) => {
@@ -848,6 +910,61 @@ mod tests {
     }
 
     #[test]
+    fn goto_label() {
+        // Forward jump skips statements.
+        assert_eq!(exec("goto skip\nprint(1)\n::skip::\nprint(2)").unwrap(), "2\n");
+        // Backward jump loops.
+        assert_eq!(
+            exec("i = 0\n::top::\ni = i + 1\nprint(i)\nif i < 3 then goto top end").unwrap(),
+            "1\n2\n3\n"
+        );
+        // goto inside an if branch jumps to a label in the enclosing block.
+        assert_eq!(
+            exec("x = 1\nif x == 1 then goto done end\nprint(1)\n::done::\nprint(2)").unwrap(),
+            "2\n"
+        );
+        // continue-style: goto to a label at the end of a loop body.
+        assert_eq!(
+            exec("for i = 1, 3 do\nif i == 2 then goto continue end\nprint(i)\n::continue::\nend").unwrap(),
+            "1\n3\n"
+        );
+        // goto jumping out of a loop entirely.
+        assert_eq!(
+            exec("for i = 1, 10 do\nif i == 2 then goto done end\nend\n::done::\nprint(0)").unwrap(),
+            "0\n"
+        );
+        // goto is scoped within a function.
+        assert_eq!(
+            exec("function f() goto done\n::done::\nreturn 5 end\nprint(f())").unwrap(),
+            "5\n"
+        );
+        // goto inside a while body.
+        assert_eq!(
+            exec("i = 0\nwhile true do\ni = i + 1\nif i == 3 then goto out end\nend\n::out::\nprint(i)").unwrap(),
+            "3\n"
+        );
+        // label at the end of a block.
+        assert_eq!(exec("goto l\n::l::").unwrap(), "");
+        // infinite goto loop is caught by the step limit.
+        assert!(exec("::top::\ngoto top").is_err());
+    }
+
+    #[test]
+    fn goto_syntax_errors() {
+        // goto to an unknown label.
+        assert!(exec("goto nope").is_err());
+        // goto with no label name.
+        assert!(exec("goto").is_err());
+        // label with no name.
+        assert!(exec(":: ::").is_err());
+        // a goto in a function cannot reference a caller's label.
+        assert!(exec("::l::\nfunction f() goto l end").is_err());
+        assert!(exec("function f() goto out end\n::out::\nf()").is_err());
+        // a goto cannot jump into a nested block (label not visible after block).
+        assert!(exec("if true then ::l:: end\ngoto l").is_err());
+    }
+
+    #[test]
     fn for_loop() {
         assert_eq!(exec("for i = 1, 3 do print(i) end").unwrap(), "1\n2\n3\n");
         assert_eq!(exec("for i = 3, 1, -1 do print(i) end").unwrap(), "3\n2\n1\n");
@@ -1030,6 +1147,74 @@ mod tests {
         assert!(exec_fetch("fetch(true)").is_err());
         // No host callback installed (plain `run`) -> clear error
         assert!(exec("print(fetch(\"a.txt\"))").is_err());
+    }
+
+    /// Mock `dofile()` loader callback: returns the source for known chunk
+    /// names, `None` for anything else (simulating a failed load).
+    fn load_demo(name: &str, buf: &mut [u8]) -> Option<usize> {
+        let src: &[u8] = match name {
+            "fortytwo.lua" => b"return 42",
+            "greet.lua" => b"print(\"hello from dofile\")\nreturn 7",
+            "addone.lua" => b"g = g + 1\nreturn g",
+            "defn.lua" => b"function fromfile() return 3 end",
+            "chunk.lua" => b"x = 99",
+            "a.lua" => b"return dofile(\"b.lua\")",
+            "b.lua" => b"return 9",
+            "bad.lua" => b"print(1 / 0)",
+            _ => return None,
+        };
+        if src.len() > buf.len() {
+            return None;
+        }
+        buf[..src.len()].copy_from_slice(src);
+        Some(src.len())
+    }
+
+    fn exec_dofile(src: &str) -> Result<String, &'static str> {
+        OUT.with(|o| o.borrow_mut().clear());
+        super::run_with_fetch_load(src.as_bytes(), putc_test, fetch_count, load_demo)?;
+        Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
+    }
+
+    #[test]
+    fn dofile_builtin() {
+        // Returns the chunk's return value.
+        assert_eq!(exec_dofile("print(dofile(\"fortytwo.lua\"))").unwrap(), "42\n");
+        // Chunk output plus its return value.
+        assert_eq!(
+            exec_dofile("print(dofile(\"greet.lua\"))").unwrap(),
+            "hello from dofile\n7\n"
+        );
+        // The chunk runs in the same global environment.
+        assert_eq!(
+            exec_dofile("g = 1\nprint(dofile(\"addone.lua\"))\nprint(g)").unwrap(),
+            "2\n2\n"
+        );
+        // A chunk can define functions usable by the caller afterwards.
+        assert_eq!(exec_dofile("dofile(\"defn.lua\")\nprint(fromfile())").unwrap(), "3\n");
+        // A chunk that returns nothing -> nil.
+        assert_eq!(exec_dofile("print(dofile(\"chunk.lua\"))").unwrap(), "nil\n");
+        // Nested dofile: a chunk can call dofile itself.
+        assert_eq!(exec_dofile("print(dofile(\"a.lua\"))").unwrap(), "9\n");
+        // The filename can come from a variable.
+        assert_eq!(
+            exec_dofile("f = \"fortytwo.lua\"\nprint(dofile(f))").unwrap(),
+            "42\n"
+        );
+    }
+
+    #[test]
+    fn dofile_errors() {
+        // Missing file -> error propagates.
+        assert!(exec_dofile("dofile(\"missing.lua\")").is_err());
+        // A runtime error inside the chunk propagates to the caller.
+        assert!(exec_dofile("print(dofile(\"bad.lua\"))").is_err());
+        // Wrong arity or argument type.
+        assert!(exec_dofile("dofile()").is_err());
+        assert!(exec_dofile("dofile(5)").is_err());
+        assert!(exec_dofile("dofile(true)").is_err());
+        // No loader callback installed (plain `run`) -> clear error.
+        assert!(exec("dofile(\"fortytwo.lua\")").is_err());
     }
 
     /// Mock `dhcp()` host callback: network setup succeeds and enables `fetch`.

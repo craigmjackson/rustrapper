@@ -92,6 +92,28 @@ impl TftpSink for FetchSink {
     }
 }
 
+/// TFTP sink writing into a caller-provided buffer (for `dofile()`).
+struct LoadSink<'a> {
+    buf: &'a mut [u8],
+    offset: usize,
+}
+
+impl TftpSink for LoadSink<'_> {
+    fn write_block(&mut self, data: &[u8]) -> Result<(), ()> {
+        let new_off = self.offset + data.len();
+        if new_off > self.buf.len() {
+            return Err(());
+        }
+        self.buf[self.offset..new_off].copy_from_slice(data);
+        self.offset = new_off;
+        Ok(())
+    }
+
+    fn finalize(&mut self, _size: usize) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
 /// Host `fetch()` callback: download `name` from the TFTP server, record it
 /// in a slot, and return the byte count (or `None` on failure).
 pub fn fetch_file(name: &str) -> Option<usize> {
@@ -142,4 +164,22 @@ pub fn fetch_file(name: &str) -> Option<usize> {
         };
     }
     Some(size)
+}
+
+/// Host `dofile()` callback: download `name` from the TFTP server into the
+/// interpreter's buffer and return its length (or `None` on failure).
+pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
+    let (base, mac, src_ip, server_ip) = unsafe {
+        (
+            FETCH_CTX.base,
+            FETCH_CTX.mac,
+            FETCH_CTX.src_ip,
+            FETCH_CTX.server_ip,
+        )
+    };
+    if base == 0 || server_ip == [0; 4] {
+        return None;
+    }
+    let mut sink = LoadSink { buf, offset: 0 };
+    crate::net::tftp_download(base, &mac, &src_ip, &server_ip, name, &mut sink)
 }

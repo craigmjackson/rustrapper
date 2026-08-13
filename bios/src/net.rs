@@ -224,7 +224,12 @@ fn pxe_boot(base: u64, mac: &[u8; 6], cfg: &DhcpConfig) {
                 let data = unsafe {
                     core::slice::from_raw_parts(sink.buffer_addr() as usize as *const u8, size)
                 };
-                match lua::run_with_fetch(data, putc, crate::fetch::fetch_file) {
+                match lua::run_with_fetch_load(
+                    data,
+                    putc,
+                    crate::fetch::fetch_file,
+                    crate::fetch::load_file,
+                ) {
                     Ok(()) => puts("    PXE: Lua script done\n"),
                     Err(e) => {
                         puts("    PXE: Lua error: ");

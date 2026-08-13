@@ -105,12 +105,13 @@ network OK
 
 Supported: integers, strings, booleans, `nil`, `local`/`global` variables,
 `+ - * / %`, comparisons, `and/or/not`, `..` concat, `if/elseif/else`,
-`while`, `repeat ... until`, `break`, numeric `for`, generic `for k, v in table`,
-named `function`/`return`, tables, `print()`, comments.
+`while`, `repeat ... until`, `break`, `goto`/labels, numeric `for`, generic
+`for k, v in table`, named `function`/`return`, tables, `print()`, comments.
 
 Builtins:
-- `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); enables `fetch()`
+- `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); enables `fetch()` and `dofile()`
 - `fetch("file")` — download a file from the TFTP server, return its byte count (or `nil`)
+- `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
 - `exit` — leave the shell; `shell()` — nested shell (not supported)
 
 On the native target, `dhcp` discovers the local IP and TFTP server from the
@@ -218,7 +219,7 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 234 tests across all crates
+cargo test --workspace   # 238 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |

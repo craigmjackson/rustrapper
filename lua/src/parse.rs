@@ -3,14 +3,45 @@
 use super::lex::{Lexer, Tok};
 use super::{LuaState, Node, Op, StrRef, NO_NODE};
 
+const MAX_SCOPES: usize = 16;
+const MAX_LABELS_PER_SCOPE: usize = 8;
+const MAX_GOTOS_PER_SCOPE: usize = 8;
+
+/// One block's label/goto bookkeeping, used to resolve `goto`/`::label::` at
+/// the end of the block. Labels and gotos in nested blocks are scoped: a goto
+/// can target a label in its own block or an enclosing block, but a label in a
+/// nested block is never visible after that block ends.
+#[derive(Clone, Copy)]
+struct Scope {
+    labels: [(StrRef, u16); MAX_LABELS_PER_SCOPE],
+    nlabels: u8,
+    gotos: [(u16, StrRef); MAX_GOTOS_PER_SCOPE],
+    ngotos: u8,
+}
+
+impl Scope {
+    fn empty() -> Self {
+        Scope {
+            labels: [(0, 0); MAX_LABELS_PER_SCOPE],
+            nlabels: 0,
+            gotos: [(0, 0); MAX_GOTOS_PER_SCOPE],
+            ngotos: 0,
+        }
+    }
+}
+
 /// Recursive-descent parser with a single-token lookahead.
 ///
 /// `'l` is the lifetime of the source buffer; `'s` the borrow of the state.
 pub struct Parser<'s, 'l> {
     lex: Lexer<'l>,
     cur: Tok,
-    /// Nesting depth of `while`/`for` loops. `break` is only valid when > 0.
+    /// Nesting depth of `while`/`for`/`repeat` loops. `break` is only valid
+    /// when > 0.
     loop_depth: u32,
+    /// Label/goto scopes, one per in-progress block.
+    scopes: [Scope; MAX_SCOPES],
+    n_scopes: usize,
     state: &'s mut LuaState,
 }
 
@@ -22,6 +53,8 @@ impl<'s, 'l> Parser<'s, 'l> {
             lex,
             cur,
             loop_depth: 0,
+            scopes: [Scope::empty(); MAX_SCOPES],
+            n_scopes: 0,
             state,
         }
     }
@@ -76,6 +109,11 @@ impl<'s, 'l> Parser<'s, 'l> {
     /// Parse a statement block. Stops at `end`/`else`/`elseif`/`until`/EOF,
     /// leaving the terminator token in `cur`. Returns the first statement node.
     fn parse_block(&mut self) -> Result<u16, &'static str> {
+        if self.n_scopes >= MAX_SCOPES {
+            return Err("script too complex");
+        }
+        self.scopes[self.n_scopes] = Scope::empty();
+        self.n_scopes += 1;
         let mut first: u16 = NO_NODE;
         let mut prev: u16 = NO_NODE;
         loop {
@@ -91,7 +129,77 @@ impl<'s, 'l> Parser<'s, 'l> {
             }
             prev = s;
         }
+        self.resolve_scope()?;
         Ok(first)
+    }
+
+    /// Resolve the innermost block's `goto` statements against the labels of
+    /// this block and every enclosing block (innermost first). A `goto` whose
+    /// label is found is patched with the label's node index; one that isn't is
+    /// deferred to the enclosing block (allowing jumps out of a block). The
+    /// scope is popped afterwards, so labels in nested blocks are never visible
+    /// to outer blocks (no jumps into a block).
+    fn resolve_scope(&mut self) -> Result<(), &'static str> {
+        let s = self.n_scopes - 1;
+        let ng = self.scopes[s].ngotos as usize;
+        let gotos = self.scopes[s].gotos;
+        for i in 0..ng {
+            let (g_node, g_name) = gotos[i];
+            match self.find_label(g_name, s) {
+                Some(target) => {
+                    self.state.nodes[g_node as usize] = Node::Goto(target);
+                }
+                None => {
+                    if s == 0 {
+                        return Err("unknown label");
+                    }
+                    let p = s - 1;
+                    let np = self.scopes[p].ngotos as usize;
+                    if np >= MAX_GOTOS_PER_SCOPE {
+                        return Err("too many gotos");
+                    }
+                    self.scopes[p].gotos[np] = (g_node, g_name);
+                    self.scopes[p].ngotos += 1;
+                }
+            }
+        }
+        self.n_scopes -= 1;
+        Ok(())
+    }
+
+    /// Find the node index of a label by name, searching scopes from
+    /// `innermost` (inclusive) outward.
+    fn find_label(&self, name: StrRef, innermost: usize) -> Option<u16> {
+        for scope in (0..=innermost).rev() {
+            for i in 0..self.scopes[scope].nlabels as usize {
+                if self.scopes[scope].labels[i].0 == name {
+                    return Some(self.scopes[scope].labels[i].1);
+                }
+            }
+        }
+        None
+    }
+
+    fn record_label(&mut self, name: StrRef, node: u16) -> Result<(), &'static str> {
+        let s = self.n_scopes - 1;
+        let n = self.scopes[s].nlabels as usize;
+        if n >= MAX_LABELS_PER_SCOPE {
+            return Err("too many labels");
+        }
+        self.scopes[s].labels[n] = (name, node);
+        self.scopes[s].nlabels += 1;
+        Ok(())
+    }
+
+    fn record_goto(&mut self, node: u16, name: StrRef) -> Result<(), &'static str> {
+        let s = self.n_scopes - 1;
+        let n = self.scopes[s].ngotos as usize;
+        if n >= MAX_GOTOS_PER_SCOPE {
+            return Err("too many gotos");
+        }
+        self.scopes[s].gotos[n] = (node, name);
+        self.scopes[s].ngotos += 1;
+        Ok(())
     }
 
     fn parse_stat(&mut self) -> Result<u16, &'static str> {
@@ -125,7 +233,12 @@ impl<'s, 'l> Parser<'s, 'l> {
                 let (params, nparams) = self.parse_params()?;
                 let saved_loop = self.loop_depth;
                 self.loop_depth = 0;
+                // Function bodies are their own label scope: gotos cannot
+                // reference labels outside the function.
+                let saved_scopes = self.n_scopes;
+                self.n_scopes = 0;
                 let body = self.parse_block()?;
+                self.n_scopes = saved_scopes;
                 self.loop_depth = saved_loop;
                 self.expect(Tok::End, "expected 'end' to close function")?;
                 let fi = self.state.alloc_func(params, nparams, body)?;
@@ -200,6 +313,21 @@ impl<'s, 'l> Parser<'s, 'l> {
                 self.expect(Tok::Until, "expected 'until' to close repeat")?;
                 let cond = self.parse_expr()?;
                 self.alloc(Node::RepeatStmt(body, cond))
+            }
+            Tok::ColonColon => {
+                self.advance()?;
+                let name = self.expect_name()?;
+                self.expect(Tok::ColonColon, "expected '::' after label name")?;
+                let node = self.alloc(Node::Label(name))?;
+                self.record_label(name, node)?;
+                Ok(node)
+            }
+            Tok::Goto => {
+                self.advance()?;
+                let name = self.expect_name()?;
+                let node = self.alloc(Node::Goto(0))?;
+                self.record_goto(node, name)?;
+                Ok(node)
             }
             Tok::Break => {
                 self.advance()?;

@@ -75,6 +75,7 @@ pub extern "C" fn main() -> ! {
                 // `dhcp` command in the shell, which enables `fetch()`.
                 state.set_fetch(None);
                 state.set_dhcp(Some(dhcp_fn));
+                state.set_load(Some(crate::fetch::load_file));
                 lua::repl::repl_loop(&mut state, uart::getc, common::print::putc, common::print::puts);
             }
         }

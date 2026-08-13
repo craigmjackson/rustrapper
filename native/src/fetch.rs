@@ -56,3 +56,22 @@ pub fn fetch_file(name: &str) -> Option<usize> {
     FILES.lock().unwrap().push((name.to_string(), data.clone()));
     Some(data.len())
 }
+
+/// Host `dofile()` callback: download `name` from the TFTP server into the
+/// interpreter's buffer and return its length (or `None` on failure).
+pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
+    let server = CTX.lock().unwrap().0;
+    if server == Ipv4Addr::UNSPECIFIED {
+        return None;
+    }
+    let mut data = Vec::new();
+    {
+        let mut sink = FileSink { data: &mut data };
+        crate::net::tftp_download(server, name, &mut sink)?;
+    }
+    if data.len() > buf.len() {
+        return None;
+    }
+    buf[..data.len()].copy_from_slice(&data);
+    Some(data.len())
+}

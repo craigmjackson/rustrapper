@@ -38,6 +38,7 @@ pub fn repl_loop(
                             match eval::run_repl_once(state, line, putc) {
                                 Ok(eval::ExecResult::Normal) => {}
                                 Ok(eval::ExecResult::Break) => {}
+                                Ok(eval::ExecResult::Goto(_)) => {}
                                 Ok(eval::ExecResult::Exit) => exited = true,
                                 Ok(eval::ExecResult::Shell) => {
                                     puts("\n(nested shell not supported)\n\n");
@@ -111,6 +112,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   returns its byte count, or nil on failure.\n\
                   Requires a TFTP server: run 'dhcp' first to set up the\n\
                   network (or it works automatically in PXE scripts).\n",
+    },
+    HelpEntry {
+        name: "dofile",
+        short: "Run a Lua chunk loaded by name (TFTP) and return its value",
+        detail: "dofile(\"file.lua\")\n\
+                  Loads a Lua source chunk from the TFTP server, executes it,\n\
+                  and returns the chunk's return value (nil if it doesn't\n\
+                  return). The chunk shares globals but has its own locals.\n\
+                  Requires a TFTP server: run 'dhcp' first.\n",
     },
     HelpEntry {
         name: "dhcp",
