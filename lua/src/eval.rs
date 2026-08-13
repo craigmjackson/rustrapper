@@ -65,6 +65,12 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
             match v {
                 Value::Exit => return Ok(ExecResult::Exit),
                 Value::Shell => return Ok(ExecResult::Shell),
+                Value::Dhcp => {
+                    let ok = s.run_dhcp()?;
+                    tostring(s, Value::Bool(ok))?;
+                    emit(s, b'\n');
+                    return Ok(ExecResult::Normal);
+                }
                 _ => {
                     tostring(s, v)?;
                     emit(s, b'\n');
@@ -116,6 +122,10 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             match v {
                 Value::Exit => return Ok(ExecResult::Exit),
                 Value::Shell => return Ok(ExecResult::Shell),
+                Value::Dhcp => {
+                    s.run_dhcp()?;
+                    return Ok(ExecResult::Normal);
+                }
                 _ => {}
             }
             Ok(ExecResult::Normal)
@@ -343,6 +353,12 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
             ExecResult::Exit
         }
+        Value::Dhcp => {
+            if argc != 0 {
+                return Err("dhcp expects no arguments");
+            }
+            ExecResult::Ret(Value::Bool(s.run_dhcp()?))
+        }
         Value::Func(idx) => {
             let fd = s.funcs[idx as usize];
             s.push_frame()?;
@@ -492,6 +508,7 @@ fn tostring(s: &LuaState, v: Value) -> Result<(), &'static str> {
         Value::Func(_) => emit_str(s, b"function"),
         Value::Native(_) => emit_str(s, b"native"),
         Value::Shell => emit_str(s, b"shell"),
+        Value::Dhcp => emit_str(s, b"dhcp"),
         Value::Exit => emit_str(s, b"exit"),
     }
     Ok(())

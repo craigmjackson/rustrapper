@@ -30,6 +30,17 @@ fn dual_putc(c: u8) {
     vga::putc(c);
 }
 
+/// `dhcp` builtin: set up the network (e1000 + DHCP) and return the `fetch`
+/// callback if a TFTP server is reachable.
+#[cfg(not(test))]
+fn dhcp_fn() -> Option<fn(&str) -> Option<usize>> {
+    if net::setup_fetch_context() {
+        Some(crate::fetch::fetch_file)
+    } else {
+        None
+    }
+}
+
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn _start(_boot_drive: u32) -> ! {
@@ -49,11 +60,10 @@ pub extern "C" fn _start(_boot_drive: u32) -> ! {
             MenuAction::LuaShell => {
                 let mut state = lua::LuaState::new();
                 state.register_builtins(common::print::putc);
-                if net::setup_fetch_context() {
-                    state.set_fetch(Some(crate::fetch::fetch_file));
-                } else {
-                    state.set_fetch(None);
-                }
+                // Network is NOT set up automatically: the user runs the
+                // `dhcp` command in the shell, which enables `fetch()`.
+                state.set_fetch(None);
+                state.set_dhcp(Some(dhcp_fn));
                 lua::repl::repl_loop(&mut state, serial::getc, common::print::putc, common::print::puts);
             }
         }

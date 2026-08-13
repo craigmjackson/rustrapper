@@ -12,6 +12,9 @@
 //! - Named functions `function name(a, b) ... end` and `return`
 //! - Tables: array fields, `name =` fields, `[expr]` fields, `t.key`, `t[key]`
 //! - `print(...)` builtin, `--` line comments
+//! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
+//!   enables the `fetch()` builtin. The REPL starts with networking disabled
+//!   until the user runs `dhcp`.
 //! - `fetch("file")` builtin: downloads a file from the TFTP server (DHCP
 //!   `next_server`) into host memory and returns its byte count as a number,
 //!   or `nil` if the download fails. Requires a host callback, so scripts
@@ -86,6 +89,8 @@ pub enum Value {
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
+    /// Builtin: `dhcp` / `dhcp()` — runs the network setup so `fetch()` works.
+    Dhcp,
     /// Builtin: `exit()` — exits the REPL (only meaningful inside a shell).
     Exit,
 }
@@ -238,8 +243,13 @@ pub struct LuaState {
     pub putc: fn(u8),
     /// Host callback for the `fetch()` builtin: downloads `name` from the
     /// TFTP server and returns its byte count, or `None` on failure. Set by
-    /// [`LuaState::run_with_fetch`]; `None` means `fetch()` errors out.
+    /// [`LuaState::run_with_fetch`] or by a successful `dhcp`; `None` means
+    /// `fetch()` errors out.
     pub fetch: Option<fn(&str) -> Option<usize>>,
+    /// Host callback for the `dhcp` builtin: runs the network setup (e1000 +
+    /// DHCP) and returns the `fetch` callback if a TFTP server is reachable.
+    /// Set by the host before entering the REPL; `None` means `dhcp` errors.
+    pub dhcp: Option<fn() -> Option<fn(&str) -> Option<usize>>>,
 }
 
 fn noop(_c: u8) {}
@@ -287,10 +297,11 @@ impl LuaState {
             steps: 0,
             putc: noop,
             fetch: None,
+            dhcp: None,
         }
     }
 
-    /// Register built-in globals (`print`, `fetch`, `shell`, `exit`).
+    /// Register built-in globals (`print`, `fetch`, `shell`, `dhcp`, `exit`).
     /// Call this once after creating a fresh `LuaState` before entering the REPL.
     pub fn register_builtins(&mut self, putc: fn(u8)) {
         self.putc = putc;
@@ -303,6 +314,9 @@ impl LuaState {
         let _ = self.intern(b"shell");
         let shell_name = self.intern(b"shell").unwrap();
         self.set_global(shell_name, Value::Shell);
+        let _ = self.intern(b"dhcp");
+        let dhcp_name = self.intern(b"dhcp").unwrap();
+        self.set_global(dhcp_name, Value::Dhcp);
         let _ = self.intern(b"exit");
         let exit_name = self.intern(b"exit").unwrap();
         self.set_global(exit_name, Value::Exit);
@@ -323,12 +337,33 @@ impl LuaState {
     }
 
     /// Install a host `fetch()` callback. Call `set_fetch(None)` to explicitly
-    /// disable fetch (e.g. when no TFTP server is reachable). REPL entry
-    /// points set this to the target's `fetch_file` callback when networking
-    /// is available so `fetch("file")` works interactively, not just in PXE
-    /// scripts.
+    /// disable fetch (e.g. when no TFTP server is reachable). The REPL starts
+    /// with `fetch` disabled and enables it only after a successful `dhcp`.
     pub fn set_fetch(&mut self, fetch: Option<fn(&str) -> Option<usize>>) {
         self.fetch = fetch;
+    }
+
+    /// Install a host `dhcp` callback: runs the network setup (e1000 + DHCP)
+    /// and returns the `fetch` callback when a TFTP server is reachable.
+    /// Call `set_dhcp(None)` to disable the `dhcp` builtin.
+    pub fn set_dhcp(&mut self, dhcp: Option<fn() -> Option<fn(&str) -> Option<usize>>>) {
+        self.dhcp = dhcp;
+    }
+
+    /// Run the `dhcp` builtin: establish network connectivity and enable the
+    /// `fetch` callback. Returns `true` on success, `false` if the network
+    /// setup failed, or an error if no host callback is registered.
+    pub fn run_dhcp(&mut self) -> Result<bool, &'static str> {
+        match self.dhcp {
+            Some(f) => match f() {
+                Some(fetch_cb) => {
+                    self.fetch = Some(fetch_cb);
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            None => Err("dhcp not available"),
+        }
     }
 
     /// Run a script with a host `fetch()` callback installed, so the script
@@ -567,7 +602,7 @@ pub fn run_repl(
     putc: fn(u8),
 ) -> Result<(), &'static str> {
     let mut state = LuaState::new();
-    // Register builtins (print, fetch, shell, exit) by running an empty script.
+    // Register builtins (print, fetch, shell, dhcp, exit) by running an empty script.
     state.run(&[], putc)?;
     let mut buf = [0u8; 256];
     loop {
@@ -869,6 +904,57 @@ mod tests {
         assert!(exec_fetch("fetch(true)").is_err());
         // No host callback installed (plain `run`) -> clear error
         assert!(exec("print(fetch(\"a.txt\"))").is_err());
+    }
+
+    /// Mock `dhcp()` host callback: network setup succeeds and enables `fetch`.
+    fn dhcp_ok() -> Option<fn(&str) -> Option<usize>> {
+        Some(fetch_count)
+    }
+
+    /// Mock `dhcp()` host callback: network setup fails.
+    fn dhcp_fail() -> Option<fn(&str) -> Option<usize>> {
+        None
+    }
+
+    /// Run a script with a mock `dhcp` callback installed (fetch disabled).
+    fn exec_dhcp(src: &str, dhcp: fn() -> Option<fn(&str) -> Option<usize>>) -> Result<String, &'static str> {
+        OUT.with(|o| o.borrow_mut().clear());
+        let mut state = super::LuaState::new();
+        state.register_builtins(putc_test);
+        state.set_fetch(None);
+        state.set_dhcp(Some(dhcp));
+        let first = {
+            let mut p = super::parse::Parser::new(src.as_bytes(), &mut state);
+            p.parse_script()?
+        };
+        super::eval::exec_script(&mut state, first)?;
+        Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
+    }
+
+    #[test]
+    fn dhcp_builtin() {
+        // dhcp() returns true when the setup succeeds, then fetch works.
+        assert_eq!(exec_dhcp("print(dhcp())", dhcp_ok).unwrap(), "true\n");
+        assert_eq!(exec_dhcp("dhcp()\nprint(fetch(\"a.txt\"))", dhcp_ok).unwrap(), "5\n");
+        // Bare `dhcp` as a statement works too.
+        assert_eq!(exec_dhcp("dhcp\nprint(fetch(\"b.txt\"))", dhcp_ok).unwrap(), "12\n");
+        // dhcp() returns false when the setup fails; fetch stays disabled.
+        assert_eq!(exec_dhcp("print(dhcp())", dhcp_fail).unwrap(), "false\n");
+        assert!(exec_dhcp("dhcp()\nprint(fetch(\"a.txt\"))", dhcp_fail).is_err());
+    }
+
+    #[test]
+    fn dhcp_errors() {
+        // No host callback installed (plain `run`) -> clear error.
+        assert!(exec("dhcp()").is_err());
+        assert!(exec("dhcp").is_err());
+        // Wrong arity.
+        assert!(exec_dhcp("dhcp(1)", dhcp_ok).is_err());
+    }
+
+    #[test]
+    fn dhcp_prints_type() {
+        assert_eq!(exec("print(dhcp)").unwrap(), "dhcp\n");
     }
 
     #[test]

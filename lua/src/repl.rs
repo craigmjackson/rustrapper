@@ -108,8 +108,17 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "fetch(\"file\")\n\
                   Downloads 'file' from the TFTP server (DHCP next_server) and\n\
                   returns its byte count, or nil on failure.\n\
-                  Works in PXE scripts and in the REPL when a TFTP server is\n\
-                  reachable (the network is set up when the shell starts).\n",
+                  Requires a TFTP server: run 'dhcp' first to set up the\n\
+                  network (or it works automatically in PXE scripts).\n",
+    },
+    HelpEntry {
+        name: "dhcp",
+        short: "Set up the network (e1000 + DHCP) so fetch() works",
+        detail: "dhcp\n\
+                  Runs the network setup: scans PCI for the e1000, initializes\n\
+                  it, and runs DHCP. Returns true on success, false on failure.\n\
+                  After it succeeds, fetch(\"file\") can download files from the\n\
+                  TFTP server. May also be written dhcp().\n",
     },
     HelpEntry {
         name: "shell",
@@ -256,6 +265,38 @@ mod tests {
         OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap())
     }
 
+    /// Mock `dhcp()` host callback: network setup succeeds and enables `fetch`.
+    fn mock_dhcp() -> Option<fn(&str) -> Option<usize>> {
+        Some(mock_fetch)
+    }
+
+    /// Run a full REPL session starting with networking disabled but a `dhcp`
+    /// callback installed (mirrors the on-device Lua shell entry).
+    fn run_session_with_dhcp(keys: &[u8]) -> String {
+        feed(keys);
+        OUT.with(|o| o.borrow_mut().clear());
+        let mut state = LuaState::new();
+        state.register_builtins(putc);
+        state.set_fetch(None);
+        state.set_dhcp(Some(mock_dhcp));
+        repl_loop(&mut state, get_key, putc, puts);
+        OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap())
+    }
+
+    #[test]
+    fn dhcp_enables_fetch_in_repl() {
+        // Before `dhcp`, fetch is unavailable.
+        let out = run_session_with_dhcp(b"print(fetch(\"a.txt\"))\rexit\r");
+        assert!(out.contains("Lua error: fetch not available"));
+        // After `dhcp` (bare command), fetch works and stays enabled.
+        let out = run_session_with_dhcp(b"dhcp\rprint(fetch(\"a.txt\"))\rexit\r");
+        assert!(out.contains("true\n"));
+        assert!(out.contains("5\n"));
+        // The call form works too.
+        let out = run_session_with_dhcp(b"print(dhcp())\rexit\r");
+        assert!(out.contains("true\n"));
+    }
+
     #[test]
     fn fetch_works_in_repl() {
         let out = run_session_with_fetch(b"print(fetch(\"a.txt\"))\rexit\r");
@@ -333,7 +374,7 @@ mod tests {
     #[test]
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
-        for cmd in ["help", "exit", "print", "fetch", "shell"] {
+        for cmd in ["help", "exit", "print", "fetch", "shell", "dhcp"] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
         }
         assert!(out.contains("Type 'help <cmd>'"));
