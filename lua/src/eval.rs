@@ -7,6 +7,8 @@ use super::{LuaState, Node, Op, Value, NO_NODE};
 pub enum ExecResult {
     Normal,
     Ret(Value),
+    /// `break` — unwinds to the innermost loop, which stops iterating.
+    Break,
     Shell,
     Exit,
 }
@@ -17,7 +19,10 @@ pub fn exec_script(s: &mut LuaState, first: u16) -> Result<(), &'static str> {
     let r = exec_chain(s, first);
     s.pop_frame();
     match r {
-        Ok(_) => Ok(()),
+        Ok(ExecResult::Normal) => Ok(()),
+        Ok(ExecResult::Ret(_)) => Ok(()),
+        Ok(ExecResult::Break) => Err("break outside loop"),
+        Ok(ExecResult::Shell) | Ok(ExecResult::Exit) => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -158,10 +163,47 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                 }
                 match exec_block(s, body)? {
                     ExecResult::Normal => {}
+                    ExecResult::Break => break,
                     r => return Ok(r),
                 }
             }
             Ok(ExecResult::Normal)
+        }
+        Node::RepeatStmt(body, cond) => {
+            let mut result = ExecResult::Normal;
+            loop {
+                s.steps += 1;
+                if s.steps > super::MAX_STEPS {
+                    return Err("step limit exceeded");
+                }
+                s.push_frame()?;
+                let r = exec_chain(s, body);
+                match r {
+                    Ok(ExecResult::Normal) => {
+                        // Evaluate the condition in the body's scope, so locals
+                        // declared in the body are visible in `until` (Lua).
+                        let c = eval(s, cond);
+                        s.pop_frame();
+                        if truthy(c?) {
+                            break;
+                        }
+                    }
+                    Ok(ExecResult::Break) => {
+                        s.pop_frame();
+                        break;
+                    }
+                    Ok(r2) => {
+                        s.pop_frame();
+                        result = r2;
+                        break;
+                    }
+                    Err(e) => {
+                        s.pop_frame();
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(result)
         }
         Node::ForStmt(var, start, limit, step, body) => {
             let (mut cur, lim, stp) = match (
@@ -193,6 +235,7 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                 s.set_local_top(name, Value::Num(cur))?;
                 match exec_block(s, body)? {
                     ExecResult::Normal => {}
+                    ExecResult::Break => break,
                     r => {
                         result = r;
                         break;
@@ -232,6 +275,7 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                 }
                 match exec_block(s, body)? {
                     ExecResult::Normal => {}
+                    ExecResult::Break => break,
                     r => {
                         result = r;
                         break;
@@ -241,6 +285,7 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             s.pop_frame();
             Ok(result)
         }
+        Node::BreakStmt => Ok(ExecResult::Break),
         Node::ReturnStmt(v) => {
             let r = if v != NO_NODE { eval(s, v)? } else { Value::Nil };
             Ok(ExecResult::Ret(r))
@@ -310,6 +355,7 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
             match call(s, fv, argc)? {
                 ExecResult::Normal => Ok(Value::Nil),
                 ExecResult::Ret(v) => Ok(v),
+                ExecResult::Break => Err("break outside loop"),
                 ExecResult::Shell => Ok(Value::Shell),
                 ExecResult::Exit => Ok(Value::Exit),
             }
@@ -410,6 +456,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             match r {
                 Ok(ExecResult::Normal) => ExecResult::Normal,
                 Ok(ExecResult::Ret(v)) => ExecResult::Ret(v),
+                Ok(ExecResult::Break) => return Err("break outside loop"),
                 Ok(ExecResult::Shell) => ExecResult::Shell,
                 Ok(ExecResult::Exit) => ExecResult::Exit,
                 Err(e) => return Err(e),

@@ -105,7 +105,8 @@ network OK
 
 Supported: integers, strings, booleans, `nil`, `local`/`global` variables,
 `+ - * / %`, comparisons, `and/or/not`, `..` concat, `if/elseif/else`,
-`while`, numeric `for`, named `function`/`return`, tables, `print()`, comments.
+`while`, `repeat ... until`, `break`, numeric `for`, generic `for k, v in table`,
+named `function`/`return`, tables, `print()`, comments.
 
 Builtins:
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); enables `fetch()`
@@ -217,7 +218,7 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 228 tests across all crates
+cargo test --workspace   # 234 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |

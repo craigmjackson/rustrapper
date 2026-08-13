@@ -27,6 +27,9 @@ pub enum Tok {
     Do,
     For,
     In,
+    Break,
+    Repeat,
+    Until,
     Function,
     Local,
     Global,
@@ -261,6 +264,7 @@ impl<'a> Lexer<'a> {
         let len = self.pos - start;
         Ok(match &self.src[start..start + len] {
             b"and" => Tok::And,
+            b"break" => Tok::Break,
             b"or" => Tok::Or,
             b"not" => Tok::Not,
             b"if" => Tok::If,
@@ -272,6 +276,8 @@ impl<'a> Lexer<'a> {
             b"do" => Tok::Do,
             b"for" => Tok::For,
             b"in" => Tok::In,
+            b"repeat" => Tok::Repeat,
+            b"until" => Tok::Until,
             b"function" => Tok::Function,
             b"local" => Tok::Local,
             b"global" => Tok::Global,

@@ -9,6 +9,8 @@ use super::{LuaState, Node, Op, StrRef, NO_NODE};
 pub struct Parser<'s, 'l> {
     lex: Lexer<'l>,
     cur: Tok,
+    /// Nesting depth of `while`/`for` loops. `break` is only valid when > 0.
+    loop_depth: u32,
     state: &'s mut LuaState,
 }
 
@@ -16,7 +18,12 @@ impl<'s, 'l> Parser<'s, 'l> {
     pub fn new(src: &'l [u8], state: &'s mut LuaState) -> Self {
         let mut lex = Lexer::new(src);
         let cur = lex.next_token().unwrap_or(Tok::Eof);
-        Parser { lex, cur, state }
+        Parser {
+            lex,
+            cur,
+            loop_depth: 0,
+            state,
+        }
     }
 
     fn advance(&mut self) -> Result<(), &'static str> {
@@ -66,14 +73,14 @@ impl<'s, 'l> Parser<'s, 'l> {
         Ok(first)
     }
 
-    /// Parse a statement block. Stops at `end`/`else`/`elseif`/EOF, leaving
-    /// the terminator token in `cur`. Returns the first statement node index.
+    /// Parse a statement block. Stops at `end`/`else`/`elseif`/`until`/EOF,
+    /// leaving the terminator token in `cur`. Returns the first statement node.
     fn parse_block(&mut self) -> Result<u16, &'static str> {
         let mut first: u16 = NO_NODE;
         let mut prev: u16 = NO_NODE;
         loop {
             match self.cur {
-                Tok::Eof | Tok::End | Tok::Else | Tok::Elseif => break,
+                Tok::Eof | Tok::End | Tok::Else | Tok::Elseif | Tok::Until => break,
                 _ => {}
             }
             let s = self.parse_stat()?;
@@ -116,7 +123,10 @@ impl<'s, 'l> Parser<'s, 'l> {
                 let name = self.expect_name()?;
                 self.expect(Tok::LParen, "expected '(' after function name")?;
                 let (params, nparams) = self.parse_params()?;
+                let saved_loop = self.loop_depth;
+                self.loop_depth = 0;
                 let body = self.parse_block()?;
+                self.loop_depth = saved_loop;
                 self.expect(Tok::End, "expected 'end' to close function")?;
                 let fi = self.state.alloc_func(params, nparams, body)?;
                 let name_node = self.alloc(Node::Var(name))?;
@@ -135,7 +145,9 @@ impl<'s, 'l> Parser<'s, 'l> {
                 self.advance()?;
                 let cond = self.parse_expr()?;
                 self.expect(Tok::Do, "expected 'do'")?;
+                self.loop_depth += 1;
                 let body = self.parse_block()?;
+                self.loop_depth -= 1;
                 self.expect(Tok::End, "expected 'end' to close while")?;
                 self.alloc(Node::WhileStmt(cond, body))
             }
@@ -156,7 +168,9 @@ impl<'s, 'l> Parser<'s, 'l> {
                         NO_NODE
                     };
                     self.expect(Tok::Do, "expected 'do'")?;
+                    self.loop_depth += 1;
                     let body = self.parse_block()?;
+                    self.loop_depth -= 1;
                     self.expect(Tok::End, "expected 'end' to close for")?;
                     self.alloc(Node::ForStmt(name_node, start, limit, step, body))
                 } else {
@@ -171,10 +185,29 @@ impl<'s, 'l> Parser<'s, 'l> {
                     self.expect(Tok::In, "expected 'in' in for statement")?;
                     let table = self.parse_expr()?;
                     self.expect(Tok::Do, "expected 'do'")?;
+                    self.loop_depth += 1;
                     let body = self.parse_block()?;
+                    self.loop_depth -= 1;
                     self.expect(Tok::End, "expected 'end' to close for")?;
                     self.alloc(Node::ForInStmt(name_node, vnode, table, body))
                 }
+            }
+            Tok::Repeat => {
+                self.advance()?;
+                self.loop_depth += 1;
+                let body = self.parse_block()?;
+                self.loop_depth -= 1;
+                self.expect(Tok::Until, "expected 'until' to close repeat")?;
+                let cond = self.parse_expr()?;
+                self.alloc(Node::RepeatStmt(body, cond))
+            }
+            Tok::Break => {
+                self.advance()?;
+                if self.loop_depth == 0 {
+                    return Err("break outside loop");
+                }
+                self.opt_semi();
+                self.alloc(Node::BreakStmt)
             }
             Tok::Return => {
                 self.advance()?;
@@ -210,7 +243,7 @@ impl<'s, 'l> Parser<'s, 'l> {
     fn at_block_end(&self) -> bool {
         matches!(
             self.cur,
-            Tok::Eof | Tok::End | Tok::Else | Tok::Elseif | Tok::Semi
+            Tok::Eof | Tok::End | Tok::Else | Tok::Elseif | Tok::Until | Tok::Semi
         )
     }
 

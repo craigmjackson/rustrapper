@@ -37,6 +37,7 @@ pub fn repl_loop(
                         if !handle_help(line, puts) {
                             match eval::run_repl_once(state, line, putc) {
                                 Ok(eval::ExecResult::Normal) => {}
+                                Ok(eval::ExecResult::Break) => {}
                                 Ok(eval::ExecResult::Exit) => exited = true,
                                 Ok(eval::ExecResult::Shell) => {
                                     puts("\n(nested shell not supported)\n\n");

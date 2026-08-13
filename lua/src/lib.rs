@@ -7,7 +7,9 @@
 //!   write to the global table even when a local shadows it)
 //! - Arithmetic `+ - * / %`, comparison `== ~= < <= > >=`
 //! - `and` / `or` (short-circuit) / `not`, string concat `..`
-//! - `if` / `elseif` / `else` / `end`, `while ... do ... end`
+//! - `if` / `elseif` / `else` / `end`, `while ... do ... end`, `repeat ... until
+//!   cond` (runs the body at least once; locals from the body are visible in the
+//!   condition), `break` (inside `while` / `repeat` / `for` / `for ... in` loops)
 //! - Numeric `for i = a, b [, step] do ... end`
 //! - Generic `for k [, v] in table do ... end` (iterates a table's key/value
 //!   pairs; the `in` keyword) — array fields iterate `1..n`, named fields by key
@@ -23,7 +25,7 @@
 //!   using it must run through [`LuaState::run_with_fetch`] / [`run_with_fetch`].
 //!
 //! Not supported: closures/upvalues, floats, `local function`, anonymous
-//! function literals, string methods, `repeat`, `break`, multiple assignment.
+//! function literals, string methods, multiple assignment.
 //!
 //! All interpreter state lives in a fixed-size [`LuaState`] with no dynamic
 //! allocation. `LuaState` is passed by `&mut` everywhere (no global mutable
@@ -166,6 +168,11 @@ pub enum Node {
     /// `for k [, v] in table do .. end` — iterate a table's key/value pairs.
     /// Fields are (key_var, value_var or `NO_NODE`, table_expr, body).
     ForInStmt(u16, u16, u16, u16),
+    /// `break` — terminate the innermost loop. Only valid inside a loop.
+    BreakStmt,
+    /// `repeat body until cond` — run `body` at least once, then repeat until
+    /// `cond` is true. `cond` is evaluated in the body's scope.
+    RepeatStmt(u16, u16),
     /// `return value` (value node index 0 means `return`).
     ReturnStmt(u16),
 }
@@ -619,6 +626,7 @@ pub fn run_repl(
         };
         match eval::run_repl_once(&mut state, &buf[..len], putc) {
             Ok(eval::ExecResult::Normal) => {}
+            Ok(eval::ExecResult::Break) => {}
             Ok(eval::ExecResult::Ret(_)) => {}
             Ok(eval::ExecResult::Exit) => break,
             Ok(eval::ExecResult::Shell) => {
@@ -760,6 +768,83 @@ mod tests {
     fn while_loop() {
         assert_eq!(exec("i = 0\nwhile i < 5 do print(i) i = i + 1 end").unwrap(), "0\n1\n2\n3\n4\n");
         assert_eq!(exec("while false do print(1) end\nprint(2)").unwrap(), "2\n");
+    }
+
+    #[test]
+    fn break_keyword() {
+        // break in a while loop.
+        assert_eq!(
+            exec("i = 0\nwhile true do i = i + 1 if i == 3 then break end end\nprint(i)").unwrap(),
+            "3\n"
+        );
+        // break in a numeric for loop.
+        assert_eq!(
+            exec("for i = 1, 10 do if i == 3 then break end print(i) end").unwrap(),
+            "1\n2\n"
+        );
+        // break in a generic for-in loop.
+        assert_eq!(
+            exec("t = {10, 20, 30}\nfor k, v in t do if k == 2 then break end print(v) end").unwrap(),
+            "10\n"
+        );
+        // break with a trailing semicolon.
+        assert_eq!(exec("for i = 1, 5 do break; end\nprint(0)").unwrap(), "0\n");
+        // break only exits the innermost loop.
+        assert_eq!(
+            exec("for i = 1, 3 do for j = 1, 3 do if j == 2 then break end print(i, j) end end").unwrap(),
+            "1\t1\n2\t1\n3\t1\n"
+        );
+        // statements after the loop still run.
+        assert_eq!(exec("i = 0\nwhile true do break end\nprint(i)").unwrap(), "0\n");
+    }
+
+    #[test]
+    fn break_outside_loop_errors() {
+        assert!(exec("break").is_err());
+        assert!(exec("if true then break end").is_err());
+        // A break in a function body is not inside a loop, even when the
+        // function is called from within a loop.
+        assert!(exec("function f() break end\nfor i = 1, 3 do f() end").is_err());
+    }
+
+    #[test]
+    fn repeat_until_loop() {
+        // Classic repeat loop.
+        assert_eq!(
+            exec("i = 0\nrepeat i = i + 1 until i == 3\nprint(i)").unwrap(),
+            "3\n"
+        );
+        // Body runs at least once even if the condition starts true.
+        assert_eq!(
+            exec("i = 0\nrepeat i = i + 1 until i > 0\nprint(i)").unwrap(),
+            "1\n"
+        );
+        // print() inside the body.
+        assert_eq!(
+            exec("i = 0\nrepeat print(i) i = i + 1 until i == 3").unwrap(),
+            "0\n1\n2\n"
+        );
+        // break inside repeat.
+        assert_eq!(
+            exec("i = 0\nrepeat i = i + 1 if i == 2 then break end until false\nprint(i)").unwrap(),
+            "2\n"
+        );
+        // Locals from the body are visible in the until condition (Lua).
+        assert_eq!(exec("repeat local x = 1 until x == 1\nprint(1)").unwrap(), "1\n");
+        // Empty body with a true condition runs zero extra iterations.
+        assert_eq!(exec("repeat until true\nprint(1)").unwrap(), "1\n");
+        // Step limit catches an infinite repeat.
+        assert!(exec("repeat until false").is_err());
+    }
+
+    #[test]
+    fn repeat_until_syntax_errors() {
+        // Missing until.
+        assert!(exec("repeat print(1)").is_err());
+        // Missing condition.
+        assert!(exec("repeat break until").is_err());
+        // until without repeat.
+        assert!(exec("until true").is_err());
     }
 
     #[test]
