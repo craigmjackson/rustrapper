@@ -9,6 +9,8 @@
 //! - `and` / `or` (short-circuit) / `not`, string concat `..`
 //! - `if` / `elseif` / `else` / `end`, `while ... do ... end`
 //! - Numeric `for i = a, b [, step] do ... end`
+//! - Generic `for k [, v] in table do ... end` (iterates a table's key/value
+//!   pairs; the `in` keyword) — array fields iterate `1..n`, named fields by key
 //! - Named functions `function name(a, b) ... end` and `return`
 //! - Tables: array fields, `name =` fields, `[expr]` fields, `t.key`, `t[key]`
 //! - `print(...)` builtin, `--` line comments
@@ -161,6 +163,9 @@ pub enum Node {
     WhileStmt(u16, u16),
     /// `for i = start, limit [, step] do .. end`.
     ForStmt(u16, u16, u16, u16, u16),
+    /// `for k [, v] in table do .. end` — iterate a table's key/value pairs.
+    /// Fields are (key_var, value_var or `NO_NODE`, table_expr, body).
+    ForInStmt(u16, u16, u16, u16),
     /// `return value` (value node index 0 means `return`).
     ReturnStmt(u16),
 }
@@ -763,6 +768,42 @@ mod tests {
         assert_eq!(exec("for i = 3, 1, -1 do print(i) end").unwrap(), "3\n2\n1\n");
         assert_eq!(exec("for i = 1, 10, 3 do print(i) end").unwrap(), "1\n4\n7\n10\n");
         assert_eq!(exec("for i = 1, 0 do print(i) end\nprint(0)").unwrap(), "0\n");
+    }
+
+    #[test]
+    fn for_in_loop() {
+        // Keys only.
+        assert_eq!(
+            exec("t = {10, 20, 30}\nfor k in t do print(k) end").unwrap(),
+            "1\n2\n3\n"
+        );
+        // Key/value pairs over array fields.
+        assert_eq!(
+            exec("t = {\"a\", \"b\"}\nfor k, v in t do print(k, v) end").unwrap(),
+            "1\ta\n2\tb\n"
+        );
+        // Named fields iterate by key.
+        assert_eq!(
+            exec("t = {name = \"bob\", age = 30}\nfor k, v in t do print(k, v) end").unwrap(),
+            "name\tbob\nage\t30\n"
+        );
+        // Iterating a non-table errors.
+        assert!(exec("for k in 5 do end").is_err());
+        assert!(exec("for k in nil do end").is_err());
+        // Empty table -> no iterations.
+        assert_eq!(exec("t = {}\nfor k, v in t do print(1) end\nprint(0)").unwrap(), "0\n");
+    }
+
+    #[test]
+    fn for_in_syntax_errors() {
+        // Missing `in`.
+        assert!(exec("for k in t do print(k) end\nt = {1, 2}").is_err());
+        assert!(exec("for k t do end\nt = {}").is_err());
+        // Missing `do` / `end`.
+        assert!(exec("for k in {} print(k) end").is_err());
+        assert!(exec("for k in {} do print(k)").is_err());
+        // Value variable requires a name.
+        assert!(exec("for k, in {} do end").is_err());
     }
 
     #[test]

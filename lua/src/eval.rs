@@ -203,6 +203,44 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             s.pop_frame();
             Ok(result)
         }
+        Node::ForInStmt(kvar, vvar, table, body) => {
+            let t = eval(s, table)?;
+            let tid = match t {
+                Value::Table(i) => i,
+                _ => return Err("'for in' requires a table value"),
+            };
+            let kname = node_name(s, kvar);
+            let vname = if vvar != NO_NODE {
+                Some(node_name(s, vvar))
+            } else {
+                None
+            };
+            let len = s.tbls[tid as usize].len;
+            s.push_frame()?;
+            let mut result = ExecResult::Normal;
+            for i in 0..len as usize {
+                s.steps += 1;
+                if s.steps > super::MAX_STEPS {
+                    let e = Err("step limit exceeded");
+                    s.pop_frame();
+                    return e;
+                }
+                let slot = s.tbls[tid as usize].slots[i];
+                s.set_local_top(kname, slot.key)?;
+                if let Some(vn) = vname {
+                    s.set_local_top(vn, slot.value)?;
+                }
+                match exec_block(s, body)? {
+                    ExecResult::Normal => {}
+                    r => {
+                        result = r;
+                        break;
+                    }
+                }
+            }
+            s.pop_frame();
+            Ok(result)
+        }
         Node::ReturnStmt(v) => {
             let r = if v != NO_NODE { eval(s, v)? } else { Value::Nil };
             Ok(ExecResult::Ret(r))

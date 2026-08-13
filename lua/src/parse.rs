@@ -142,21 +142,39 @@ impl<'s, 'l> Parser<'s, 'l> {
             Tok::For => {
                 self.advance()?;
                 let name = self.expect_name()?;
-                self.expect(Tok::Equals, "expected '=' in for statement")?;
-                let start = self.parse_expr()?;
-                self.expect(Tok::Comma, "expected ',' in for statement")?;
-                let limit = self.parse_expr()?;
-                let step = if self.cur == Tok::Comma {
-                    self.advance()?;
-                    self.parse_expr()?
-                } else {
-                    NO_NODE
-                };
-                self.expect(Tok::Do, "expected 'do'")?;
-                let body = self.parse_block()?;
-                self.expect(Tok::End, "expected 'end' to close for")?;
                 let name_node = self.alloc(Node::Var(name))?;
-                self.alloc(Node::ForStmt(name_node, start, limit, step, body))
+                if self.cur == Tok::Equals {
+                    // Numeric for: `for i = start, limit [, step] do .. end`.
+                    self.advance()?;
+                    let start = self.parse_expr()?;
+                    self.expect(Tok::Comma, "expected ',' in for statement")?;
+                    let limit = self.parse_expr()?;
+                    let step = if self.cur == Tok::Comma {
+                        self.advance()?;
+                        self.parse_expr()?
+                    } else {
+                        NO_NODE
+                    };
+                    self.expect(Tok::Do, "expected 'do'")?;
+                    let body = self.parse_block()?;
+                    self.expect(Tok::End, "expected 'end' to close for")?;
+                    self.alloc(Node::ForStmt(name_node, start, limit, step, body))
+                } else {
+                    // Generic for: `for k [, v] in table do .. end`.
+                    let vnode = if self.cur == Tok::Comma {
+                        self.advance()?;
+                        let vname = self.expect_name()?;
+                        self.alloc(Node::Var(vname))?
+                    } else {
+                        NO_NODE
+                    };
+                    self.expect(Tok::In, "expected 'in' in for statement")?;
+                    let table = self.parse_expr()?;
+                    self.expect(Tok::Do, "expected 'do'")?;
+                    let body = self.parse_block()?;
+                    self.expect(Tok::End, "expected 'end' to close for")?;
+                    self.alloc(Node::ForInStmt(name_node, vnode, table, body))
+                }
             }
             Tok::Return => {
                 self.advance()?;
