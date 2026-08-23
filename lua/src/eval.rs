@@ -107,6 +107,9 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
                 Value::Shell => return Ok(ExecResult::Shell),
                 Value::Dhcp => {
                     let ok = s.run_dhcp()?;
+                    if ok {
+                        s.emit_dhcp_info();
+                    }
                     tostring(s, Value::Bool(ok))?;
                     emit(s, b'\n');
                     return Ok(ExecResult::Normal);
@@ -167,7 +170,9 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                 Value::Exit => return Ok(ExecResult::Exit),
                 Value::Shell => return Ok(ExecResult::Shell),
                 Value::Dhcp => {
-                    s.run_dhcp()?;
+                    if s.run_dhcp()? {
+                        s.emit_dhcp_info();
+                    }
                     return Ok(ExecResult::Normal);
                 }
                 Value::Ls => {
@@ -517,7 +522,11 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             if argc != 0 {
                 return Err("dhcp expects no arguments");
             }
-            ExecResult::Ret(Value::Bool(s.run_dhcp()?))
+            let ok = s.run_dhcp()?;
+            if ok {
+                s.emit_dhcp_info();
+            }
+            ExecResult::Ret(Value::Bool(ok))
         }
         Value::Ls => {
             if argc != 0 {

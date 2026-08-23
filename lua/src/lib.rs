@@ -34,6 +34,12 @@
 //!   [`run_with_fetch_load`].
 //! - `ls` / `ls()` builtin: lists the files downloaded with `fetch()` this
 //!   run/session, one per line as `name (N bytes)` (nothing if none yet).
+//! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and, on
+//!   success, prints the negotiated details — MAC, IP, subnet, gateway, TFTP
+//!   server, and bootfile — from the host `dhcp_info` callback, and exposes
+//!   them as the `mac` / `ip` / `subnet` / `gateway` / `server` / `bootfile`
+//!   globals (strings) plus a numeric `tftp_port` (default 69) from the host
+//!   `dhcp_values` callback.
 //!
 //! Not supported: closures/upvalues, floats, `local function`, anonymous
 //! function literals, string methods, multiple assignment.
@@ -83,6 +89,9 @@ pub const DOFILE_CAP: usize = 4096;
 /// Maximum number of distinct files recorded by successful `fetch()` calls
 /// (for the `ls` builtin).
 pub const MAX_FETCHED: usize = 16;
+/// Scratch buffer used by `dhcp()` to hold the formatted network details
+/// (MAC / IP / subnet / gateway / TFTP server / bootfile) from the host.
+pub const DHCP_INFO_CAP: usize = 384;
 
 /// Sentinel for "no node" / end-of-chain. Node indices are well below this.
 pub const NO_NODE: u16 = u16::MAX;
@@ -94,6 +103,56 @@ pub type StrRef = u32;
 #[inline]
 pub fn strref(off: u16, len: u16) -> StrRef {
     ((off as u32) << 16) | (len as u32)
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+fn fmt_dec(v: u32, buf: &mut [u8], n: &mut usize) {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    let mut x = v;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    while i < tmp.len() {
+        buf[*n] = tmp[i];
+        *n += 1;
+        i += 1;
+    }
+}
+
+/// Format an IPv4 address as `A.B.C.D`, returning the byte length.
+fn fmt_dotted(ip: &[u8; 4], buf: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    for i in 0..4 {
+        if i > 0 {
+            buf[n] = b'.';
+            n += 1;
+        }
+        fmt_dec(ip[i] as u32, buf, &mut n);
+    }
+    n
+}
+
+/// Format a MAC address as `XX:XX:XX:XX:XX:XX`, returning the byte length.
+fn fmt_mac(mac: &[u8; 6], buf: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    for i in 0..6 {
+        if i > 0 {
+            buf[n] = b':';
+            n += 1;
+        }
+        buf[n] = HEX[(mac[i] >> 4) as usize];
+        n += 1;
+        buf[n] = HEX[(mac[i] & 0x0F) as usize];
+        n += 1;
+    }
+    n
 }
 
 /// A runtime value. Numbers are 64-bit integers (no floats).
@@ -116,6 +175,36 @@ pub enum Value {
     Exit,
     /// Builtin: `ls` / `ls()` — lists the files downloaded with `fetch()`.
     Ls,
+}
+
+/// Structured DHCP result, filled by the host `dhcp_values` callback after a
+/// successful `dhcp` and exposed to scripts as the `mac` / `ip` / `subnet` /
+/// `gateway` / `server` / `bootfile` / `tftp_port` globals.
+#[derive(Clone, Copy)]
+pub struct DhcpValues {
+    pub mac: [u8; 6],
+    pub ip: [u8; 4],
+    pub subnet: [u8; 4],
+    pub gateway: [u8; 4],
+    pub server: [u8; 4],
+    /// TFTP bootfile name, null-terminated.
+    pub bootfile: [u8; 128],
+    /// TFTP server port (defaults to 69).
+    pub tftp_port: u16,
+}
+
+impl Default for DhcpValues {
+    fn default() -> Self {
+        DhcpValues {
+            mac: [0; 6],
+            ip: [0; 4],
+            subnet: [0; 4],
+            gateway: [0; 4],
+            server: [0; 4],
+            bootfile: [0; 128],
+            tftp_port: 69,
+        }
+    }
 }
 
 /// Binary and unary operators. `And`/`Or` are handled with short-circuiting.
@@ -297,6 +386,15 @@ pub struct LuaState {
     /// bytes); the callback must not write past it. `None` means `dofile()`
     /// errors out.
     pub load: Option<fn(&str, &mut [u8]) -> Option<usize>>,
+    /// Host callback for the `dhcp` builtin result: formats the negotiated
+    /// network details (MAC, IP, subnet, gateway, TFTP server, bootfile) into
+    /// `buf`, returning the number of bytes written. The interpreter prints
+    /// the bytes after a successful `dhcp`. `None` means nothing is printed.
+    pub dhcp_info: Option<fn(&mut [u8]) -> usize>,
+    /// Host callback for the `dhcp` builtin result: fills the structured
+    /// [`DhcpValues`] (mac, ip, subnet, gateway, server, bootfile), which the
+    /// interpreter exposes as Lua globals after a successful `dhcp`.
+    pub dhcp_values: Option<fn(&mut DhcpValues)>,
 }
 
 fn noop(_c: u8) {}
@@ -349,6 +447,8 @@ impl LuaState {
             fetch: None,
             dhcp: None,
             load: None,
+            dhcp_info: None,
+            dhcp_values: None,
         }
     }
 
@@ -408,6 +508,80 @@ impl LuaState {
         self.dhcp = dhcp;
     }
 
+    /// Install a host callback that formats the negotiated network details
+    /// (MAC / IP / subnet / gateway / TFTP server / bootfile) into a buffer
+    /// for the `dhcp` builtin to print. Call `set_dhcp_info(None)` to print
+    /// nothing after `dhcp`.
+    pub fn set_dhcp_info(&mut self, dhcp_info: Option<fn(&mut [u8]) -> usize>) {
+        self.dhcp_info = dhcp_info;
+    }
+
+    /// Install a host callback that fills the structured [`DhcpValues`] so the
+    /// `dhcp` builtin can expose `mac` / `ip` / `subnet` / `gateway` / `server`
+    /// / `bootfile` as Lua globals. Call `set_dhcp_values(None)` to set nothing.
+    pub fn set_dhcp_values(&mut self, dhcp_values: Option<fn(&mut DhcpValues)>) {
+        self.dhcp_values = dhcp_values;
+    }
+
+    /// Populate the `mac` / `ip` / `subnet` / `gateway` / `server` / `bootfile`
+    /// globals (as interned strings) and the numeric `tftp_port` global from
+    /// the host [`DhcpValues`]. Called after a successful `dhcp`. Strings are
+    /// interned, so comparisons like `ip == "10.0.0.15"` work by identity.
+    pub fn set_dhcp_globals(&mut self) -> Result<(), &'static str> {
+        let cb = self.dhcp_values;
+        if let Some(f) = cb {
+            let mut v = DhcpValues::default();
+            f(&mut v);
+            let mac_name = self.intern(b"mac")?;
+            let ip_name = self.intern(b"ip")?;
+            let subnet_name = self.intern(b"subnet")?;
+            let gateway_name = self.intern(b"gateway")?;
+            let server_name = self.intern(b"server")?;
+            let bootfile_name = self.intern(b"bootfile")?;
+            let tftp_port_name = self.intern(b"tftp_port")?;
+            let mut mac_buf = [0u8; 17];
+            let mac_len = fmt_mac(&v.mac, &mut mac_buf);
+            let mac_val = self.intern(&mac_buf[..mac_len])?;
+            let mut ip_buf = [0u8; 15];
+            let ip_len = fmt_dotted(&v.ip, &mut ip_buf);
+            let ip_val = self.intern(&ip_buf[..ip_len])?;
+            let mut sub_buf = [0u8; 15];
+            let subnet_len = fmt_dotted(&v.subnet, &mut sub_buf);
+            let subnet_val = self.intern(&sub_buf[..subnet_len])?;
+            let mut gw_buf = [0u8; 15];
+            let gateway_len = fmt_dotted(&v.gateway, &mut gw_buf);
+            let gateway_val = self.intern(&gw_buf[..gateway_len])?;
+            let mut srv_buf = [0u8; 15];
+            let server_len = fmt_dotted(&v.server, &mut srv_buf);
+            let server_val = self.intern(&srv_buf[..server_len])?;
+            let bf_len = v
+                .bootfile
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(v.bootfile.len());
+            let bootfile_val = self.intern(&v.bootfile[..bf_len])?;
+            self.set_global(mac_name, Value::Str(mac_val));
+            self.set_global(ip_name, Value::Str(ip_val));
+            self.set_global(subnet_name, Value::Str(subnet_val));
+            self.set_global(gateway_name, Value::Str(gateway_val));
+            self.set_global(server_name, Value::Str(server_val));
+            self.set_global(bootfile_name, Value::Str(bootfile_val));
+            self.set_global(tftp_port_name, Value::Num(v.tftp_port as i64));
+        }
+        Ok(())
+    }
+
+    /// Emit the negotiated DHCP details via `putc` after a successful `dhcp`.
+    pub fn emit_dhcp_info(&mut self) {
+        if let Some(f) = self.dhcp_info {
+            let mut buf = [0u8; DHCP_INFO_CAP];
+            let n = f(&mut buf).min(buf.len());
+            for &b in &buf[..n] {
+                (self.putc)(b);
+            }
+        }
+    }
+
     /// Install a host `dofile()` callback: loads the Lua source for a filename
     /// (e.g. via TFTP) into a caller-provided buffer and returns its length.
     /// Call `set_load(None)` to disable the `dofile` builtin.
@@ -423,6 +597,7 @@ impl LuaState {
             Some(f) => match f() {
                 Some(fetch_cb) => {
                     self.fetch = Some(fetch_cb);
+                    self.set_dhcp_globals()?;
                     Ok(true)
                 }
                 None => Ok(false),
@@ -752,6 +927,7 @@ pub fn run_repl(
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::format;
     use std::string::String;
     use std::thread_local;
     use std::vec;
@@ -1309,6 +1485,121 @@ mod tests {
         };
         super::eval::exec_script(&mut state, first)?;
         Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
+    }
+
+    /// Mock `dhcp_info` host callback: formats the negotiated network details.
+    fn dhcp_info_test(buf: &mut [u8]) -> usize {
+        let s = b"MAC: 52:54:00:12:34:56\nIP: 10.0.0.15\nSubnet: 255.255.255.0\n\
+                  Gateway: 10.0.0.1\nTFTP Server: 10.0.0.1\nBootfile: test.lua\n";
+        let n = s.len().min(buf.len());
+        buf[..n].copy_from_slice(&s[..n]);
+        n
+    }
+
+    /// Run a script with both a mock `dhcp` and a mock `dhcp_info` callback.
+    fn exec_dhcp_info(
+        src: &str,
+        dhcp: fn() -> Option<fn(&str) -> Option<usize>>,
+    ) -> Result<String, &'static str> {
+        OUT.with(|o| o.borrow_mut().clear());
+        let mut state = super::LuaState::new();
+        state.register_builtins(putc_test);
+        state.set_fetch(None);
+        state.set_dhcp(Some(dhcp));
+        state.set_dhcp_info(Some(dhcp_info_test));
+        let first = {
+            let mut p = super::parse::Parser::new(src.as_bytes(), &mut state);
+            p.parse_script()?
+        };
+        super::eval::exec_script(&mut state, first)?;
+        Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
+    }
+
+    #[test]
+    fn dhcp_prints_network_info() {
+        let info = "MAC: 52:54:00:12:34:56\nIP: 10.0.0.15\nSubnet: 255.255.255.0\n\
+                    Gateway: 10.0.0.1\nTFTP Server: 10.0.0.1\nBootfile: test.lua\n";
+        // Bare `dhcp` statement prints the details on success.
+        assert_eq!(exec_dhcp_info("dhcp", dhcp_ok).unwrap(), info);
+        // The call form prints the details and returns true.
+        assert_eq!(exec_dhcp_info("print(dhcp())", dhcp_ok).unwrap(), format!("{}true\n", info));
+        // On failure nothing is printed and no error.
+        assert_eq!(exec_dhcp_info("dhcp", dhcp_fail).unwrap(), "");
+        assert_eq!(exec_dhcp_info("print(dhcp())", dhcp_fail).unwrap(), "false\n");
+        // fetch() works after dhcp printed its details.
+        assert_eq!(
+            exec_dhcp_info("dhcp\nprint(fetch(\"a.txt\"))", dhcp_ok).unwrap(),
+            format!("{}5\n", info)
+        );
+    }
+
+    /// Mock `dhcp_values` host callback: fills the structured DHCP result.
+    fn dhcp_values_test(v: &mut super::DhcpValues) {
+        v.mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        v.ip = [10, 0, 0, 15];
+        v.subnet = [255, 255, 255, 0];
+        v.gateway = [10, 0, 0, 1];
+        v.server = [10, 0, 0, 1];
+        let bf: &[u8] = b"test.lua";
+        v.bootfile[..bf.len()].copy_from_slice(bf);
+    }
+
+    /// Run a script with mock `dhcp` and `dhcp_values` callbacks installed.
+    fn exec_dhcp_vars(
+        src: &str,
+        dhcp: fn() -> Option<fn(&str) -> Option<usize>>,
+    ) -> Result<String, &'static str> {
+        OUT.with(|o| o.borrow_mut().clear());
+        let mut state = super::LuaState::new();
+        state.register_builtins(putc_test);
+        state.set_fetch(None);
+        state.set_dhcp(Some(dhcp));
+        state.set_dhcp_values(Some(dhcp_values_test));
+        let first = {
+            let mut p = super::parse::Parser::new(src.as_bytes(), &mut state);
+            p.parse_script()?
+        };
+        super::eval::exec_script(&mut state, first)?;
+        Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
+    }
+
+    #[test]
+    fn dhcp_sets_variable_globals() {
+        // After a successful dhcp, the fields are readable as strings.
+        assert_eq!(exec_dhcp_vars("dhcp\nprint(mac)", dhcp_ok).unwrap(), "52:54:00:12:34:56\n");
+        assert_eq!(
+            exec_dhcp_vars("dhcp\nprint(ip, subnet)", dhcp_ok).unwrap(),
+            "10.0.0.15\t255.255.255.0\n"
+        );
+        assert_eq!(
+            exec_dhcp_vars("dhcp\nprint(gateway, server)", dhcp_ok).unwrap(),
+            "10.0.0.1\t10.0.0.1\n"
+        );
+        assert_eq!(exec_dhcp_vars("dhcp\nprint(bootfile)", dhcp_ok).unwrap(), "test.lua\n");
+        // The strings are interned, so equality by content works.
+        assert_eq!(
+            exec_dhcp_vars("dhcp\nprint(ip == \"10.0.0.15\")", dhcp_ok).unwrap(),
+            "true\n"
+        );
+        assert_eq!(
+            exec_dhcp_vars("dhcp\nprint(bootfile == \"test.lua\")", dhcp_ok).unwrap(),
+            "true\n"
+        );
+        // On failure the variables are not defined.
+        assert!(exec_dhcp_vars("dhcp\nprint(mac)", dhcp_fail).is_err());
+        // dhcp() also sets them (call form).
+        assert_eq!(
+            exec_dhcp_vars("dhcp()\nprint(server)", dhcp_ok).unwrap(),
+            "10.0.0.1\n"
+        );
+        // tftp_port defaults to 69 and is a number.
+        assert_eq!(exec_dhcp_vars("dhcp\nprint(tftp_port)", dhcp_ok).unwrap(), "69\n");
+        assert_eq!(
+            exec_dhcp_vars("dhcp\nprint(tftp_port + 1)", dhcp_ok).unwrap(),
+            "70\n"
+        );
+        // On failure neither is defined.
+        assert!(exec_dhcp_vars("dhcp\nprint(tftp_port)", dhcp_fail).is_err());
     }
 
     #[test]

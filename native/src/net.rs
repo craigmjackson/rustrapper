@@ -30,6 +30,30 @@ pub fn setup_fetch_context() -> bool {
             return false;
         }
     };
+    let (iface, gateway, mask) = route_info().unwrap_or((
+        String::new(),
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::new(255, 255, 255, 0),
+    ));
+    let mac = if iface.is_empty() {
+        [0u8; 6]
+    } else {
+        iface_mac(&iface).unwrap_or([0u8; 6])
+    };
+    let bootfile = std::env::var(ENV_BOOTFILE).unwrap_or_else(|_| "test.lua".to_string());
+    let tftp_port = std::env::var(ENV_PORT)
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(69);
+    crate::fetch::set_context(
+        server,
+        local,
+        gateway,
+        mask.octets(),
+        mac,
+        bootfile.as_bytes(),
+        tftp_port,
+    );
     puts("  local IP: ");
     print_ip(&local.octets());
     putc(b'\r');
@@ -38,7 +62,6 @@ pub fn setup_fetch_context() -> bool {
     print_ip(&server.octets());
     putc(b'\r');
     putc(b'\n');
-    crate::fetch::set_context(server, local);
     true
 }
 
@@ -115,17 +138,41 @@ fn discover_network() -> Option<(Ipv4Addr, Ipv4Addr)> {
 
 /// Read the default gateway from `/proc/net/route` (little-endian hex fields).
 fn default_gateway() -> Option<Ipv4Addr> {
+    let (_, gw, _) = route_info()?;
+    (gw != Ipv4Addr::UNSPECIFIED).then_some(gw)
+}
+
+/// Parse the default route from `/proc/net/route`: (interface, gateway, mask).
+/// Fields are little-endian hex words; column order is Iface, Destination,
+/// Gateway, Flags, RefCnt, Use, Metric, Mask, MTU, Window, IRTT.
+fn route_info() -> Option<(String, Ipv4Addr, Ipv4Addr)> {
     let data = std::fs::read_to_string("/proc/net/route").ok()?;
     for line in data.lines().skip(1) {
         let mut f = line.split_whitespace();
-        let _iface = f.next()?;
+        let iface = f.next()?.to_string();
         let dest = f.next()?;
         let gw = f.next()?;
-        if dest == "00000000" && gw != "00000000" {
-            return parse_route_hex(gw);
+        let _flags = f.next()?;
+        let _refcnt = f.next()?;
+        let _use = f.next()?;
+        let _metric = f.next()?;
+        let mask = f.next()?;
+        if dest == "00000000" {
+            return Some((iface, parse_route_hex(gw)?, parse_route_hex(mask)?));
         }
     }
     None
+}
+
+/// Read a host NIC's MAC address from `/sys/class/net/<iface>/address`.
+fn iface_mac(iface: &str) -> Option<[u8; 6]> {
+    let addr = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface)).ok()?;
+    let mut parts = addr.trim().split(':');
+    let mut mac = [0u8; 6];
+    for b in mac.iter_mut() {
+        *b = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    Some(mac)
 }
 
 /// Decode a `/proc/net/route` hex field (little-endian: LSB of the u32 is the

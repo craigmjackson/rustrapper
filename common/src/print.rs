@@ -97,6 +97,105 @@ pub fn print_ip(ip: &[u8; 4]) {
     print_dec(ip[3] as u64);
 }
 
+// ── DHCP info formatter (Lua `dhcp` builtin) ───────────────────────────────
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
+#[inline]
+fn buf_push(buf: &mut [u8], n: &mut usize, b: u8) {
+    if *n < buf.len() {
+        buf[*n] = b;
+        *n += 1;
+    }
+}
+
+fn buf_push_str(buf: &mut [u8], n: &mut usize, s: &[u8]) {
+    for &b in s {
+        buf_push(buf, n, b);
+    }
+}
+
+fn buf_push_dec(buf: &mut [u8], n: &mut usize, v: u32) {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    let mut x = v;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    while i < tmp.len() {
+        buf_push(buf, n, tmp[i]);
+        i += 1;
+    }
+}
+
+fn buf_push_ip(buf: &mut [u8], n: &mut usize, ip: &[u8; 4]) {
+    for i in 0..4 {
+        if i > 0 {
+            buf_push(buf, n, b'.');
+        }
+        buf_push_dec(buf, n, ip[i] as u32);
+    }
+}
+
+fn buf_push_mac(buf: &mut [u8], n: &mut usize, mac: &[u8; 6]) {
+    for (i, &b) in mac.iter().enumerate() {
+        if i > 0 {
+            buf_push(buf, n, b':');
+        }
+        buf_push(buf, n, HEX_DIGITS[(b >> 4) as usize]);
+        buf_push(buf, n, HEX_DIGITS[(b & 0x0F) as usize]);
+    }
+}
+
+/// Format a DHCP result as `Label: value` lines into `buf` (no trailing newline
+/// beyond each line). Used by the host `dhcp_info` callback backing the Lua
+/// `dhcp` builtin. `bootfile` may be a null-terminated filename; formatting
+/// stops at the first null byte. Returns the number of bytes written.
+pub fn format_dhcp_info(
+    mac: &[u8; 6],
+    ip: &[u8; 4],
+    subnet: &[u8; 4],
+    gateway: &[u8; 4],
+    next_server: &[u8; 4],
+    bootfile: &[u8],
+    buf: &mut [u8],
+) -> usize {
+    let mut n = 0usize;
+    buf_push_str(buf, &mut n, b"MAC: ");
+    buf_push_mac(buf, &mut n, mac);
+    buf_push(buf, &mut n, b'\n');
+    buf_push_str(buf, &mut n, b"IP: ");
+    buf_push_ip(buf, &mut n, ip);
+    buf_push(buf, &mut n, b'\n');
+    buf_push_str(buf, &mut n, b"Subnet: ");
+    buf_push_ip(buf, &mut n, subnet);
+    buf_push(buf, &mut n, b'\n');
+    buf_push_str(buf, &mut n, b"Gateway: ");
+    if gateway == &[0, 0, 0, 0] {
+        buf_push_str(buf, &mut n, b"(none)");
+    } else {
+        buf_push_ip(buf, &mut n, gateway);
+    }
+    buf_push(buf, &mut n, b'\n');
+    buf_push_str(buf, &mut n, b"TFTP Server: ");
+    buf_push_ip(buf, &mut n, next_server);
+    buf_push(buf, &mut n, b'\n');
+    buf_push_str(buf, &mut n, b"Bootfile: ");
+    for &b in bootfile {
+        if b == 0 {
+            break;
+        }
+        buf_push(buf, &mut n, b);
+    }
+    buf_push(buf, &mut n, b'\n');
+    n
+}
+
 pub fn print_fmt(args: fmt::Arguments<'_>) {
     let _ = UartWriter.write_fmt(args);
 }
@@ -218,6 +317,32 @@ mod tests {
         let mut buf = [0u8; 20];
         let s = format_dec(1 << 20, &mut buf);
         assert_eq!(s, "1048576");
+    }
+
+    #[test]
+    fn dhcp_info_format() {
+        let mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        let ip = [10, 0, 0, 15];
+        let subnet = [255, 255, 255, 0];
+        let gw = [10, 0, 0, 1];
+        let srv = [10, 0, 0, 1];
+        // The bootfile is null-terminated; formatting stops at the null byte.
+        let bootfile = b"test.lua\0junk";
+        let mut buf = [0u8; 384];
+        let n = format_dhcp_info(&mac, &ip, &subnet, &gw, &srv, bootfile, &mut buf);
+        assert_eq!(
+            core::str::from_utf8(&buf[..n]).unwrap(),
+            "MAC: 52:54:00:12:34:56\nIP: 10.0.0.15\nSubnet: 255.255.255.0\n\
+             Gateway: 10.0.0.1\nTFTP Server: 10.0.0.1\nBootfile: test.lua\n"
+        );
+        // A zero gateway prints (none).
+        let no_gw = [0, 0, 0, 0];
+        let n3 = format_dhcp_info(&mac, &ip, &subnet, &no_gw, &srv, bootfile, &mut buf);
+        assert!(core::str::from_utf8(&buf[..n3]).unwrap().contains("Gateway: (none)"));
+        // Output is bounded by the buffer size.
+        let mut small = [0u8; 10];
+        let n2 = format_dhcp_info(&mac, &ip, &subnet, &gw, &srv, bootfile, &mut small);
+        assert_eq!(n2, 10);
     }
 
     #[test]

@@ -301,6 +301,71 @@ mod tests {
         OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap())
     }
 
+    /// Mock `dhcp_info` host callback: formats the negotiated network details.
+    fn mock_dhcp_info(buf: &mut [u8]) -> usize {
+        let s = b"MAC: aa:bb:cc:dd:ee:ff\nIP: 10.0.0.15\n";
+        let n = s.len().min(buf.len());
+        buf[..n].copy_from_slice(&s[..n]);
+        n
+    }
+
+    /// REPL session with `dhcp` and `dhcp_info` callbacks installed.
+    fn run_session_with_dhcp_info(keys: &[u8]) -> String {
+        feed(keys);
+        OUT.with(|o| o.borrow_mut().clear());
+        let mut state = LuaState::new();
+        state.register_builtins(putc);
+        state.set_fetch(None);
+        state.set_dhcp(Some(mock_dhcp));
+        state.set_dhcp_info(Some(mock_dhcp_info));
+        repl_loop(&mut state, get_key, putc, puts);
+        OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap())
+    }
+
+    #[test]
+    fn dhcp_prints_info_in_repl() {
+        // Bare `dhcp` prints the negotiated details, then the success marker.
+        let out = run_session_with_dhcp_info(b"dhcp\rexit\r");
+        assert!(out.contains("MAC: aa:bb:cc:dd:ee:ff"));
+        assert!(out.contains("IP: 10.0.0.15"));
+        assert!(out.contains("true"));
+    }
+
+    /// Mock `dhcp_values` host callback: fills the structured DHCP result.
+    fn mock_dhcp_values(v: &mut crate::DhcpValues) {
+        v.mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+        v.ip = [10, 0, 0, 15];
+        v.subnet = [255, 255, 255, 0];
+        v.gateway = [10, 0, 0, 1];
+        v.server = [10, 0, 0, 1];
+        let bf: &[u8] = b"test.lua";
+        v.bootfile[..bf.len()].copy_from_slice(bf);
+    }
+
+    /// REPL session with `dhcp` and `dhcp_values` callbacks installed.
+    fn run_session_with_dhcp_values(keys: &[u8]) -> String {
+        feed(keys);
+        OUT.with(|o| o.borrow_mut().clear());
+        let mut state = LuaState::new();
+        state.register_builtins(putc);
+        state.set_fetch(None);
+        state.set_dhcp(Some(mock_dhcp));
+        state.set_dhcp_values(Some(mock_dhcp_values));
+        repl_loop(&mut state, get_key, putc, puts);
+        OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap())
+    }
+
+    #[test]
+    fn dhcp_variable_globals_in_repl() {
+        // After `dhcp`, the MAC/IP/etc. globals persist across REPL lines.
+        let out = run_session_with_dhcp_values(b"dhcp\rprint(mac)\rprint(ip)\rprint(server)\rprint(bootfile)\rprint(tftp_port)\rexit\r");
+        assert!(out.contains("52:54:00:12:34:56\n"));
+        assert!(out.contains("10.0.0.15\n"));
+        assert!(out.contains("10.0.0.1\n"));
+        assert!(out.contains("test.lua\n"));
+        assert!(out.contains("69\n"));
+    }
+
     #[test]
     fn dhcp_enables_fetch_in_repl() {
         // Before `dhcp`, fetch is unavailable.

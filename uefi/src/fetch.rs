@@ -43,13 +43,17 @@ pub struct FetchFile {
 }
 
 /// Network context needed to run a TFTP transfer, set by [`set_context`]
-/// right before a Lua script executes. `fetch` uses direct MMIO e1000.
+/// right before a Lua script executes. `fetch` uses direct MMIO e1000. Also
+/// keeps the negotiated network details for the Lua `dhcp` builtin.
 struct FetchContext {
     system_table: *const EFI_SYSTEM_TABLE,
     base: u64,
     mac: [u8; 6],
     src_ip: [u8; 4],
     server_ip: [u8; 4],
+    subnet: [u8; 4],
+    gateway: [u8; 4],
+    bootfile: [u8; 128],
 }
 
 static mut FETCH_CTX: FetchContext = FetchContext {
@@ -58,6 +62,9 @@ static mut FETCH_CTX: FetchContext = FetchContext {
     mac: [0; 6],
     src_ip: [0; 4],
     server_ip: [0; 4],
+    subnet: [0; 4],
+    gateway: [0; 4],
+    bootfile: [0; 128],
 };
 
 static mut FETCH_FILES: [FetchFile; MAX_FETCH_FILES] = [
@@ -79,11 +86,30 @@ pub fn set_context(st: &EFI_SYSTEM_TABLE, base: u64, mac: &[u8; 6], cfg: &common
             mac: *mac,
             src_ip: cfg.yiaddr,
             server_ip: cfg.next_server,
+            subnet: cfg.subnet,
+            gateway: cfg.gateway,
+            bootfile: cfg.bootfile,
         };
         for f in 0..MAX_FETCH_FILES {
             FETCH_FILES[f].used = false;
         }
     }
+}
+
+/// Host `dhcp_info` callback for the Lua `dhcp` builtin: format the negotiated
+/// MAC / IP / subnet / gateway / TFTP server / bootfile into `buf`.
+pub fn dhcp_info(buf: &mut [u8]) -> usize {
+    let (mac, src_ip, subnet, gateway, server_ip, bootfile) = unsafe {
+        (
+            FETCH_CTX.mac,
+            FETCH_CTX.src_ip,
+            FETCH_CTX.subnet,
+            FETCH_CTX.gateway,
+            FETCH_CTX.server_ip,
+            FETCH_CTX.bootfile,
+        )
+    };
+    common::print::format_dhcp_info(&mac, &src_ip, &subnet, &gateway, &server_ip, &bootfile, buf)
 }
 
 /// TFTP sink writing into one slot's window of the shared buffer.
@@ -130,6 +156,21 @@ impl TftpSink for LoadSink<'_> {
 
     fn finalize(&mut self, _size: usize) -> Result<(), ()> {
         Ok(())
+    }
+}
+
+/// Host `dhcp_values` callback for the Lua `dhcp` builtin: fill the structured
+/// DHCP result so scripts can read `mac` / `ip` / `subnet` / `gateway` /
+/// `server` / `bootfile` globals.
+pub fn dhcp_values(v: &mut lua::DhcpValues) {
+    unsafe {
+        v.mac = FETCH_CTX.mac;
+        v.ip = FETCH_CTX.src_ip;
+        v.subnet = FETCH_CTX.subnet;
+        v.gateway = FETCH_CTX.gateway;
+        v.server = FETCH_CTX.server_ip;
+        v.bootfile = FETCH_CTX.bootfile;
+        v.tftp_port = 69;
     }
 }
 
