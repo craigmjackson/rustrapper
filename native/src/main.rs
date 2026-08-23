@@ -67,6 +67,51 @@ fn sys_ioctl(fd: u64, req: u64, arg: u64) -> i64 {
 }
 
 #[inline]
+fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 72u64 => ret,
+            in("rdi") fd,
+            in("rsi") cmd,
+            in("rdx") arg,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[inline]
+fn sys_nanosleep(req: *const Timespec, rem: *mut Timespec) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 35u64 => ret,
+            in("rdi") req as u64,
+            in("rsi") rem as u64,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+const F_GETFL: u64 = 3;
+const F_SETFL: u64 = 4;
+const O_NONBLOCK: u64 = 0x800;
+
+#[inline]
 fn exit_group(code: u64) -> ! {
     unsafe {
         core::arch::asm!(
@@ -112,6 +157,79 @@ fn shutdown(code: u64) -> ! {
     exit_group(code);
 }
 
+// ── Signal safety net ──────────────────────────────────────────────────────
+//
+// If the process dies by a signal (eg. an external `kill`, or a crash), the
+// terminal would otherwise be left in raw mode and the user must type `reset`.
+// A handler restores termios before exiting for every common termination path,
+// so Ctrl-C/SIGTERM/SIGSEGV etc. always return the terminal to the shell.
+
+#[repr(C)]
+struct SigAction {
+    handler: u64,
+    flags: u64,
+    restorer: u64,
+    mask: u64,
+}
+
+extern "C" fn sig_cleanup(sig: i32) {
+    restore_termios();
+    exit_group(128 + sig as u64);
+}
+
+/// Signal-frame return trampoline (`rt_sigreturn`). Never reached by
+/// [`sig_cleanup`] (which exits), but the kernel needs a valid restorer
+/// pointer when `SA_RESTORER` is set.
+extern "C" fn sig_restore_rt() {
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            in("rax") 15u64,
+            clobber_abi("system"),
+            options(noreturn, nostack),
+        );
+    }
+}
+
+#[inline]
+fn sys_rt_sigaction(sig: u64, act: *const SigAction, oldact: *mut SigAction, size: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") 13u64 => ret,
+            in("rdi") sig,
+            in("rsi") act as u64,
+            in("rdx") oldact as u64,
+            in("r10") size,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Install `sig_cleanup` for the common fatal signals so the terminal is
+/// restored even if the process is terminated by a signal rather than by the
+/// normal `shutdown` path. Must be called after `set_raw_mode` (which saves the
+/// original termios).
+fn install_signal_handlers() {
+// SIGINT, SIGQUIT, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGPIPE, SIGTERM.
+    let handler: extern "C" fn(i32) = sig_cleanup;
+    let restorer: extern "C" fn() = sig_restore_rt;
+    const SA_RESTORER: u64 = 0x0400_0000;
+    let action = SigAction {
+        handler: handler as u64,
+        flags: SA_RESTORER,
+        restorer: restorer as u64,
+        mask: 0,
+    };
+    for sig in [2u64, 3, 6, 7, 8, 11, 13, 15] {
+        sys_rt_sigaction(sig, &action, core::ptr::null_mut(), 8);
+    }
+}
+
 // ── I/O callbacks ───────────────────────────────────────────────────────────
 
 /// Low-level byte output to stdout (flushed), wired into `common::print`.
@@ -129,24 +247,76 @@ fn stdout_putc(c: u8) {
     let _ = out.flush();
 }
 
-/// Blocking single-byte input from stdin (raw mode). Exits on Ctrl-C / Ctrl-D.
+/// Decodes terminal escape sequences (arrow keys / home / end / delete) into the
+/// [`lua::repl`] key sentinels. Bytes arrive as a burst, so after `ESC` the
+/// driver polls stdin non-blockingly.
+static mut ESC: lua::repl::EscSeq = lua::repl::EscSeq::new();
+
+/// Blocking single-byte input from stdin (raw mode), decoding modifier-key
+/// escape sequences. Ctrl-D exits the program; Ctrl-C is passed through so the
+/// shell can cancel the current line.
 fn get_key() -> Option<u8> {
     let mut b = [0u8; 1];
     let n = sys_read(0, b.as_mut_ptr(), 1);
-    if n == 1 {
-        if b[0] == 0x03 {
-            // Ctrl-C (ISIG off, delivered as a literal byte)
-            shutdown(130);
-        }
-        if b[0] == 0x04 {
-            // Ctrl-D (raw mode delivers it as a literal byte)
+    if n != 1 {
+        if n == 0 {
             shutdown(0);
         }
-        Some(b[0])
-    } else if n == 0 {
+        return None;
+    }
+    let first = b[0];
+    if first == 0x04 {
         shutdown(0);
-    } else {
-        None
+    }
+    if first != 0x1b {
+        return Some(first);
+    }
+
+    // Decode an escape sequence: read the following bytes non-blockingly with
+    // short sleeps, then restore the original blocking mode.
+    let f = sys_fcntl(0, F_GETFL, 0);
+    if f < 0 {
+        return None;
+    }
+    let flags = f as u64;
+    sys_fcntl(0, F_SETFL, flags | O_NONBLOCK);
+    let esc = unsafe { &mut *core::ptr::addr_of_mut!(ESC) };
+    esc.reset();
+    let _ = esc.feed(0x1b);
+    let mut result = None;
+    let ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000, // 10 ms
+    };
+    for _ in 0..16 {
+        let mut c = [0u8; 1];
+        if sys_read(0, c.as_mut_ptr(), 1) == 1 {
+            match esc.feed(c[0]) {
+                Some(k) => {
+                    result = Some(k);
+                    break;
+                }
+                None if !esc.in_progress() => break,
+                None => {}
+            }
+        } else {
+            let mut rem = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            sys_nanosleep(&ts, &mut rem);
+        }
+    }
+    sys_fcntl(0, F_SETFL, flags);
+    result
+}
+
+/// `get_key` for the main menu: unlike the Lua shell (where Ctrl-C cancels the
+/// current line), Ctrl-C at the menu quits the program.
+fn menu_get_key() -> Option<u8> {
+    match get_key() {
+        Some(0x03) => shutdown(130),
+        k => k,
     }
 }
 
@@ -196,13 +366,14 @@ fn native_detect_device(index: usize, info: &mut common::scan::DeviceInfo) -> bo
 fn main() {
     print::init(stdout_putc);
     set_raw_mode();
+    install_signal_handlers();
     std::panic::set_hook(Box::new(|_| {
         restore_termios();
     }));
     print::puts("\nRustrapper Native (Linux x86_64)\n");
 
     loop {
-        match show_menu(print::puts, print::putc, get_key) {
+        match show_menu(print::puts, print::putc, menu_get_key) {
             MenuAction::StorageScan => {
                 print::puts("\nStorage devices:\n");
                 common::scan::scan_devices(native_detect_device);

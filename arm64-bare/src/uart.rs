@@ -16,9 +16,15 @@ pub fn putc(c: u8) {
     unsafe { write_volatile(UART_DR, c as u32) };
 }
 
+/// Decodes PL011 escape sequences (arrow keys / home / end / delete) into the
+/// [`lua::repl`] key sentinels.
+static mut ESC: lua::repl::EscSeq = lua::repl::EscSeq::new();
+
 pub fn getc() -> Option<u8> {
     if unsafe { read_volatile(UART_FR) } & UART_FR_RXFE != 0 {
         return None;
     }
-    Some(unsafe { read_volatile(UART_DR) } as u8)
+    let c = unsafe { read_volatile(UART_DR) } as u8;
+    let esc = unsafe { &mut *core::ptr::addr_of_mut!(ESC) };
+    esc.feed(c)
 }

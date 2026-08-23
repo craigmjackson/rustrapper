@@ -61,41 +61,11 @@ pub fn u16_putc(c: u8) {
     }
 }
 
-// State for multi-byte escape sequences (ESC [ 3 ~ etc.) that arrive across
+// State for multi-byte escape sequences (ESC [ A etc.) that arrive across
 // several ReadKeyStroke polls (serial-terminal input under -nographic).
+// EscSeq maps them to the lua::repl key sentinels.
 #[cfg(not(test))]
-const ESC_BUF_LEN: usize = 8;
-#[cfg(not(test))]
-static mut ESC_SEQ: [u8; ESC_BUF_LEN] = [0; ESC_BUF_LEN];
-#[cfg(not(test))]
-static mut ESC_N: usize = 0;
-
-// Temporary diagnostic: report raw scan/unicode for unrecognized keys so the
-// ARM64 UEFI backspace/delete key delivery can be identified precisely.
-#[cfg(not(test))]
-fn debug_key(scan: u16, unicode: u16) {
-    let hex = b"0123456789ABCDEF";
-    let mut buf = [0u8; 24];
-    let mut i = 0;
-    for &(label, v) in &[(b's', scan), (b'u', unicode)] {
-        buf[i] = label;
-        i += 1;
-        buf[i] = b'=';
-        i += 1;
-        for shift in [12u32, 8, 4, 0] {
-            buf[i] = hex[((v >> shift) & 0xF) as usize];
-            i += 1;
-        }
-        buf[i] = b' ';
-        i += 1;
-    }
-    buf[i] = b'\r';
-    i += 1;
-    buf[i] = b'\n';
-    i += 1;
-    let s = core::str::from_utf8(&buf[..i]).unwrap_or("");
-    u16_puts(s);
-}
+static mut ESC: lua::repl::EscSeq = lua::repl::EscSeq::new();
 
 #[cfg(not(test))]
 fn get_key() -> Option<u8> {
@@ -113,50 +83,47 @@ fn get_key() -> Option<u8> {
             let ch = unicode as u8;
 
             // Continue a partially-received escape sequence across polls.
-            if ESC_N > 0 {
-                // ESC followed by anything but '['/'O' is a lone ESC, not a
-                // sequence: cancel and reprocess this key normally.
-                let cancel = ESC_N == 1 && ch != b'[' && ch != b'O';
-                if !cancel {
-                    if ESC_N < ESC_BUF_LEN {
-                        ESC_SEQ[ESC_N] = ch;
-                    }
-                    ESC_N += 1;
-                    // Sequences end at '~', 'M', or a letter.
-                    if ch == b'~' || ch == b'M' || ch.is_ascii_alphabetic() {
-                        // Only ESC [ 3 ~ (Delete) maps to backspace; arrows and
-                        // other sequences are discarded.
-                        let delete = ESC_N == 4
-                            && ESC_SEQ[0] == b'\x1B'
-                            && ESC_SEQ[1] == b'['
-                            && ESC_SEQ[2] == b'3'
-                            && ESC_SEQ[3] == b'~';
-                        ESC_N = 0;
-                        return if delete { Some(b'\x7F') } else { None };
-                    }
-                    return None;
-                }
-                ESC_N = 0;
+            let esc = &mut *core::ptr::addr_of_mut!(ESC);
+            if esc.in_progress() {
+                return esc.feed(ch);
             }
 
-            // Backspace: unicode 0x08 / 0x7F (DEL), or EDK2 SCAN_DELETE (0x0008).
-            if ch == b'\x08' || ch == b'\x7F' || scan == 0x0008 {
+            // EFI scan codes for keys without an ASCII encoding.
+            let sentinel = match scan {
+                0x01 => Some(lua::repl::KEY_UP),
+                0x02 => Some(lua::repl::KEY_DOWN),
+                0x03 => Some(lua::repl::KEY_RIGHT),
+                0x04 => Some(lua::repl::KEY_LEFT),
+                0x05 => Some(lua::repl::KEY_HOME),
+                0x06 => Some(lua::repl::KEY_END),
+                0x08 => Some(lua::repl::KEY_DELETE),
+                _ => None,
+            };
+            if let Some(k) = sentinel {
+                return Some(k);
+            }
+
+            // Backspace: unicode 0x08 / 0x7F (DEL).
+            if ch == b'\x08' || ch == b'\x7F' {
                 return Some(b'\x7F');
             }
             // Escape: unicode 0x1B or EDK2 SCAN_ESC (0x0017) starts a sequence.
             if ch == b'\x1B' || scan == 0x0017 {
-                ESC_SEQ[0] = b'\x1B';
-                ESC_N = 1;
+                let esc = &mut *core::ptr::addr_of_mut!(ESC);
+                let _ = esc.feed(0x1b);
                 return None;
             }
             // Enter / line feeds must reach the REPL's enter handling.
             if ch == b'\r' || ch == b'\n' {
                 return Some(ch);
             }
+            // Control bytes the shell uses: Ctrl-C, Tab, Ctrl-L.
+            if ch == b'\x03' || ch == b'\x09' || ch == b'\x0c' {
+                return Some(ch);
+            }
             if unicode > 0 && ch >= 0x20 && ch < 0x7F {
                 return Some(ch);
             }
-            debug_key(scan, unicode);
             return None;
         }
     }

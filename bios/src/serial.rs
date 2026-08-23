@@ -18,6 +18,10 @@ fn putc_raw(c: u8) {
     }
 }
 
+/// Decodes serial escape sequences (arrow keys / home / end / delete) into the
+/// [`lua::repl`] key sentinels.
+static mut ESC: lua::repl::EscSeq = lua::repl::EscSeq::new();
+
 pub fn getc() -> Option<u8> {
     unsafe {
         let lsr: u8;
@@ -25,7 +29,8 @@ pub fn getc() -> Option<u8> {
         if lsr & 0x01 != 0 {
             let c: u8;
             core::arch::asm!("in al, dx", in("dx") 0x3F8u16, out("al") c);
-            Some(c)
+            let esc = &mut *core::ptr::addr_of_mut!(ESC);
+            esc.feed(c)
         } else {
             None
         }

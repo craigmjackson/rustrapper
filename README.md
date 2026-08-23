@@ -99,9 +99,16 @@ true
 > print(fetch("test.txt"))
 21
 > global booted = true
-> if booted then print("network OK") end
+> if booted then
+>> print("network OK")
+>> end
 network OK
 ```
+
+The shell supports full line editing (Left/Right/Home/End/Delete),
+Up/Down command history with draft restore, Tab completion of builtin/global
+names, Ctrl-C to cancel the current input, Ctrl-L / `clear` to clear the
+screen, and multiline continuation (`>> `) for incomplete Lua input.
 
 Supported: integers, strings, booleans, `nil`, `local`/`global` variables,
 `+ - * / %`, comparisons, `and/or/not`, `..` concat, `if/elseif/else`,
@@ -220,7 +227,7 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 245 tests across all crates
+cargo test --workspace   # 259 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
