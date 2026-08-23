@@ -111,6 +111,10 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
                     emit(s, b'\n');
                     return Ok(ExecResult::Normal);
                 }
+                Value::Ls => {
+                    ls_run(s)?;
+                    return Ok(ExecResult::Normal);
+                }
                 _ => {
                     tostring(s, v)?;
                     emit(s, b'\n');
@@ -164,6 +168,10 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                 Value::Shell => return Ok(ExecResult::Shell),
                 Value::Dhcp => {
                     s.run_dhcp()?;
+                    return Ok(ExecResult::Normal);
+                }
+                Value::Ls => {
+                    ls_run(s)?;
                     return Ok(ExecResult::Normal);
                 }
                 _ => {}
@@ -449,12 +457,21 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
             match argbuf[0] {
                 Value::Str(r) => {
-                    let fetch = s.fetch;
-                    let name = core::str::from_utf8(s.str_bytes(r))
+                    let bytes = s.str_bytes(r);
+                    if bytes.len() >= 128 {
+                        return Err("fetch filename too long");
+                    }
+                    let mut nbuf = [0u8; 128];
+                    nbuf[..bytes.len()].copy_from_slice(bytes);
+                    let name = core::str::from_utf8(&nbuf[..bytes.len()])
                         .map_err(|_| "fetch filename must be ASCII")?;
+                    let fetch = s.fetch;
                     match fetch {
                         Some(f) => match f(name) {
-                            Some(n) => ExecResult::Ret(Value::Num(n as i64)),
+                            Some(n) => {
+                                s.record_fetch_ref(r, n as u64)?;
+                                ExecResult::Ret(Value::Num(n as i64))
+                            }
                             None => ExecResult::Ret(Value::Nil),
                         },
                         None => return Err("fetch not available (no TFTP server)"),
@@ -501,6 +518,13 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 return Err("dhcp expects no arguments");
             }
             ExecResult::Ret(Value::Bool(s.run_dhcp()?))
+        }
+        Value::Ls => {
+            if argc != 0 {
+                return Err("ls expects no arguments");
+            }
+            ls_run(s)?;
+            ExecResult::Normal
         }
         Value::Func(idx) => {
             let fd = s.funcs[idx as usize];
@@ -561,6 +585,20 @@ fn dofile_exec(s: &mut LuaState, name: &str) -> Result<Value, &'static str> {
         Ok(ExecResult::Exit) => Ok(Value::Exit),
         Err(e) => Err(e),
     }
+}
+
+/// `ls`: print every file downloaded with `fetch()` this run/session, one per
+/// line as `name (N bytes)`. Prints nothing when no files have been fetched.
+fn ls_run(s: &mut LuaState) -> Result<(), &'static str> {
+    for i in 0..s.fetched_n as usize {
+        emit_bytes(s, s.str_bytes(s.fetched_names[i]));
+        emit(s, b' ');
+        emit(s, b'(');
+        let (buf, len) = itoa(s.fetched_lens[i] as i64);
+        emit_bytes(s, &buf[..len]);
+        emit_str(s, b" bytes)\n");
+    }
+    Ok(())
 }
 
 fn assign(s: &mut LuaState, target: u16, v: Value) -> Result<(), &'static str> {
@@ -689,6 +727,7 @@ fn tostring(s: &LuaState, v: Value) -> Result<(), &'static str> {
         Value::Shell => emit_str(s, b"shell"),
         Value::Dhcp => emit_str(s, b"dhcp"),
         Value::Exit => emit_str(s, b"exit"),
+        Value::Ls => emit_str(s, b"ls"),
     }
     Ok(())
 }

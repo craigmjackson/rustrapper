@@ -32,6 +32,8 @@
 //!   chunk propagate to the caller. Requires a host loader callback, so
 //!   scripts using it must run through [`LuaState::run_with_fetch_load`] /
 //!   [`run_with_fetch_load`].
+//! - `ls` / `ls()` builtin: lists the files downloaded with `fetch()` this
+//!   run/session, one per line as `name (N bytes)` (nothing if none yet).
 //!
 //! Not supported: closures/upvalues, floats, `local function`, anonymous
 //! function literals, string methods, multiple assignment.
@@ -78,6 +80,9 @@ pub const MAX_TABLES: usize = 16;
 pub const MAX_STEPS: u64 = 5_000_000;
 /// Scratch buffer used by `dofile()` to hold a loaded Lua chunk while parsing.
 pub const DOFILE_CAP: usize = 4096;
+/// Maximum number of distinct files recorded by successful `fetch()` calls
+/// (for the `ls` builtin).
+pub const MAX_FETCHED: usize = 16;
 
 /// Sentinel for "no node" / end-of-chain. Node indices are well below this.
 pub const NO_NODE: u16 = u16::MAX;
@@ -109,6 +114,8 @@ pub enum Value {
     Dhcp,
     /// Builtin: `exit()` — exits the REPL (only meaningful inside a shell).
     Exit,
+    /// Builtin: `ls` / `ls()` — lists the files downloaded with `fetch()`.
+    Ls,
 }
 
 /// Binary and unary operators. `And`/`Or` are handled with short-circuiting.
@@ -268,6 +275,11 @@ pub struct LuaState {
     pub tbls: [TableRec; MAX_TABLES],
     pub ntables: u32,
     pub steps: u64,
+    /// Files successfully downloaded by `fetch()`, for the `ls` builtin
+    /// (names are interned; lengths are the byte counts fetch returned).
+    pub fetched_names: [StrRef; MAX_FETCHED],
+    pub fetched_lens: [u64; MAX_FETCHED],
+    pub fetched_n: u8,
     /// Character output callback used by `print()`.
     pub putc: fn(u8),
     /// Host callback for the `fetch()` builtin: downloads `name` from the
@@ -330,6 +342,9 @@ impl LuaState {
             }; MAX_TABLES],
             ntables: 0,
             steps: 0,
+            fetched_names: [0; MAX_FETCHED],
+            fetched_lens: [0; MAX_FETCHED],
+            fetched_n: 0,
             putc: noop,
             fetch: None,
             dhcp: None,
@@ -337,8 +352,9 @@ impl LuaState {
         }
     }
 
-    /// Register built-in globals (`print`, `fetch`, `shell`, `dhcp`, `exit`).
-    /// Call this once after creating a fresh `LuaState` before entering the REPL.
+    /// Register built-in globals (`print`, `fetch`, `shell`, `dhcp`, `dofile`,
+    /// `exit`, `ls`). Call this once after creating a fresh `LuaState` before
+    /// entering the REPL.
     pub fn register_builtins(&mut self, putc: fn(u8)) {
         self.putc = putc;
         let _ = self.intern(b"print");
@@ -359,6 +375,9 @@ impl LuaState {
         let _ = self.intern(b"exit");
         let exit_name = self.intern(b"exit").unwrap();
         self.set_global(exit_name, Value::Exit);
+        let _ = self.intern(b"ls");
+        let ls_name = self.intern(b"ls").unwrap();
+        self.set_global(ls_name, Value::Ls);
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -412,6 +431,27 @@ impl LuaState {
         }
     }
 
+    /// Record a successful `fetch()` download for the `ls` builtin. `name` is
+    /// the (already-interned) filename of the fetched file, `len` the byte
+    /// count the fetch returned. Re-fetching a recorded name updates its
+    /// length instead of adding a duplicate entry.
+    pub fn record_fetch_ref(&mut self, name: StrRef, len: u64) -> Result<(), &'static str> {
+        for i in 0..self.fetched_n as usize {
+            if self.fetched_names[i] == name {
+                self.fetched_lens[i] = len;
+                return Ok(());
+            }
+        }
+        if self.fetched_n as usize >= MAX_FETCHED {
+            return Err("too many fetched files");
+        }
+        let i = self.fetched_n as usize;
+        self.fetched_names[i] = name;
+        self.fetched_lens[i] = len;
+        self.fetched_n += 1;
+        Ok(())
+    }
+
     /// Run a script with a host `fetch()` callback installed, so the script
     /// can call `fetch("file")` to download files from the TFTP server.
     pub fn run_with_fetch(
@@ -452,6 +492,7 @@ impl LuaState {
         self.nglobals = 0;
         self.ntables = 0;
         self.steps = 0;
+        self.fetched_n = 0;
     }
 
     // ── String arena ────────────────────────────────────────────────────────
@@ -1215,6 +1256,34 @@ mod tests {
         assert!(exec_dofile("dofile(true)").is_err());
         // No loader callback installed (plain `run`) -> clear error.
         assert!(exec("dofile(\"fortytwo.lua\")").is_err());
+    }
+
+    #[test]
+    fn ls_lists_fetched_files() {
+        // Fetch twice, then ls lists them in fetch order.
+        assert_eq!(
+            exec_fetch("fetch(\"a.txt\")\nfetch(\"b.txt\")\nls").unwrap(),
+            "a.txt (5 bytes)\nb.txt (12 bytes)\n"
+        );
+        // The call form works too.
+        assert_eq!(exec_fetch("fetch(\"a.txt\")\nls()").unwrap(), "a.txt (5 bytes)\n");
+        // No files fetched -> nothing printed.
+        assert_eq!(exec_fetch("ls").unwrap(), "");
+        // A failed fetch is not listed.
+        assert_eq!(exec_fetch("fetch(\"missing.txt\")\nls").unwrap(), "");
+        // ls() with an argument errors.
+        assert!(exec_fetch("ls(1)").is_err());
+        // print(ls) shows the type.
+        assert_eq!(exec("print(ls)").unwrap(), "ls\n");
+    }
+
+    #[test]
+    fn ls_dedupes_refetch() {
+        // Re-fetching the same name keeps one entry (length updated).
+        assert_eq!(
+            exec_fetch("fetch(\"a.txt\")\nfetch(\"a.txt\")\nls").unwrap(),
+            "a.txt (5 bytes)\n"
+        );
     }
 
     /// Mock `dhcp()` host callback: network setup succeeds and enables `fetch`.

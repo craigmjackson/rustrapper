@@ -123,6 +123,13 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Requires a TFTP server: run 'dhcp' first.\n",
     },
     HelpEntry {
+        name: "ls",
+        short: "List the files downloaded with fetch()",
+        detail: "ls\n\
+                  Lists every file successfully downloaded with fetch(\"file\"),\n\
+                  one per line as 'name (N bytes)'. Prints nothing if none yet.\n",
+    },
+    HelpEntry {
         name: "dhcp",
         short: "Set up the network (e1000 + DHCP) so fetch() works",
         detail: "dhcp\n\
@@ -315,6 +322,16 @@ mod tests {
     }
 
     #[test]
+    fn ls_in_repl() {
+        // Before fetch, ls prints nothing.
+        let out = run_session_with_fetch(b"ls\rexit\r");
+        assert!(!out.contains("bytes)"));
+        // After fetch, bare `ls` lists the downloaded files.
+        let out = run_session_with_fetch(b"fetch(\"a.txt\")\rls\rexit\r");
+        assert!(out.contains("a.txt (5 bytes)"));
+    }
+
+    #[test]
     fn fetch_failure_in_repl() {
         // Download failure -> nil, does not kill the REPL.
         let out = run_session_with_fetch(b"print(fetch(\"missing.txt\"))\rexit\r");
@@ -385,7 +402,7 @@ mod tests {
     #[test]
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
-        for cmd in ["help", "exit", "print", "fetch", "shell", "dhcp"] {
+        for cmd in ["help", "exit", "print", "fetch", "dofile", "ls", "shell", "dhcp"] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
         }
         assert!(out.contains("Type 'help <cmd>'"));

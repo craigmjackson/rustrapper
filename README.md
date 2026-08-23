@@ -112,6 +112,7 @@ Builtins:
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); enables `fetch()` and `dofile()`
 - `fetch("file")` — download a file from the TFTP server, return its byte count (or `nil`)
 - `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
+- `ls` / `ls()` — list the files downloaded with `fetch()`, as `name (N bytes)`
 - `exit` — leave the shell; `shell()` — nested shell (not supported)
 
 On the native target, `dhcp` discovers the local IP and TFTP server from the
@@ -219,7 +220,7 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 238 tests across all crates
+cargo test --workspace   # 241 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
