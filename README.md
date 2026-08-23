@@ -227,7 +227,7 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 259 tests across all crates
+cargo test --workspace   # 260 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |

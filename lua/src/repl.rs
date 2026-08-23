@@ -181,6 +181,9 @@ pub fn repl_loop(
     let mut line = [0u8; LINE_CAP];
     let mut len = 0usize;
     let mut pos = 0usize;
+    // Number of line characters currently displayed (used to erase stale text
+    // when a redraw makes the line shorter — see `redraw_line`).
+    let mut shown = 0usize;
 
     let mut hist = [[0u8; HIST_CAP]; HIST_MAX];
     let mut hist_n = 0usize;
@@ -214,6 +217,7 @@ pub fn repl_loop(
                     }
                     len = 0;
                     pos = 0;
+                    shown = 0;
                     if is_complete(&acc[..acc_len]) {
                         let mut clen = acc_len;
                         while clen > 0 && acc[clen - 1] == b'\n' {
@@ -270,7 +274,7 @@ pub fn repl_loop(
                         hist_pos -= 1;
                         load_entry(&mut acc, &mut acc_len, &mut line, &mut len, &hist[hist_pos]);
                         pos = len;
-                        render_recalled(putc, puts, &acc[..acc_len], &line[..len]);
+                        render_recalled(putc, puts, &acc[..acc_len], &line[..len], &mut shown);
                     }
                 }
                 Some(KEY_DOWN) => {
@@ -287,7 +291,7 @@ pub fn repl_loop(
                             load_entry(&mut acc, &mut acc_len, &mut line, &mut len, &hist[hist_pos]);
                             pos = len;
                         }
-                        render_recalled(putc, puts, &acc[..acc_len], &line[..len]);
+                        render_recalled(putc, puts, &acc[..acc_len], &line[..len], &mut shown);
                     }
                 }
 
@@ -305,11 +309,11 @@ pub fn repl_loop(
                 }
                 Some(KEY_HOME) => {
                     pos = 0;
-                    redraw_line(putc, puts, prompt(acc_len), &line, len, pos);
+                    redraw_line(putc, puts, prompt(acc_len), &line, len, pos, &mut shown);
                 }
                 Some(KEY_END) => {
                     pos = len;
-                    redraw_line(putc, puts, prompt(acc_len), &line, len, pos);
+                    redraw_line(putc, puts, prompt(acc_len), &line, len, pos, &mut shown);
                 }
                 Some(KEY_DELETE) => {
                     if pos < len {
@@ -317,7 +321,7 @@ pub fn repl_loop(
                             line[i] = line[i + 1];
                         }
                         len -= 1;
-                        redraw_line(putc, puts, prompt(acc_len), &line, len, pos);
+                        redraw_line(putc, puts, prompt(acc_len), &line, len, pos, &mut shown);
                     }
                 }
                 Some(b'\x7f') | Some(b'\x08') => {
@@ -327,7 +331,7 @@ pub fn repl_loop(
                             line[i] = line[i + 1];
                         }
                         len -= 1;
-                        redraw_line(putc, puts, prompt(acc_len), &line, len, pos);
+                        redraw_line(putc, puts, prompt(acc_len), &line, len, pos, &mut shown);
                     }
                 }
 
@@ -338,6 +342,7 @@ pub fn repl_loop(
                         acc_len = 0;
                         len = 0;
                         pos = 0;
+                        shown = 0;
                         draft_len = 0;
                         draft_line_len = 0;
                         hist_pos = hist_n;
@@ -347,10 +352,19 @@ pub fn repl_loop(
                 Some(0x0c) => {
                     // Ctrl-L: clear the screen (form feed).
                     putc(b'\x0c');
-                    redraw_line(putc, puts, prompt(acc_len), &line, len, pos);
+                    redraw_line(putc, puts, prompt(acc_len), &line, len, pos, &mut shown);
                 }
                 Some(0x09) => {
-                    complete(state, &mut line, &mut len, &mut pos, putc, puts, prompt(acc_len));
+                    complete(
+                        state,
+                        &mut line,
+                        &mut len,
+                        &mut pos,
+                        putc,
+                        puts,
+                        prompt(acc_len),
+                        &mut shown,
+                    );
                 }
 
                 Some(ch) if ch >= 0x20 && ch < 0x7f && len < LINE_CAP => {
@@ -367,6 +381,7 @@ pub fn repl_loop(
                         putc(b'\x08');
                     }
                     pos += 1;
+                    shown = len;
                 }
                 _ => {}
             }
@@ -383,8 +398,10 @@ fn prompt(acc_len: usize) -> &'static str {
     }
 }
 
-/// Redraw the current line in place: carriage return, erase the old content
-/// (including the prompt area), then reprint the prompt and the line.
+/// Redraw the current line in place: carriage return, erase the previously
+/// displayed content (which may be longer than the new line after an edit),
+/// then reprint the prompt and the line. `shown` tracks the most recent
+/// displayed line length so erasing always covers the old text.
 fn redraw_line(
     putc: fn(u8),
     puts: fn(&str),
@@ -392,9 +409,10 @@ fn redraw_line(
     line: &[u8],
     len: usize,
     pos: usize,
+    shown: &mut usize,
 ) {
     putc(b'\r');
-    for _ in 0..len + pr.len() {
+    for _ in 0..(*shown).max(len) + pr.len() {
         putc(b' ');
     }
     putc(b'\r');
@@ -405,6 +423,7 @@ fn redraw_line(
     for _ in 0..len - pos {
         putc(b'\x08');
     }
+    *shown = len;
 }
 
 /// After an in-place edit at `pos`, print the (shorter) tail and settle the
@@ -481,9 +500,15 @@ fn load_entry(
 
 /// Render a recalled history entry: in place for a single-line entry, otherwise
 /// on fresh lines under `> ` / `>> ` prompts.
-fn render_recalled(putc: fn(u8), puts: fn(&str), acc: &[u8], line: &[u8]) {
+fn render_recalled(
+    putc: fn(u8),
+    puts: fn(&str),
+    acc: &[u8],
+    line: &[u8],
+    shown: &mut usize,
+) {
     if acc.is_empty() {
-        redraw_line(putc, puts, "> ", line, line.len(), line.len());
+        redraw_line(putc, puts, "> ", line, line.len(), line.len(), shown);
         return;
     }
     putc(b'\n');
@@ -506,6 +531,7 @@ fn render_recalled(putc: fn(u8), puts: fn(&str), acc: &[u8], line: &[u8]) {
     for &b in line {
         putc(b);
     }
+    *shown = line.len();
 }
 
 // ── Multiline completeness ──────────────────────────────────────────────────
@@ -578,6 +604,7 @@ fn complete(
     putc: fn(u8),
     puts: fn(&str),
     pr: &str,
+    shown: &mut usize,
 ) {
     let mut start = *pos;
     while start > 0 && is_ident(line[start - 1]) {
@@ -635,6 +662,7 @@ fn complete(
             for _ in 0..(old_len - old_pos) {
                 putc(b'\x08');
             }
+            *shown = *len;
         }
         return;
     }
@@ -650,7 +678,7 @@ fn complete(
     if help_matches {
         puts("  help\n");
     }
-    redraw_line(putc, puts, pr, line, *len, *pos);
+    redraw_line(putc, puts, pr, line, *len, *pos, shown);
 }
 
 // ── Repl commands (help, clear) ─────────────────────────────────────────────
@@ -1015,6 +1043,15 @@ mod tests {
         assert!(out.contains("\n1\n"));
         // The erased '2' must not appear on its own line after the erase.
         assert!(!out.contains("> 12\n"));
+    }
+
+    #[test]
+    fn backspace_erases_previous_width() {
+        // After shrinking "123" -> "12", the redraw must erase the whole old
+        // line (5 columns including the prompt), not just the new 2-char line,
+        // so no stale character is left on screen.
+        let out = run_session(b"123\x7f\rprint(1)\rexit\r");
+        assert!(out.contains("\r     \r> 12"), "redraw should erase 5 cols:\n{}", out);
     }
 
     #[test]
