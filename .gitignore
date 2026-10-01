@@ -1,6 +1,9 @@
 target/
 bin/
 build/
+# The native package's Lua CLI source lives in src/bin/ (Cargo convention);
+# keep the top-level build output ignored but track that source directory.
+!native/src/bin/
 EFI/
 fat-root/
 test.img

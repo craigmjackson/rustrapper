@@ -23,9 +23,9 @@ BARE_ARM64_TARGET := aarch64-unknown-none
         run-x86_64-uefi-rom run-i386-bios-rom \
         i386-bios run-i386-bios check-deps \
         pxe-start pxe-stop tftp-root \
-        native run-native
+        native run-native lua run-lua
 
-all: x86_64-uefi aarch64-uefi aarch64-bare i386-bios x86_64-uefi-rom i386-bios-rom native
+all: x86_64-uefi aarch64-uefi aarch64-bare i386-bios x86_64-uefi-rom i386-bios-rom native lua
 
 # Create output directory
 $(BIN):
@@ -41,8 +41,17 @@ native: $(shell find native common lua -name '*.rs') Cargo.toml | $(BIN)
 run-native: native
 	./$(BIN)/rustrapper_native
 
+# ── Standalone Lua shell / script runner ──────────────────────────────────
+# `bin/lua` skips the boot menu and goes straight into the Lua shell, or runs
+# a script when given a file argument: ./bin/lua path/to/script.lua
+lua: native | $(BIN)
+	cp target/release/lua $(BIN)/lua
+
+run-lua: lua
+	./$(BIN)/lua $(SCRIPT)
+
 # ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
-# Loads 80 sectors (LBA 1-80, 40960 bytes) to 0x8000 and jumps there.
+# Loads 128 sectors (LBA 1-128, 65536 bytes) to 0x8000 and jumps there.
 # The 512-byte stub at 0x8000 (stage2_entry.nasm) then takes over.
 $(BIN)/bios.bin: TARGET := i386-bios
 $(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN) check-deps

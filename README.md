@@ -22,7 +22,7 @@ target links only the shared `common` and `lua` crates.
 - **ARM64 bare‑metal** — No firmware: PL011 UART, PCI ECAM walk, AHCI probe, PXE boot
 - **BIOS option ROM** — Legacy PCI expansion ROM from `rust_payload.bin` via `romwrap --bios`
 - **ROM wrapper** — Rust CLI tool wraps PE/COFF into UEFI PCI option ROM (`--bios` for BIOS option ROM)
-- **Native Linux** — Same menu + Lua interpreter as a host binary; the kernel handles networking (`make run-native`)
+- **Native Linux** — Same menu + Lua interpreter as a host binary; the kernel handles networking (`make run-native`). `make lua` builds a standalone `bin/lua` shell / script runner that skips the menu
 - **Lua interpreter** — no_std, no heap, fixed static buffers. A `[3] Lua Shell` menu entry and PXE `.lua` scripts run the same interpreter (`dhcp`, `fetch()`, `global`, `local`, tables, functions, loops)
 - **PXE Boot** — DHCP options 66/67, TFTP client (RFC 1350), executes PE/COFF/ELF32/ELF64/Multiboot and `.lua` scripts
 
@@ -41,11 +41,12 @@ make all                          # Build everything (firmware + native)
 make run-x86_64-uefi              # x86_64 UEFI in QEMU (e1000 NIC, full DHCP, PXE boot)
 make run-aarch64-bare             # ARM64 bare-metal + AHCI drive
 make run-native                   # Run the native Linux binary (no QEMU)
+make run-lua                      # Standalone Lua shell on the host (no QEMU)
 ```
 
-The `run-*` targets automatically start an OpenWrt VM as the DHCP/TFTP PXE
-server and populate `tftp-root/` with bootloader binaries, the Lua demo
-(`test.lua`), and a test file.
+The firmware `run-*` targets automatically start an OpenWrt VM as the
+DHCP/TFTP PXE server and populate `tftp-root/` with bootloader binaries, the
+Lua demo (`test.lua`), and a test file.
 
 ## Build Targets
 
@@ -58,6 +59,7 @@ server and populate `tftp-root/` with bootloader binaries, the Lua demo
 | `make x86_64-uefi-rom` | `bin/rustrapper_efi.rom`                       | PCI expansion ROM (UEFI option ROM) |
 | `make i386-bios-rom`   | `bin/rustrapper_bios.rom`                      | PCI expansion ROM (BIOS option ROM) |
 | `make native`          | `bin/rustrapper_native`                        | Native Linux x86_64 binary          |
+| `make lua`             | `bin/lua`                                      | Standalone Lua shell / script runner |
 
 ## Run in QEMU
 
@@ -69,6 +71,8 @@ make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM (direct e
 make run-aarch64-uefi             # ARM64 UEFI (e1000 NIC via direct PCI scan)
 make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 make run-native                   # Native Linux binary (runs on the host, no QEMU)
+make run-lua                      # Standalone Lua shell (runs on the host, no QEMU)
+make run-lua SCRIPT=lua/demo/test.lua   # Run a Lua script on the host
 ```
 
 All firmware run targets use `-nographic` (Ctrl-A X to exit) and need the
@@ -124,6 +128,11 @@ Builtins:
 
 On the native target, `dhcp` discovers the local IP and TFTP server from the
 kernel instead of running DHCP itself.
+
+The same shell runs on the host without the boot menu: `make lua` builds
+`bin/lua`. `./bin/lua` starts the shell directly, and `./bin/lua script.lua`
+runs a script (exit status 0 on success, 1 on error, with the error message on
+stderr) — handy for testing Lua scripts outside QEMU.
 
 ## Network Support
 
@@ -211,9 +220,13 @@ directory. This needs no root privileges and no external TFTP server.
 │       ├── loader.rs   # ELF64 execution
 │       ├── fetch.rs    # Lua `fetch()` host callback (static BSS slots)
 │       └── main.rs     # global_asm! entry, UART/PCI init
-├── native/             # Native Linux x86_64 binary (std; kernel handles networking)
+├── native/             # Native Linux x86_64 binaries (std; kernel handles networking)
 │   └── src/
-│       ├── main.rs     # Menu loop, raw-terminal input, storage scan via /sys/block
+│       ├── lib.rs      # Shared lib (term/net/fetch/cli) backing both binaries
+│       ├── term.rs     # Raw-terminal I/O + signal-safe cleanup
+│       ├── cli.rs      # Standalone `bin/lua` entry: REPL or run a .lua file
+│       ├── bin/lua.rs  # Standalone Lua shell / script runner
+│       ├── main.rs     # Menu loop, storage scan via /sys/block
 │       ├── net.rs      # Kernel networking: gateway/IP from /proc + std UDP TFTP client
 │       └── fetch.rs    # Lua `dhcp` + `fetch()` host callbacks (std Mutex)
 ├── romwrap/            # CLI tool: wraps PE/COFF into PCI option ROM

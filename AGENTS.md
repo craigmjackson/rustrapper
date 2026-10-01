@@ -75,11 +75,14 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
-├── native/                 # Native Linux x86_64 binary (std, no_std deps)
+├── native/                 # Native Linux x86_64 binaries (std, no_std deps)
 │   ├── Cargo.toml          # Depends only on common + lua (no external crates)
 │   └── src/
-│       ├── main.rs         # Menu loop, raw-terminal input (termios via inline
-│       │                   #   syscalls), storage scan via /sys/block
+│       ├── lib.rs          # Shared lib backing both the native and lua binaries
+│       ├── term.rs         # Raw-terminal I/O + signal-safe cleanup (inline syscalls)
+│       ├── cli.rs          # `bin/lua` entry: REPL or run a .lua file
+│       ├── bin/lua.rs      # Standalone Lua shell / script runner (bin/lua)
+│       ├── main.rs         # Menu loop, storage scan via /sys/block
 │       ├── net.rs          # Kernel networking: gateway/IP from /proc + std UDP
 │       │                   #   TFTP client (reuses common::tftp wire protocol)
 │       └── fetch.rs        # Lua `dhcp` + `fetch()` host callbacks (std Mutex)
@@ -423,11 +426,13 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `native/` — Native Linux x86_64 target
 
-- A std binary (`x86_64-linux-gnu`) that links the `common` (menu/print/scan/tftp-protocol) and `lua` crates — both `#![no_std]` libs — so it runs the same menu and Lua interpreter as the firmware targets with **zero external crate dependencies**. Exists for fast iteration on the Lua interpreter.
-- `main.rs`: sets a raw terminal (termios via inline `syscall`s — no libc), presents the `[1]/[2]/[3]` menu via `common::menu::show_menu`, and runs the Lua REPL via `lua::repl::repl_loop`. `get_key` decodes arrow/Home/End/Delete escape sequences with an `O_NONBLOCK`-and-`nanosleep` lookahead after `ESC` (fcntl + nanosleep syscalls) into the `lua::repl` sentinels; Ctrl-C (ISIG cleared) is passed to the shell, which cancels the current line. `show_menu` uses a `menu_get_key` wrapper so Ctrl-C at the main menu instead quits the program (exit 130); Ctrl-D exits from either. Signal handlers (`rt_sigaction`) are installed for SIGINT/SIGQUIT/SIGABRT/SIGBUS/SIGFPE/SIGSEGV/SIGPIPE/SIGTERM so the terminal is still restored if the process dies by a signal (e.g. an external `kill`) rather than the normal `shutdown` path — a bare signal death would otherwise leave the terminal in raw mode (requiring `reset`). Storage scan enumerates `/sys/block`.
+- A std package (`x86_64-linux-gnu`) that links the `common` (menu/print/scan/tftp-protocol) and `lua` crates — both `#![no_std]` libs — so it runs the same menu and Lua interpreter as the firmware targets with **zero external crate dependencies**. Exists for fast iteration on the Lua interpreter.
+- **The package is a lib plus two binaries.** `lib.rs` exposes `term` (raw terminal + signal/panic cleanup), `net` (kernel route discovery + std UDP TFTP client), `fetch` (`dhcp`/`fetch()`/`dofile()` host callbacks) and `cli` (shared entry logic), so both binaries share the same code. The `native` bin (`src/main.rs`) shows the boot menu; the `lua` bin (`src/bin/lua.rs`, via `native::cli::run_lua_cli`) skips the menu and goes straight into the Lua shell, or runs a `.lua` file passed as its first argument (`bin/lua script.lua`, exit status 0/1). Built by `make native` (`bin/rustrapper_native`) and `make lua` (`bin/lua`); run with `make run-native` / `make run-lua` (`make run-lua SCRIPT=lua/demo/test.lua`).
+- `term.rs`: sets a raw terminal (termios via inline `syscall`s — no libc) and provides `init`/`get_key`/`shutdown`. `get_key` decodes arrow/Home/End/Delete escape sequences with an `O_NONBLOCK`-and-`nanosleep` lookahead after `ESC` (fcntl + nanosleep syscalls) into the `lua::repl` sentinels; Ctrl-C (ISIG cleared) is passed through, so the shell can cancel the current line. Signal handlers (`rt_sigaction`) are installed for SIGINT/SIGQUIT/SIGABRT/SIGBUS/SIGFPE/SIGSEGV/SIGPIPE/SIGTERM so the terminal is still restored if the process dies by a signal (e.g. an external `kill`) rather than the normal `shutdown` path — a bare signal death would otherwise leave the terminal in raw mode (requiring `reset`). A panic hook does the same.
+- `main.rs`: presents the `[1]/[2]/[3]` menu via `common::menu::show_menu` and runs the Lua REPL via `lua::repl::repl_loop`; `menu_get_key` makes Ctrl-C at the main menu quit the program (exit 130) while Ctrl-D exits from either place. Storage scan enumerates `/sys/block`.
+- `cli.rs`: the `lua` binary. With a file argument it reads the source, runs it through `run_with_fetch_load`, and exits 0/1 (errors go to stderr as `lua: <file>: <error>`); with no argument it calls `term::init` and starts the REPL. Script mode keeps the terminal cooked and uses `term::raw_putc` (no `\r\n` translation), so output pipes/redirects cleanly.
 - `net.rs`: the kernel handles networking. `setup_fetch_context` discovers the (TFTP server, local IP) from `/proc/net/route` (default gateway, little-endian hex) and the UDP connect-to-discover-local-IP trick; overridable via `RUSTWRAPPER_TFTP_SERVER` / `RUSTWRAPPER_TFTP_PORT` (default 69) / `RUSTWRAPPER_BOOTFILE` (default `test.lua`). It also records the gateway/subnet (route Mask column), the NIC MAC (`/sys/class/net/<iface>/address`), the bootfile, and the TFTP port (`RUSTWRAPPER_TFTP_PORT`, default 69) so the `dhcp` builtin can print them. `tftp_download` is a std UDP client reusing `common::tftp`'s `build_rrq`/`parse_data`/`build_ack`/`parse_oack` and the `TftpSink` trait (no e1000, no raw packets).
 - `fetch.rs`: `dhcp_fn` (the `dhcp` builtin) discovers the network and enables `fetch_file`; `dhcp_info` formats the discovered details for the Lua `dhcp` builtin; downloads are kept in `std::sync::Mutex`-backed Vecs.
-- Built by `make native` → `bin/rustrapper_native`; run with `make run-native`.
 
 ### `Makefile` — Build orchestration
 
@@ -436,7 +441,8 @@ The following details apply to the common e1000 driver used by all three targets
 - The `rustrapper.efi`, `rustrapper_arm64.efi`, and `rustrapper_arm64_bare.elf` targets list `$(shell find ... lua -name '*.rs')` in their deps so all three rebuild when the `lua/` crate changes (all three link the interpreter).
 - `i386-bios` target requires nightly (`-Zjson-target-spec -Zbuild-std=core`). Produces `bin/stage2_entry.bin` (entry stub + incbinned Rust payload) and `bin/rust_payload.bin` (raw binary).
 - `run-i386-bios` and `run-i386-bios-rom` use `-boot order=c` so SeaBIOS boots the hard disk first (skipping the e1000's iPXE option-ROM network-boot attempt, which otherwise stalls ~90s fighting the running PXE server before falling through to disk). They also use `-nographic` (matching all other BIOS targets) so Ctrl-A X exits cleanly. The Rust stage2 also writes to VGA text mode, so it works with `-display curses` too (but Ctrl-A X won't work in curses mode — kill the process instead).
-- All `run-*` targets automatically create `tftp-root/` (copying the UEFI/BIOS binaries and `lua/demo/test.lua` as `test.lua`), start the OpenWrt PXE VM (`pxe-start`, DHCP/TFTP on 10.0.0.1 serving `/tftpboot`), and boot QEMU with `-netdev socket` multicast networking. No root privileges or external TFTP server required.
+- `native` builds the whole `native` package (menu + Lua binaries) and copies `bin/rustrapper_native`; `lua` copies that same build's `bin/lua` (standalone shell / `.lua` script runner). `run-native` / `run-lua` run them on the host (no QEMU); `make run-lua SCRIPT=lua/demo/test.lua` passes a script argument. `all` builds `lua` too.
+- All firmware `run-*` targets automatically create `tftp-root/` (copying the UEFI/BIOS binaries and `lua/demo/test.lua` as `test.lua`), start the OpenWrt PXE VM (`pxe-start`, DHCP/TFTP on 10.0.0.1 serving `/tftpboot`), and boot QEMU with `-netdev socket` multicast networking. No root privileges or external TFTP server required.
 
 ### PXE Boot Flow
 
@@ -596,6 +602,8 @@ make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
 make run-aarch64-uefi            # ARM64 UEFI from FAT directory
 make run-aarch64-bare            # ARM64 bare-metal + AHCI drive
 make run-native                  # Run the native Linux binary interactively
+make lua                         # Build standalone Lua shell / script runner (bin/lua)
+make run-lua                     # Run bin/lua (SCRIPT=file.lua to run a script)
 make clean                       # Clean all artifacts (keeps SeaBIOS checkout)
 make x86_64-seabios-clean        # Remove SeaBIOS checkout
 ```
@@ -617,6 +625,7 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 | `aarch64-unknown-none`          | ARM64  | None (bare-metal) | `bin/rustrapper_arm64_bare.elf`    |
 | `x86_64-linux-gnu` (romwrap)    | Host   | —                 | `target/debug/romwrap`           |
 | `x86_64-linux-gnu` (native)     | Host   | —                 | `bin/rustrapper_native`          |
+| `x86_64-linux-gnu` (lua)        | Host   | —                 | `bin/lua`                        |
 | `i386-unknown-none` (BIOS)      | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | `i386-unknown-none` (Rust BIOS) | i386   | BIOS (32-bit PM)  | `bin/rust_payload.bin`, `bin/stage2_entry.bin` |
 | PCI Option ROM (UEFI)           | x86_64 | UEFI (ROM)        | `bin/rustrapper_efi.rom`         |
