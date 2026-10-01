@@ -537,6 +537,10 @@ impl<'s, 'l> Parser<'s, 'l> {
                 self.advance()?;
                 self.alloc(Node::Num(v))?
             }
+            Tok::Float(v) => {
+                self.advance()?;
+                self.alloc(Node::Float(v))?
+            }
             Tok::Str(_len) => {
                 let r = self.state.intern(self.lex.buf())?;
                 self.advance()?;

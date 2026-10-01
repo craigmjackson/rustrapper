@@ -51,7 +51,7 @@ run-lua: lua
 	./$(BIN)/lua $(SCRIPT)
 
 # ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
-# Loads 128 sectors (LBA 1-128, 65536 bytes) to 0x8000 and jumps there.
+# Loads 256 sectors (LBA 1-256, 131072 bytes) to 0x8000 and jumps there.
 # The 512-byte stub at 0x8000 (stage2_entry.nasm) then takes over.
 $(BIN)/bios.bin: TARGET := i386-bios
 $(BIN)/bios.bin: $(BIOS_SRC)/mbr.asm | $(BIN) check-deps

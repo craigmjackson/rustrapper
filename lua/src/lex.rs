@@ -9,6 +9,8 @@
 pub enum Tok {
     Eof,
     Num(i64),
+    /// Floating-point literal (`5.5`, `.5`, `5.`, `1e3`, `2.5e-2`).
+    Float(f64),
     /// String literal length in bytes, decoded into `Lexer::buf`.
     Str(u16),
     /// Identifier, as (source offset, length).
@@ -195,6 +197,9 @@ impl<'a> Lexer<'a> {
                 if self.pos + 1 < self.src.len() && self.src[self.pos + 1] == b'.' {
                     self.pos += 2;
                     Ok(Tok::DotDot)
+                } else if self.pos + 1 < self.src.len() && self.src[self.pos + 1].is_ascii_digit() {
+                    // `.5` — a float with no integer part.
+                    self.lex_number()
                 } else {
                     self.pos += 1;
                     Ok(Tok::Dot)
@@ -248,18 +253,55 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Decimal integer literal. Floats are not part of the subset.
+    /// Number literal: decimal integer (`5`) or float (`5.5`, `.5`, `5.`,
+    /// `1e3`, `2.5e-2`). A `.` is only taken as a decimal point when it is not
+    /// the start of the `..` concat operator, so `5..3` still concatenates.
     fn lex_number(&mut self) -> Result<Tok, &'static str> {
-        let mut val: i64 = 0;
-        let mut any = false;
+        let start = self.pos;
+        let mut is_float = false;
+        if self.peek() == b'.' {
+            is_float = true;
+            self.pos += 1;
+        }
         while matches!(self.peek(), b'0'..=b'9') {
-            val = val.wrapping_mul(10).wrapping_add((self.bump() - b'0') as i64);
-            any = true;
+            self.pos += 1;
         }
-        if !any {
-            return Err("malformed number");
+        if !is_float && self.peek() == b'.' {
+            if self.pos + 1 >= self.src.len() || self.src[self.pos + 1] != b'.' {
+                is_float = true;
+                self.pos += 1;
+                while matches!(self.peek(), b'0'..=b'9') {
+                    self.pos += 1;
+                }
+            }
         }
-        Ok(Tok::Num(val))
+        // Exponent: `e`/`E`, optional sign, at least one digit.
+        if matches!(self.peek(), b'e' | b'E') {
+            let save = self.pos;
+            self.pos += 1;
+            if matches!(self.peek(), b'+' | b'-') {
+                self.pos += 1;
+            }
+            if matches!(self.peek(), b'0'..=b'9') {
+                is_float = true;
+                while matches!(self.peek(), b'0'..=b'9') {
+                    self.pos += 1;
+                }
+            } else {
+                self.pos = save;
+            }
+        }
+        let text = core::str::from_utf8(&self.src[start..self.pos])
+            .map_err(|_| "malformed number")?;
+        if is_float {
+            text.parse::<f64>()
+                .map(Tok::Float)
+                .map_err(|_| "malformed number")
+        } else {
+            text.parse::<i64>()
+                .map(Tok::Num)
+                .map_err(|_| "malformed number")
+        }
     }
 
     /// Identifier or keyword.

@@ -114,10 +114,13 @@ Up/Down command history with draft restore, Tab completion of builtin/global
 names, Ctrl-C to cancel the current input, Ctrl-L / `clear` to clear the
 screen, and multiline continuation (`>> `) for incomplete Lua input.
 
-Supported: integers, strings, booleans, `nil`, `local`/`global` variables,
-`+ - * / %`, comparisons, `and/or/not`, `..` concat, `if/elseif/else`,
-`while`, `repeat ... until`, `break`, `goto`/labels, numeric `for`, generic
+Supported: integers and floats (IEEE-754 doubles, e.g. `5.5`, `.5`, `1e3`),
+strings, booleans, `nil`, `local`/`global` variables, `+ - * / %`,
+comparisons, `and/or/not`, `..` concat, `if/elseif/else`, `while`,
+`repeat ... until`, `break`, `goto`/labels, numeric `for`, generic
 `for k, v in table`, named `function`/`return`, tables, `print()`, comments.
+`int / int` stays integer (`10/3 == 3`); mixing in a float promotes to float,
+and floats print like Lua's `%.14g` (`5.0`, `1/3.0` -> `0.33333333333333`).
 
 Builtins:
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
@@ -184,7 +187,7 @@ directory. This needs no root privileges and no external TFTP server.
 │   ├── demo/test.lua   # PXE demo script (fib, tables, fetch())
 │   └── src/
 │       ├── lib.rs      # LuaState (~38 KB), run(), intern(), host tests
-│       ├── lex.rs      # Tokenizer (ints, strings, comments, symbols)
+│       ├── lex.rs      # Tokenizer (ints, floats, strings, comments, symbols)
 │       ├── parse.rs    # Recursive-descent parser → AST
 │       ├── eval.rs     # Tree-walking evaluator (functions, tables, control flow)
 │       └── repl.rs     # Interactive shell driver (shared by all targets)
@@ -240,13 +243,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 262 tests across all crates
+cargo test --workspace   # 264 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
-| `common`     | 97    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 51    | Lexer, parser, evaluator, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
+| `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
+| `lua`        | 86    | Lexer, parser, evaluator, integer & float arithmetic and formatting, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

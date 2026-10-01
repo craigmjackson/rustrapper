@@ -16,6 +16,35 @@ pub enum ExecResult {
     Exit,
 }
 
+/// Numeric `for` loop iterator state: exact integers when all bounds are
+/// integers, floating point when any bound is a float.
+#[derive(Clone, Copy)]
+enum NumIter {
+    Int(i64, i64, i64),
+    Float(f64, f64, f64),
+}
+
+/// Numeric view of a value, accepting both integers and floats.
+fn float_of(v: Value) -> Option<f64> {
+    match v {
+        Value::Num(n) => Some(n as f64),
+        Value::Float(f) => Some(f),
+        _ => None,
+    }
+}
+
+/// `f64::floor` without libm: truncate toward zero via an `i64` cast, then step
+/// down when the truncation rounded up. Exact for `|x| < 2^63`.
+fn float_floor(x: f64) -> f64 {
+    let t = x as i64;
+    let tf = t as f64;
+    if tf > x {
+        tf - 1.0
+    } else {
+        tf
+    }
+}
+
 /// Execute the top-level script (its own scope frame).
 pub fn exec_script(s: &mut LuaState, first: u16) -> Result<(), &'static str> {
     s.push_frame()?;
@@ -92,7 +121,7 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
     // But skip if it's an assignment (name = ...).
     let mut lex = super::lex::Lexer::new(line);
     let tok = lex.next_token();
-    let is_expr_start = matches!(tok, Ok(super::lex::Tok::Name(_, _) | super::lex::Tok::Num(_) | super::lex::Tok::Str(_) | super::lex::Tok::LParen | super::lex::Tok::True | super::lex::Tok::False | super::lex::Tok::Nil | super::lex::Tok::Dot | super::lex::Tok::Minus | super::lex::Tok::Not));
+    let is_expr_start = matches!(tok, Ok(super::lex::Tok::Name(_, _) | super::lex::Tok::Num(_) | super::lex::Tok::Float(_) | super::lex::Tok::Str(_) | super::lex::Tok::LParen | super::lex::Tok::True | super::lex::Tok::False | super::lex::Tok::Nil | super::lex::Tok::Dot | super::lex::Tok::Minus | super::lex::Tok::Not));
     if is_expr_start {
         // Skip assignments: "x = ..." should not be treated as a bare expression.
         let mut lex2 = super::lex::Lexer::new(line);
@@ -254,17 +283,22 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             Ok(result)
         }
         Node::ForStmt(var, start, limit, step, body) => {
-            let (mut cur, lim, stp) = match (
-                eval(s, start)?,
-                eval(s, limit)?,
-                if step != NO_NODE {
-                    eval(s, step)?
-                } else {
-                    Value::Num(1)
-                },
-            ) {
-                (Value::Num(a), Value::Num(b), Value::Num(c)) => (a, b, c),
-                _ => return Err("for loop bound must be a number"),
+            let sv = eval(s, start)?;
+            let lv = eval(s, limit)?;
+            let stv = if step != NO_NODE {
+                eval(s, step)?
+            } else {
+                Value::Num(1)
+            };
+            // All-integer bounds keep exact integer iteration; if any bound is
+            // a float the loop runs in floating point (Lua-like).
+            let mut iter = match (sv, lv, stv) {
+                (Value::Num(a), Value::Num(b), Value::Num(c)) => NumIter::Int(a, b, c),
+                (a, b, c) => NumIter::Float(
+                    float_of(a).ok_or("for loop bound must be a number")?,
+                    float_of(b).ok_or("for loop bound must be a number")?,
+                    float_of(c).ok_or("for loop bound must be a number")?,
+                ),
             };
             let name = node_name(s, var);
             s.push_frame()?;
@@ -276,11 +310,23 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                     s.pop_frame();
                     return e;
                 }
-                let done = if stp >= 0 { cur > lim } else { cur < lim };
-                if done {
-                    break;
-                }
-                s.set_local_top(name, Value::Num(cur))?;
+                let value = match iter {
+                    NumIter::Int(cur, lim, stp) => {
+                        if if stp >= 0 { cur > lim } else { cur < lim } {
+                            break;
+                        }
+                        iter = NumIter::Int(cur.wrapping_add(stp), lim, stp);
+                        Value::Num(cur)
+                    }
+                    NumIter::Float(cur, lim, stp) => {
+                        if if stp >= 0.0 { cur > lim } else { cur < lim } {
+                            break;
+                        }
+                        iter = NumIter::Float(cur + stp, lim, stp);
+                        Value::Float(cur)
+                    }
+                };
+                s.set_local_top(name, value)?;
                 match exec_block(s, body)? {
                     ExecResult::Normal => {}
                     ExecResult::Break => break,
@@ -289,7 +335,6 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                         break;
                     }
                 }
-                cur = cur.wrapping_add(stp);
             }
             s.pop_frame();
             Ok(result)
@@ -358,6 +403,7 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
         Node::True => Ok(Value::Bool(true)),
         Node::False => Ok(Value::Bool(false)),
         Node::Num(v) => Ok(Value::Num(v)),
+        Node::Float(v) => Ok(Value::Float(v)),
         Node::Str(r) => Ok(Value::Str(r)),
         Node::Var(name) => s.lookup(name).ok_or("undefined variable"),
         Node::Bin(op, l, r) => {
@@ -379,6 +425,7 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
         }
         Node::Un(Op::Neg, x) => match eval(s, x)? {
             Value::Num(v) => Ok(Value::Num(v.wrapping_neg())),
+            Value::Float(v) => Ok(Value::Float(-v)),
             _ => Err("attempt to perform arithmetic on a non-number value"),
         },
         Node::Index(base, key) => {
@@ -658,6 +705,9 @@ fn val_eq(a: Value, b: Value) -> bool {
         (Value::Nil, Value::Nil) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Num(x), Value::Num(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        // Numbers compare across int/float: `1 == 1.0` is true in Lua.
+        (Value::Num(x), Value::Float(y)) | (Value::Float(y), Value::Num(x)) => x as f64 == y,
         // Strings are interned, so identity equals content equality.
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Table(x), Value::Table(y)) => x == y,
@@ -671,43 +721,64 @@ fn binop(s: &mut LuaState, op: Op, a: Value, b: Value) -> Result<Value, &'static
     use Op::*;
     match op {
         Add | Sub | Mul | Div | Mod => {
-            let (x, y) = match (a, b) {
-                (Value::Num(x), Value::Num(y)) => (x, y),
-                _ => return Err("attempt to perform arithmetic on a non-number value"),
-            };
+            // Integer/integer stays in exact integer arithmetic (the existing
+            // semantics); if either side is a float, promote both to f64.
+            if let (Value::Num(x), Value::Num(y)) = (a, b) {
+                let r = match op {
+                    Add => x.wrapping_add(y),
+                    Sub => x.wrapping_sub(y),
+                    Mul => x.wrapping_mul(y),
+                    Div => {
+                        if y == 0 {
+                            return Err("division by zero");
+                        }
+                        x / y
+                    }
+                    Mod => {
+                        if y == 0 {
+                            return Err("division by zero");
+                        }
+                        x.rem_euclid(y)
+                    }
+                    _ => 0,
+                };
+                return Ok(Value::Num(r));
+            }
+            let x = float_of(a).ok_or("attempt to perform arithmetic on a non-number value")?;
+            let y = float_of(b).ok_or("attempt to perform arithmetic on a non-number value")?;
             let r = match op {
-                Add => x.wrapping_add(y),
-                Sub => x.wrapping_sub(y),
-                Mul => x.wrapping_mul(y),
-                Div => {
-                    if y == 0 {
-                        return Err("division by zero");
-                    }
-                    x / y
-                }
-                Mod => {
-                    if y == 0 {
-                        return Err("division by zero");
-                    }
-                    x.rem_euclid(y)
-                }
-                _ => 0,
+                Add => x + y,
+                Sub => x - y,
+                Mul => x * y,
+                // Float division by zero yields inf/nan (Lua), unlike integers.
+                Div => x / y,
+                // Lua float modulo: a - floor(a/b) * b.
+                Mod => x - float_floor(x / y) * y,
+                _ => 0.0,
             };
-            Ok(Value::Num(r))
+            Ok(Value::Float(r))
         }
         Eq => Ok(Value::Bool(val_eq(a, b))),
         Ne => Ok(Value::Bool(!val_eq(a, b))),
         Lt | Le | Gt | Ge => {
-            let (x, y) = match (a, b) {
-                (Value::Num(x), Value::Num(y)) => (x, y),
-                _ => return Err("attempt to compare non-number values"),
-            };
-            let r = match op {
-                Lt => x < y,
-                Le => x <= y,
-                Gt => x > y,
-                Ge => x >= y,
-                _ => false,
+            let r = if let (Value::Num(x), Value::Num(y)) = (a, b) {
+                match op {
+                    Lt => x < y,
+                    Le => x <= y,
+                    Gt => x > y,
+                    Ge => x >= y,
+                    _ => false,
+                }
+            } else {
+                let x = float_of(a).ok_or("attempt to compare non-number values")?;
+                let y = float_of(b).ok_or("attempt to compare non-number values")?;
+                match op {
+                    Lt => x < y,
+                    Le => x <= y,
+                    Gt => x > y,
+                    Ge => x >= y,
+                    _ => false,
+                }
             };
             Ok(Value::Bool(r))
         }
@@ -737,6 +808,11 @@ fn string_of(s: &mut LuaState, v: Value) -> Result<super::StrRef, &'static str> 
             let (buf, len) = itoa(n);
             s.intern(&buf[..len])
         }
+        Value::Float(f) => {
+            let mut buf = [0u8; FLOAT_BUF];
+            let len = fmt_float(f, &mut buf);
+            s.intern(&buf[..len])
+        }
         _ => Err("attempt to concatenate a non-string value"),
     }
 }
@@ -749,6 +825,11 @@ fn tostring(s: &LuaState, v: Value) -> Result<(), &'static str> {
         Value::Bool(false) => emit_str(s, b"false"),
         Value::Num(n) => {
             let (buf, len) = itoa(n);
+            emit_bytes(s, &buf[..len]);
+        }
+        Value::Float(f) => {
+            let mut buf = [0u8; FLOAT_BUF];
+            let len = fmt_float(f, &mut buf);
             emit_bytes(s, &buf[..len]);
         }
         Value::Str(r) => emit_bytes(s, s.str_bytes(r)),
@@ -775,6 +856,151 @@ fn emit_bytes(s: &LuaState, bytes: &[u8]) {
 
 fn emit_str(s: &LuaState, bytes: &[u8]) {
     emit_bytes(s, bytes);
+}
+
+/// Scratch size for a formatted float (up to `-4.9406564584125e-324.0`).
+const FLOAT_BUF: usize = 40;
+
+/// `core::fmt::Write` sink over a fixed byte buffer (no allocation).
+struct FmtBuf<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl core::fmt::Write for FmtBuf<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let b = s.as_bytes();
+        if self.len + b.len() > self.buf.len() {
+            return Err(core::fmt::Error);
+        }
+        self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+        self.len += b.len();
+        Ok(())
+    }
+}
+
+/// Format a float the way Lua's `tostring` does: `%.14g` (14 significant
+/// digits) with `.0` appended to integer-looking results. Returns the byte
+/// length; `out` must be at least [`FLOAT_BUF`] bytes.
+fn fmt_float(v: f64, out: &mut [u8]) -> usize {
+    use core::fmt::Write;
+
+    if v.is_nan() {
+        out[..3].copy_from_slice(b"nan");
+        return 3;
+    }
+    if v.is_infinite() {
+        let s: &[u8] = if v < 0.0 { b"-inf" } else { b"inf" };
+        out[..s.len()].copy_from_slice(s);
+        return s.len();
+    }
+    if v == 0.0 {
+        let s: &[u8] = if v.is_sign_negative() { b"-0.0" } else { b"0.0" };
+        out[..s.len()].copy_from_slice(s);
+        return s.len();
+    }
+
+    // Render with 14 significant digits and read off the decimal exponent.
+    let mut sci = [0u8; 32];
+    let n = {
+        let mut w = FmtBuf {
+            buf: &mut sci,
+            len: 0,
+        };
+        if write!(w, "{:.13e}", v).is_err() {
+            return 0;
+        }
+        w.len
+    };
+    let epos = match sci[..n].iter().position(|&b| b == b'e') {
+        Some(p) => p,
+        None => {
+            out[..n].copy_from_slice(&sci[..n]);
+            return n;
+        }
+    };
+    let mut i = epos + 1;
+    let mut exp_neg = false;
+    if sci[i] == b'-' {
+        exp_neg = true;
+        i += 1;
+    } else if sci[i] == b'+' {
+        i += 1;
+    }
+    let mut exp: i32 = 0;
+    while i < n {
+        exp = exp * 10 + (sci[i] - b'0') as i32;
+        i += 1;
+    }
+    if exp_neg {
+        exp = -exp;
+    }
+
+    if exp < -4 || exp >= 14 {
+        // Scientific notation: trim trailing zeros from the mantissa.
+        let mut mend = epos;
+        while mend > 1 && sci[mend - 1] == b'0' {
+            mend -= 1;
+        }
+        if mend > 1 && sci[mend - 1] == b'.' {
+            mend -= 1;
+        }
+        let mut o = 0;
+        out[..mend].copy_from_slice(&sci[..mend]);
+        o += mend;
+        out[o] = b'e';
+        o += 1;
+        out[o] = if exp < 0 { b'-' } else { b'+' };
+        o += 1;
+        let mut mag: u32 = if exp < 0 { (-exp) as u32 } else { exp as u32 };
+        if mag < 10 {
+            out[o] = b'0';
+            o += 1;
+        }
+        let mut tmp = [0u8; 10];
+        let mut t = tmp.len();
+        loop {
+            t -= 1;
+            tmp[t] = b'0' + (mag % 10) as u8;
+            mag /= 10;
+            if mag == 0 {
+                break;
+            }
+        }
+        while t < tmp.len() {
+            out[o] = tmp[t];
+            o += 1;
+            t += 1;
+        }
+        o
+    } else {
+        // Fixed notation with `13 - exp` decimals (14 significant digits).
+        let prec = (13 - exp) as usize;
+        let n2 = {
+            let mut w = FmtBuf { buf: out, len: 0 };
+            if write!(w, "{:.*}", prec, v).is_err() {
+                return 0;
+            }
+            w.len
+        };
+        if let Some(dot) = out[..n2].iter().position(|&b| b == b'.') {
+            let mut end = n2;
+            while end > dot + 1 && out[end - 1] == b'0' {
+                end -= 1;
+            }
+            if end == dot + 1 {
+                // Every decimal was zero: keep one (`5.` -> `5.0`).
+                out[end] = b'0';
+                end += 1;
+            }
+            end
+        } else {
+            // No fractional point at all (`12345678901234`): append `.0`.
+            out[n2] = b'.';
+            out[n2 + 1] = b'0';
+            n2 + 2
+        }
+    }
 }
 
 /// i64 to decimal, zero-padded left in the returned buffer.

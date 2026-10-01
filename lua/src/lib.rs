@@ -1,7 +1,8 @@
 //! Minimal Lua interpreter subset for rustrapper (`no_std`, no heap).
 //!
 //! Supported subset:
-//! - Integer numbers, strings (single/double quotes with escapes), booleans, `nil`
+//! - Integer and floating-point numbers (IEEE-754 doubles), strings
+//!   (single/double quotes with escapes), booleans, `nil`
 //! - `local` and `global` variable declarations (assignment to a plain name
 //!   updates an existing local or creates a global; `global name = v` forces a
 //!   write to the global table even when a local shadows it)
@@ -43,8 +44,8 @@
 //!   globals (strings) plus a numeric `tftp_port` (default 69) from the host
 //!   `dhcp_values` callback.
 //!
-//! Not supported: closures/upvalues, floats, `local function`, anonymous
-//! function literals, string methods, multiple assignment.
+//! Not supported: closures/upvalues, `local function`, anonymous function
+//! literals, string methods, multiple assignment.
 //!
 //! All interpreter state lives in a fixed-size [`LuaState`] with no dynamic
 //! allocation. `LuaState` is passed by `&mut` everywhere (no global mutable
@@ -157,12 +158,14 @@ fn fmt_mac(mac: &[u8; 6], buf: &mut [u8]) -> usize {
     n
 }
 
-/// A runtime value. Numbers are 64-bit integers (no floats).
+/// A runtime value. Numbers are 64-bit integers or IEEE-754 doubles.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Value {
     Nil,
     Bool(bool),
     Num(i64),
+    /// Floating-point number (IEEE-754 double).
+    Float(f64),
     Str(StrRef),
     Table(u16),
     Func(u16),
@@ -239,6 +242,8 @@ pub enum Node {
     True,
     False,
     Num(i64),
+    /// Floating-point literal (IEEE-754 double).
+    Float(f64),
     Str(StrRef),
     /// Variable reference by name.
     Var(StrRef),
@@ -962,6 +967,62 @@ mod tests {
         assert_eq!(exec("print(10 % 3)").unwrap(), "1\n");
         assert_eq!(exec("print(-7 + 2)").unwrap(), "-5\n");
         assert_eq!(exec("print(7 - 10)").unwrap(), "-3\n");
+    }
+
+    #[test]
+    fn floats() {
+        // Literals (including `.5`, `5.` and exponents).
+        assert_eq!(exec("print(5.5)").unwrap(), "5.5\n");
+        assert_eq!(exec("print(5.0)").unwrap(), "5.0\n");
+        assert_eq!(exec("print(.5 + 5.)").unwrap(), "5.5\n");
+        assert_eq!(exec("print(1e3)").unwrap(), "1000.0\n");
+        assert_eq!(exec("print(2.5e-2)").unwrap(), "0.025\n");
+        // Mixed int/float arithmetic promotes to float.
+        assert_eq!(exec("print(5.0 + 5)").unwrap(), "10.0\n");
+        assert_eq!(exec("print(5.5 * 2)").unwrap(), "11.0\n");
+        assert_eq!(exec("print(10.0 / 4)").unwrap(), "2.5\n");
+        assert_eq!(exec("print(-5.5)").unwrap(), "-5.5\n");
+        // Integer arithmetic is unchanged.
+        assert_eq!(exec("print(10 / 3)").unwrap(), "3\n");
+        // Float division and floor-based modulo (Lua semantics).
+        assert_eq!(exec("print(5.0 / 3)").unwrap(), "1.6666666666667\n");
+        assert_eq!(exec("print(7.0 % 3)").unwrap(), "1.0\n");
+        assert_eq!(exec("print(-7.0 % 3)").unwrap(), "2.0\n");
+        assert_eq!(exec("print(2.5 % 1)").unwrap(), "0.5\n");
+        // Comparisons and equality mix ints and floats.
+        assert_eq!(exec("print(1 == 1.0)").unwrap(), "true\n");
+        assert_eq!(exec("print(1 ~= 2.0)").unwrap(), "true\n");
+        assert_eq!(exec("print(1 < 1.5)").unwrap(), "true\n");
+        assert_eq!(exec("print(2.0 <= 2)").unwrap(), "true\n");
+        assert_eq!(exec("print(3.5 >= 4)").unwrap(), "false\n");
+        // Concat coerces floats to strings.
+        assert_eq!(exec("print(\"x=\" .. 1.5)").unwrap(), "x=1.5\n");
+        // Numeric for loops iterate in floating point when a bound is a float.
+        assert_eq!(
+            exec("for i = 1, 2, 0.5 do print(i) end").unwrap(),
+            "1.0\n1.5\n2.0\n"
+        );
+        // Float table keys are the same key as equal integers.
+        assert_eq!(
+            exec("t = {}\nt[2.0] = \"two\"\nprint(t[2])").unwrap(),
+            "two\n"
+        );
+        // Non-numbers still error.
+        assert!(exec("print(\"a\" + 1)").is_err());
+    }
+
+    #[test]
+    fn float_formatting() {
+        assert_eq!(exec("print(0.1 + 0.2)").unwrap(), "0.3\n");
+        assert_eq!(exec("print(1.5e-5)").unwrap(), "1.5e-05\n");
+        assert_eq!(exec("print(1e14)").unwrap(), "1e+14\n");
+        assert_eq!(exec("print(1.0e300 * 10)").unwrap(), "1e+301\n");
+        assert_eq!(exec("print(12345678901234.0)").unwrap(), "12345678901234.0\n");
+        assert_eq!(exec("print(-0.0)").unwrap(), "-0.0\n");
+        // Float division by zero is inf/nan, unlike the integer error.
+        assert_eq!(exec("print(1.0 / 0)").unwrap(), "inf\n");
+        assert_eq!(exec("print(-1.0 / 0)").unwrap(), "-inf\n");
+        assert_eq!(exec("print(0.0 / 0)").unwrap(), "nan\n");
     }
 
     #[test]
