@@ -64,6 +64,12 @@ impl<'s, 'l> Parser<'s, 'l> {
         Ok(())
     }
 
+    /// The lookahead token. The REPL uses this after `parse_expr` to tell an
+    /// assignment (`x = ...`, `k, v = ...`) from a bare expression.
+    pub fn current(&self) -> Tok {
+        self.cur
+    }
+
     fn expect(&mut self, t: Tok, msg: &'static str) -> Result<(), &'static str> {
         if self.cur == t {
             self.advance()
@@ -206,12 +212,27 @@ impl<'s, 'l> Parser<'s, 'l> {
         match self.cur {
             Tok::Local => {
                 self.advance()?;
+                // One or more names, chained through `next[]`, so a call value
+                // can supply two of them (`local k, v = next(t)`).
                 let name = self.expect_name()?;
+                let first = self.alloc(Node::Var(name))?;
+                let mut last = first;
+                let mut count = 1usize;
+                while self.cur == Tok::Comma {
+                    self.advance()?;
+                    let name = self.expect_name()?;
+                    let node = self.alloc(Node::Var(name))?;
+                    self.state.next[last as usize] = node;
+                    last = node;
+                    count += 1;
+                    if count >= super::MAX_LOCALS {
+                        return Err("too many locals");
+                    }
+                }
                 self.expect(Tok::Equals, "expected '=' in local declaration")?;
                 let v = self.parse_expr()?;
                 self.opt_semi();
-                let name_node = self.alloc(Node::Var(name))?;
-                self.alloc(Node::LocalDecl(name_node, v))
+                self.alloc(Node::LocalDecl(first, v))
             }
             Tok::Global => {
                 self.advance()?;
@@ -354,18 +375,35 @@ impl<'s, 'l> Parser<'s, 'l> {
     /// Expression statement: either an assignment or a call.
     fn parse_expr_stat(&mut self) -> Result<u16, &'static str> {
         let e = self.parse_expr()?;
-        if self.cur == Tok::Equals {
-            if !is_assign_target(self.state, e) {
-                return Err("invalid assignment target");
-            }
-            self.advance()?;
-            let v = self.parse_expr()?;
-            self.opt_semi();
-            self.alloc(Node::AssignStmt(e, v))
+        if self.cur == Tok::Equals || self.cur == Tok::Comma {
+            self.parse_assignment_from(e)
         } else {
             self.opt_semi();
             self.alloc(Node::CallStmt(e))
         }
+    }
+
+    /// Finish an assignment whose first target has already been parsed by
+    /// `parse_expr` (the REPL detects assignments the same way). Remaining
+    /// targets are chained through `next[]`.
+    pub fn parse_assignment_from(&mut self, first: u16) -> Result<u16, &'static str> {
+        if !is_assign_target(self.state, first) {
+            return Err("invalid assignment target");
+        }
+        let mut last = first;
+        while self.cur == Tok::Comma {
+            self.advance()?;
+            let t = self.parse_expr()?;
+            if !is_assign_target(self.state, t) {
+                return Err("invalid assignment target");
+            }
+            self.state.next[last as usize] = t;
+            last = t;
+        }
+        self.expect(Tok::Equals, "expected '=' in assignment")?;
+        let v = self.parse_expr()?;
+        self.opt_semi();
+        self.alloc(Node::AssignStmt(first, v))
     }
 
     fn at_block_end(&self) -> bool {

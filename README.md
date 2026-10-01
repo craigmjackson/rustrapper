@@ -121,8 +121,11 @@ comparisons, `and/or/not`, `..` concat, `if/elseif/else`, `while`,
 `for k, v in table`, named `function`/`return`, tables, `print()`, comments.
 `int / int` stays integer (`10/3 == 3`); mixing in a float promotes to float,
 and floats print like Lua's `%.14g` (`5.0`, `1/3.0` -> `0.33333333333333`).
+Calls can return two values, so `k, v = next(t)` walks a table (assigning
+`t[k] = nil` removes the field), and `a, b = f()` assigns both results.
 
 Builtins:
+- `next(t [, k])` — return the next key/value pair of a table (or `nil` at the end); `next(t) == nil` tests for an empty table
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
 - `fetch("file"[, "dest"])` — download a file from the TFTP server, saving it under the optional local `dest` name, and return its byte count (or `nil`)
 - `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
@@ -243,13 +246,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 264 tests across all crates
+cargo test --workspace   # 268 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 86    | Lexer, parser, evaluator, integer & float arithmetic and formatting, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
+| `lua`        | 90    | Lexer, parser, evaluator, integer & float arithmetic and formatting, `next` + multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

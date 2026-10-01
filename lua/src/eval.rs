@@ -7,6 +7,9 @@ use super::{LuaState, Node, Op, Value, NO_NODE};
 pub enum ExecResult {
     Normal,
     Ret(Value),
+    /// Two return values (`next` returns key and value; a user function can
+    /// forward them with `return next(t)`).
+    Ret2(Value, Value),
     /// `break` — unwinds to the innermost loop, which stops iterating.
     Break,
     /// `goto` — jump to the label node. Unwinds through block frames until the
@@ -52,7 +55,7 @@ pub fn exec_script(s: &mut LuaState, first: u16) -> Result<(), &'static str> {
     s.pop_frame();
     match r {
         Ok(ExecResult::Normal) => Ok(()),
-        Ok(ExecResult::Ret(_)) => Ok(()),
+        Ok(ExecResult::Ret(_)) | Ok(ExecResult::Ret2(..)) => Ok(()),
         Ok(ExecResult::Break) => Err("break outside loop"),
         Ok(ExecResult::Goto(_)) => Err("unknown label"),
         Ok(ExecResult::Shell) | Ok(ExecResult::Exit) => Ok(()),
@@ -123,37 +126,48 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
     let tok = lex.next_token();
     let is_expr_start = matches!(tok, Ok(super::lex::Tok::Name(_, _) | super::lex::Tok::Num(_) | super::lex::Tok::Float(_) | super::lex::Tok::Str(_) | super::lex::Tok::LParen | super::lex::Tok::True | super::lex::Tok::False | super::lex::Tok::Nil | super::lex::Tok::Dot | super::lex::Tok::Minus | super::lex::Tok::Not));
     if is_expr_start {
-        // Skip assignments: "x = ..." should not be treated as a bare expression.
-        let mut lex2 = super::lex::Lexer::new(line);
-        let _ = lex2.next_token(); // skip first token
-        let next = lex2.next_token();
-        if next != Ok(super::lex::Tok::Equals) {
-            let mut p = super::parse::Parser::new(line, s);
-            let e = p.parse_expr()?;
-            let v = eval(s, e)?;
-            match v {
-                Value::Exit => return Ok(ExecResult::Exit),
-                Value::Shell => return Ok(ExecResult::Shell),
-                Value::Dhcp => {
-                    let ok = s.run_dhcp()?;
-                    if ok {
-                        s.emit_dhcp_info();
-                    }
-                    tostring(s, Value::Bool(ok))?;
-                    emit(s, b'\n');
-                    return Ok(ExecResult::Normal);
-                }
-                Value::Ls => {
-                    ls_run(s)?;
-                    return Ok(ExecResult::Normal);
-                }
-                _ => {
-                    tostring(s, v)?;
-                    emit(s, b'\n');
-                }
-            }
-            return Ok(ExecResult::Normal);
+        let mut p = super::parse::Parser::new(line, s);
+        let e = p.parse_expr()?;
+        let after = p.current();
+        if after == super::lex::Tok::Equals || after == super::lex::Tok::Comma {
+            // `x = ...` / `k, v = ...`: an assignment statement, not a bare
+            // expression, so it should not print a result.
+            let stmt = p.parse_assignment_from(e)?;
+            return exec_script(s, stmt).map(|_| ExecResult::Normal);
         }
+        let (v, second, n) = eval_multi(s, e)?;
+        match v {
+            Value::Exit => return Ok(ExecResult::Exit),
+            Value::Shell => return Ok(ExecResult::Shell),
+            Value::Dhcp => {
+                let ok = s.run_dhcp()?;
+                if ok {
+                    s.emit_dhcp_info();
+                }
+                tostring(s, Value::Bool(ok))?;
+                emit(s, b'\n');
+                return Ok(ExecResult::Normal);
+            }
+            Value::Ls => {
+                ls_run(s)?;
+                return Ok(ExecResult::Normal);
+            }
+            _ => {
+                if n == 0 {
+                    // A call that returns nothing prints as nil (existing
+                    // behavior; Lua's REPL prints nothing).
+                    tostring(s, Value::Nil)?;
+                } else {
+                    tostring(s, v)?;
+                    if n == 2 {
+                        emit(s, b'\t');
+                        tostring(s, second)?;
+                    }
+                }
+                emit(s, b'\n');
+            }
+        }
+        return Ok(ExecResult::Normal);
     }
     let first = {
         let mut p = super::parse::Parser::new(line, s);
@@ -172,10 +186,23 @@ fn exec_block(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> 
 
 fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
     match s.nodes[n as usize] {
-        Node::LocalDecl(name_node, val_node) => {
-            let v = eval(s, val_node)?;
-            let name = node_name(s, name_node);
-            s.declare_local(name, v)?;
+        Node::LocalDecl(first_name, val_node) => {
+            // Name nodes are chained through `next[]`; a call in the value
+            // position can supply two values (`local k, v = next(t)`).
+            let (a, b, n) = eval_multi(s, val_node)?;
+            let mut name_node = first_name;
+            let mut idx = 0u8;
+            while name_node != NO_NODE {
+                let name = node_name(s, name_node);
+                let v = match idx {
+                    0 => a,
+                    1 if n == 2 => b,
+                    _ => Value::Nil,
+                };
+                s.declare_local(name, v)?;
+                name_node = s.next[name_node as usize];
+                idx += 1;
+            }
             Ok(ExecResult::Normal)
         }
         Node::GlobalDecl(name_node, val_node) => {
@@ -188,9 +215,22 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             s.set_global(name, v);
             Ok(ExecResult::Normal)
         }
-        Node::AssignStmt(t, v) => {
-            let vv = eval(s, v)?;
-            assign(s, t, vv)?;
+        Node::AssignStmt(first_target, v) => {
+            // Targets are chained through `next[]`; all values are computed
+            // before any assignment (`k, v = next(t)`).
+            let (a, b, n) = eval_multi(s, v)?;
+            let mut target = first_target;
+            let mut idx = 0u8;
+            while target != NO_NODE {
+                let vv = match idx {
+                    0 => a,
+                    1 if n == 2 => b,
+                    _ => Value::Nil,
+                };
+                assign(s, target, vv)?;
+                target = s.next[target as usize];
+                idx += 1;
+            }
             Ok(ExecResult::Normal)
         }
         Node::CallStmt(e) => {
@@ -351,10 +391,15 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             } else {
                 None
             };
-            let len = s.tbls[tid as usize].len;
             s.push_frame()?;
             let mut result = ExecResult::Normal;
-            for i in 0..len as usize {
+            // The length is re-read each iteration and `i` only advances when
+            // the current key is still at `i`, so the body may remove the
+            // current field (`t[k] = nil`) without skipping or re-visiting
+            // entries (Lua allows nil-assigning existing fields while
+            // traversing).
+            let mut i = 0usize;
+            while i < s.tbls[tid as usize].len as usize {
                 s.steps += 1;
                 if s.steps > super::MAX_STEPS {
                     let e = Err("step limit exceeded");
@@ -374,6 +419,13 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
                         break;
                     }
                 }
+                if i >= s.tbls[tid as usize].len as usize
+                    || !val_eq(s.tbls[tid as usize].slots[i].key, slot.key)
+                {
+                    // The current key was removed; the next entry shifted in.
+                    continue;
+                }
+                i += 1;
             }
             s.pop_frame();
             Ok(result)
@@ -382,8 +434,16 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
         Node::Label(_) => Ok(ExecResult::Normal),
         Node::Goto(t) => Ok(ExecResult::Goto(t)),
         Node::ReturnStmt(v) => {
-            let r = if v != NO_NODE { eval(s, v)? } else { Value::Nil };
-            Ok(ExecResult::Ret(r))
+            if v == NO_NODE {
+                return Ok(ExecResult::Ret(Value::Nil));
+            }
+            // `return next(t)` forwards both values to the caller.
+            let (a, b, n) = eval_multi(s, v)?;
+            Ok(if n == 2 {
+                ExecResult::Ret2(a, b)
+            } else {
+                ExecResult::Ret(a)
+            })
         }
         _ => Err("internal error: statement expected"),
     }
@@ -394,6 +454,61 @@ fn node_name(s: &LuaState, node: u16) -> super::StrRef {
         Node::Var(name) => name,
         _ => 0,
     }
+}
+
+/// Evaluate a call node: evaluate the callee and the args (a *final* call
+/// argument expands to its multiple results, matching Lua), then invoke the
+/// function. Returns [`ExecResult::Ret`] / [`ExecResult::Ret2`] for the
+/// results, or [`ExecResult::Normal`] when the function returns nothing.
+fn eval_call(s: &mut LuaState, f: u16, first_arg: u16) -> Result<ExecResult, &'static str> {
+    let fv = eval(s, f)?;
+    let mut argc: u8 = 0;
+    let mut n = first_arg;
+    while n != NO_NODE {
+        let is_last = s.next[n as usize] == NO_NODE;
+        let vnode = match s.nodes[n as usize] {
+            Node::Arg(v) => v,
+            _ => return Err("internal error: expected argument"),
+        };
+        if is_last {
+            let (a, b, cnt) = eval_multi(s, vnode)?;
+            if cnt >= 1 {
+                s.push_val(a)?;
+                argc += 1;
+            }
+            if cnt == 2 {
+                s.push_val(b)?;
+                argc += 1;
+            }
+        } else {
+            let v = eval(s, vnode)?;
+            s.push_val(v)?;
+            argc += 1;
+        }
+        if argc >= 32 {
+            return Err("too many arguments");
+        }
+        n = s.next[n as usize];
+    }
+    call(s, fv, argc)
+}
+
+/// Evaluate an expression in a multiple-value context. A call may yield two
+/// values (e.g. `next`); anything else yields one. Returns `(first, second,
+/// count)` where `count` is 0 (a call returning nothing), 1, or 2.
+fn eval_multi(s: &mut LuaState, n: u16) -> Result<(Value, Value, u8), &'static str> {
+    if let Node::Call(f, first_arg) = s.nodes[n as usize] {
+        return match eval_call(s, f, first_arg)? {
+            ExecResult::Normal => Ok((Value::Nil, Value::Nil, 0)),
+            ExecResult::Ret(v) => Ok((v, Value::Nil, 1)),
+            ExecResult::Ret2(a, b) => Ok((a, b, 2)),
+            ExecResult::Break => Err("break outside loop"),
+            ExecResult::Goto(_) => Err("goto outside function"),
+            ExecResult::Shell => Ok((Value::Shell, Value::Nil, 1)),
+            ExecResult::Exit => Ok((Value::Exit, Value::Nil, 1)),
+        };
+    }
+    Ok((eval(s, n)?, Value::Nil, 1))
 }
 
 /// Evaluate an expression node.
@@ -433,31 +548,16 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
             let k = eval(s, key)?;
             tget(s, b, k)
         }
-        Node::Call(f, first_arg) => {
-            let fv = eval(s, f)?;
-            let mut argc: u8 = 0;
-            let mut n = first_arg;
-            while n != NO_NODE {
-                let av = match s.nodes[n as usize] {
-                    Node::Arg(v) => eval(s, v)?,
-                    _ => return Err("internal error: expected argument"),
-                };
-                s.push_val(av)?;
-                argc += 1;
-                if argc >= 32 {
-                    return Err("too many arguments");
-                }
-                n = s.next[n as usize];
-            }
-            match call(s, fv, argc)? {
-                ExecResult::Normal => Ok(Value::Nil),
-                ExecResult::Ret(v) => Ok(v),
-                ExecResult::Break => Err("break outside loop"),
-                ExecResult::Goto(_) => Err("goto outside function"),
-                ExecResult::Shell => Ok(Value::Shell),
-                ExecResult::Exit => Ok(Value::Exit),
-            }
-        }
+        Node::Call(f, first_arg) => match eval_call(s, f, first_arg)? {
+            ExecResult::Normal => Ok(Value::Nil),
+            ExecResult::Ret(v) => Ok(v),
+            // Single-value context: keep the first result.
+            ExecResult::Ret2(a, _) => Ok(a),
+            ExecResult::Break => Err("break outside loop"),
+            ExecResult::Goto(_) => Err("goto outside function"),
+            ExecResult::Shell => Ok(Value::Shell),
+            ExecResult::Exit => Ok(Value::Exit),
+        },
         Node::FuncLit(i) => Ok(Value::Func(i)),
         Node::TableLit(first_field) => {
             let tid = new_table(s)?;
@@ -575,6 +675,41 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 _ => return Err("dofile expects a string filename"),
             }
         }
+        Value::Native(3) => {
+            // next(table [, index]) -> next index, value; nil at the end.
+            // Absent/nil index starts the traversal. An index that is not a
+            // key of the table is an error (Lua: "invalid key to 'next'").
+            if argc != 1 && argc != 2 {
+                return Err("next expects 1 or 2 arguments");
+            }
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("next expects a table"),
+            };
+            let len = s.tbls[tid as usize].len as usize;
+            let start = if argc == 1 || matches!(argbuf[1], Value::Nil) {
+                0
+            } else {
+                let key = argbuf[1];
+                let mut found = None;
+                for i in 0..len {
+                    if val_eq(s.tbls[tid as usize].slots[i].key, key) {
+                        found = Some(i + 1);
+                        break;
+                    }
+                }
+                match found {
+                    Some(i) => i,
+                    None => return Err("invalid key to 'next'"),
+                }
+            };
+            if start >= len {
+                ExecResult::Ret(Value::Nil)
+            } else {
+                let slot = s.tbls[tid as usize].slots[start];
+                ExecResult::Ret2(slot.key, slot.value)
+            }
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");
@@ -617,6 +752,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             match r {
                 Ok(ExecResult::Normal) => ExecResult::Normal,
                 Ok(ExecResult::Ret(v)) => ExecResult::Ret(v),
+                Ok(ExecResult::Ret2(a, b)) => ExecResult::Ret2(a, b),
                 Ok(ExecResult::Break) => return Err("break outside loop"),
                 Ok(ExecResult::Goto(_)) => return Err("goto outside function"),
                 Ok(ExecResult::Shell) => ExecResult::Shell,
@@ -657,6 +793,8 @@ fn dofile_exec(s: &mut LuaState, name: &str) -> Result<Value, &'static str> {
     match r {
         Ok(ExecResult::Normal) => Ok(Value::Nil),
         Ok(ExecResult::Ret(v)) => Ok(v),
+        // Single-value context: keep the first result.
+        Ok(ExecResult::Ret2(a, _)) => Ok(a),
         Ok(ExecResult::Break) => Err("break outside loop"),
         Ok(ExecResult::Goto(_)) => Err("unknown label"),
         Ok(ExecResult::Shell) => Ok(Value::Shell),
@@ -1068,12 +1206,27 @@ fn tset(s: &mut LuaState, t: Value, k: Value, v: Value) -> Result<(), &'static s
         Value::Table(i) => i,
         _ => return Err("attempt to index a non-table value"),
     };
+    let nil = matches!(v, Value::Nil);
     let len = s.tbls[tid as usize].len as usize;
     for i in 0..len {
         if val_eq(s.tbls[tid as usize].slots[i].key, k) {
-            s.tbls[tid as usize].slots[i].value = v;
+            if nil {
+                // Lua: assigning nil removes the field (so `next` never sees
+                // it again). Shift the remaining slots down to keep them
+                // contiguous for iteration.
+                for j in i..len - 1 {
+                    s.tbls[tid as usize].slots[j] = s.tbls[tid as usize].slots[j + 1];
+                }
+                s.tbls[tid as usize].len -= 1;
+            } else {
+                s.tbls[tid as usize].slots[i].value = v;
+            }
             return Ok(());
         }
+    }
+    if nil {
+        // Assigning nil to a non-existent field is a no-op.
+        return Ok(());
     }
     if len >= super::TABLE_SLOTS {
         return Err("table full");

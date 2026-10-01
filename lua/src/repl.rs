@@ -230,6 +230,7 @@ pub fn repl_loop(
                                     Ok(eval::ExecResult::Normal) => {}
                                     Ok(eval::ExecResult::Break) => {}
                                     Ok(eval::ExecResult::Goto(_)) => {}
+                                    Ok(eval::ExecResult::Ret2(..)) => {}
                                     Ok(eval::ExecResult::Exit) => exited = true,
                                     Ok(eval::ExecResult::Shell) => {
                                         puts("\n(nested shell not supported)\n\n");
@@ -730,6 +731,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: print(1 + 2) -> 3\n",
     },
     HelpEntry {
+        name: "next",
+        short: "Return the next key/value pair of a table",
+        detail: "next(t [, k])\n\
+                  Returns the next key and value after key k in table t, or the\n\
+                  first pair when k is nil/missing, or nil at the end. Use\n\
+                  'k, v = next(t, k)' to walk a table; 'next(t) == nil' tests\n\
+                  whether t is empty.\n",
+    },
+    HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
         detail: "fetch(\"file\"[, \"dest\"])\n\
@@ -1185,6 +1195,17 @@ mod tests {
         assert!(out.contains("Completions:"));
         assert!(out.contains("dhcp"));
         assert!(out.contains("dofile"));
+    }
+
+    #[test]
+    fn repl_next_and_multiple_assignment() {
+        // A bare `next(t)` prints both results.
+        let out = run_session(b"t = {9, 8}\rnext(t)\rexit\r");
+        assert!(out.contains("1\t9"));
+        // `k, v = next(t)` is an assignment: it must not print a result.
+        let out = run_session(b"t = {9, 8}\rk, v = next(t)\rprint(k, v)\rexit\r");
+        assert!(out.contains("1\t9"));
+        assert!(!out.contains("Lua error"));
     }
 
     #[test]

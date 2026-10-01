@@ -20,6 +20,10 @@
 //! - Named functions `function name(a, b) ... end` and `return`
 //! - Tables: array fields, `name =` fields, `[expr]` fields, `t.key`, `t[key]`
 //! - `print(...)` builtin, `--` line comments
+//! - `next(t [, k])` builtin: returns the next key/value pair of a table (or
+//!   `nil` at the end / for an empty table). Calls can yield two values, which
+//!   `local k, v = next(t)`, `k, v = next(t)`, `return next(t)` and a final
+//!   call argument (`print(next(t))`) consume. `t[k] = nil` removes the field.
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
@@ -45,7 +49,7 @@
 //!   `dhcp_values` callback.
 //!
 //! Not supported: closures/upvalues, `local function`, anonymous function
-//! literals, string methods, multiple assignment.
+//! literals, string methods, right-hand-side expression lists (`a, b = 1, 2`).
 //!
 //! All interpreter state lives in a fixed-size [`LuaState`] with no dynamic
 //! allocation. `LuaState` is passed by `&mut` everywhere (no global mutable
@@ -170,7 +174,7 @@ pub enum Value {
     Table(u16),
     Func(u16),
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
-    /// `dofile` is `Native(2)`.
+    /// `dofile` is `Native(2)`, `next` is `Native(3)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -486,6 +490,9 @@ impl LuaState {
         let _ = self.intern(b"ls");
         let ls_name = self.intern(b"ls").unwrap();
         self.set_global(ls_name, Value::Ls);
+        let _ = self.intern(b"next");
+        let next_name = self.intern(b"next").unwrap();
+        self.set_global(next_name, Value::Native(3));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -917,6 +924,7 @@ pub fn run_repl(
             Ok(eval::ExecResult::Break) => {}
             Ok(eval::ExecResult::Goto(_)) => {}
             Ok(eval::ExecResult::Ret(_)) => {}
+            Ok(eval::ExecResult::Ret2(..)) => {}
             Ok(eval::ExecResult::Exit) => break,
             Ok(eval::ExecResult::Shell) => {
                 // Nested shell — not supported in this simple REPL.
@@ -1278,6 +1286,80 @@ mod tests {
         assert!(exec("for k in nil do end").is_err());
         // Empty table -> no iterations.
         assert_eq!(exec("t = {}\nfor k, v in t do print(1) end\nprint(0)").unwrap(), "0\n");
+        // Removing the current field during traversal neither skips nor
+        // re-visits entries.
+        assert_eq!(
+            exec("t = {a = 1, b = 2, c = 3}\nfor k, v in t do\nif k == \"b\" then t[k] = nil end\nprint(k, v)\nend").unwrap(),
+            "a\t1\nb\t2\nc\t3\n"
+        );
+    }
+
+    #[test]
+    fn next_builtin() {
+        // Empty table -> nil (the empty-table test).
+        assert_eq!(exec("print(next({}))").unwrap(), "nil\n");
+        assert_eq!(exec("print(next({}) == nil, next({1}) == nil)").unwrap(), "true\tfalse\n");
+        // next(t) returns the first index and value, in slot order.
+        assert_eq!(exec("print(next({10, 20}))").unwrap(), "1\t10\n");
+        // Full traversal with multiple assignment.
+        assert_eq!(
+            exec("t = {10, 20, x = 30}\nk, v = next(t)\nprint(k, v)\nk, v = next(t, k)\nprint(k, v)\nk, v = next(t, k)\nprint(k, v)\nprint(next(t, k))").unwrap(),
+            "1\t10\n2\t20\nx\t30\nnil\n"
+        );
+        // Multiple locals take the two results.
+        assert_eq!(
+            exec("local k, v = next({a = 7})\nprint(k, v)").unwrap(),
+            "a\t7\n"
+        );
+        // Missing values default to nil.
+        assert_eq!(
+            exec("local a, b, c = next({z = 1})\nprint(a, b, c)").unwrap(),
+            "z\t1\tnil\n"
+        );
+        // A function can forward both results with `return next(t)`.
+        assert_eq!(
+            exec("function f() return next({q = 7}) end\nprint(f())").unwrap(),
+            "q\t7\n"
+        );
+        // A final call argument expands; a non-final one is truncated.
+        assert_eq!(exec("function g(a, b) print(a, b) end\ng(next({5}))").unwrap(), "1\t5\n");
+        assert_eq!(exec("print(next({5}), \"x\")").unwrap(), "1\tx\n");
+        // Assigning nil to a visited field removes it from the traversal.
+        assert_eq!(
+            exec("t = {a = 1, b = 2}\nk, v = next(t)\nt[k] = nil\nprint(next(t))").unwrap(),
+            "b\t2\n"
+        );
+        // Invalid key / non-table / wrong arity error.
+        assert!(exec("next({1}, 5)").is_err());
+        assert!(exec("next(5)").is_err());
+        assert!(exec("next()").is_err());
+        assert!(exec("next({}, 1, 2)").is_err());
+    }
+
+    #[test]
+    fn nil_removes_table_fields() {
+        // `t[k] = nil` removes the key (Lua), it does not store a nil value.
+        assert_eq!(exec("t = {a = 1}\nt.a = nil\nprint(t.a)").unwrap(), "nil\n");
+        assert_eq!(
+            exec("t = {a = 1}\nk = \"a\"\nt[k] = nil\nprint(next(t))").unwrap(),
+            "nil\n"
+        );
+        // Removing a missing key is a no-op.
+        assert_eq!(
+            exec("t = {a = 1}\nt.b = nil\nprint(t.a)").unwrap(),
+            "1\n"
+        );
+    }
+
+    #[test]
+    fn multiple_assignment() {
+        // A right-hand-side list is not supported (only a call expands).
+        assert!(exec("a, b = 1, 2\nprint(a, b)").is_err());
+        assert_eq!(exec("a, b = next({9})\nprint(a, b)").unwrap(), "1\t9\n");
+        assert_eq!(exec("local a, b = next({8})\nprint(a, b)").unwrap(), "1\t8\n");
+        assert_eq!(exec("t = {}\nt.x, t.y = next({5})\nprint(t.x, t.y)").unwrap(), "1\t5\n");
+        // A target that is not assignable errors.
+        assert!(exec("1, b = next({})").is_err());
     }
 
     #[test]
