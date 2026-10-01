@@ -350,8 +350,9 @@ pub fn repl_loop(
                     break 'keys;
                 }
                 Some(0x0c) => {
-                    // Ctrl-L: clear the screen (form feed).
-                    putc(b'\x0c');
+                    // Ctrl-L: clear the screen, then redraw the prompt and line
+                    // (like bash's clear-screen binding).
+                    clear_screen(putc);
                     redraw_line(putc, puts, prompt(acc_len), &line, len, pos, &mut shown);
                 }
                 Some(0x09) => {
@@ -395,6 +396,16 @@ fn prompt(acc_len: usize) -> &'static str {
         "> "
     } else {
         ">> "
+    }
+}
+
+/// Erase the display and home the cursor using the ANSI sequence the Linux
+/// `clear` tool sends for xterm-like terminals: `ESC [ H` (cursor to the
+/// top-left) followed by `ESC [ 2 J` (erase the whole display). ANSI terminals
+/// (serial, QEMU `-nographic`, the native host) interpret it.
+fn clear_screen(putc: fn(u8)) {
+    for &b in b"\x1b[H\x1b[2J" {
+        putc(b);
     }
 }
 
@@ -803,7 +814,7 @@ fn print_general_help(puts: fn(&str)) {
 /// Lua parser. Returns `true` if the line was a shell command (already handled).
 fn handle_repl_cmd(line: &[u8], putc: fn(u8), puts: fn(&str)) -> bool {
     if trim(line) == &b"clear"[..] {
-        putc(b'\x0c');
+        clear_screen(putc);
         return true;
     }
     let target: Option<&[u8]> = if line == &b"help"[..] {
@@ -1179,14 +1190,15 @@ mod tests {
     #[test]
     fn ctrl_l_clears() {
         let out = run_session(b"\x0cprint(1)\rexit\r");
-        assert!(out.contains("\x0c"));
+        // ANSI clear sequence (`ESC [ H` home, `ESC [ 2 J` erase display).
+        assert!(out.contains("\x1b[H\x1b[2J"));
         assert!(out.contains("1"));
     }
 
     #[test]
     fn clear_command() {
         let out = run_session(b"clear\rprint(1)\rexit\r");
-        assert!(out.contains("\x0c"));
+        assert!(out.contains("\x1b[H\x1b[2J"));
         assert!(!out.contains("Lua error"));
     }
 
