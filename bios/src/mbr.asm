@@ -68,8 +68,8 @@ msg_err: db 'Boot error', 0x0D, 0x0A, 0
 dap:
     db 0x10        ; size
     db 0x00        ; reserved
-    dw 80          ; sectors to read (LBA 1-80 = bytes 0x200-0xA1FF) — covers the
-                   ; entry stub + Rust payload (~36 KB, incl. the Lua interpreter)
+    dw 128         ; sectors to read (LBA 1-128 = bytes 0x200-0x101FF) — covers the
+                    ; entry stub + Rust payload (~58 KB, incl. the Lua interpreter)
     dw 0x8000      ; buffer offset
     dw 0x0000      ; buffer segment
     dq 1           ; start LBA

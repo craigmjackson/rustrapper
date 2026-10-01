@@ -87,7 +87,7 @@ pub extern "C" fn main() -> ! {
 /// `dhcp` builtin: set up the network (e1000 + DHCP) and return the `fetch`
 /// callback if a TFTP server is reachable.
 #[cfg(not(test))]
-fn dhcp_fn() -> Option<fn(&str) -> Option<usize>> {
+fn dhcp_fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>> {
     if net::setup_fetch_context() {
         Some(crate::fetch::fetch_file)
     } else {

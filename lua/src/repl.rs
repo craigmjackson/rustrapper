@@ -721,9 +721,10 @@ const HELP_COMMANDS: &[HelpEntry] = &[
     HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
-        detail: "fetch(\"file\")\n\
+        detail: "fetch(\"file\"[, \"dest\"])\n\
                   Downloads 'file' from the TFTP server (DHCP next_server) and\n\
-                  returns its byte count, or nil on failure.\n\
+                  returns its byte count, or nil on failure. The optional\n\
+                  'dest' names the local file it is saved under (shown by ls).\n\
                   Requires a TFTP server: run 'dhcp' first to set up the\n\
                   network (or it works automatically in PXE scripts).\n",
     },
@@ -886,7 +887,7 @@ mod tests {
 
     /// Mock `fetch()` host callback: returns a size for known names, `None`
     /// for anything else (simulating a TFTP download failure).
-    fn mock_fetch(name: &str) -> Option<usize> {
+    fn mock_fetch(name: &str, _save_as: &str) -> Option<usize> {
         match name {
             "a.txt" => Some(5),
             "b.txt" => Some(12),
@@ -906,7 +907,7 @@ mod tests {
     }
 
     /// Mock `dhcp()` host callback: network setup succeeds and enables `fetch`.
-    fn mock_dhcp() -> Option<fn(&str) -> Option<usize>> {
+    fn mock_dhcp() -> Option<fn(source: &str, save_as: &str) -> Option<usize>> {
         Some(mock_fetch)
     }
 
@@ -1016,6 +1017,10 @@ mod tests {
         // After fetch, bare `ls` lists the downloaded files.
         let out = run_session_with_fetch(b"fetch(\"a.txt\")\rls\rexit\r");
         assert!(out.contains("a.txt (5 bytes)"));
+        // fetch("src", "dest") lists the file under the local dest name.
+        let out = run_session_with_fetch(b"fetch(\"a.txt\", \"mine.txt\")\rls\rexit\r");
+        assert!(out.contains("mine.txt (5 bytes)"));
+        assert!(!out.contains("a.txt (5 bytes)"));
     }
 
     #[test]

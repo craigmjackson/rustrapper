@@ -111,8 +111,9 @@ impl TftpSink for FileSink<'_> {
 }
 
 /// Host `fetch()` callback: download `name` from the TFTP server, keep it in
-/// memory, and return its byte count (or `None` on failure).
-pub fn fetch_file(name: &str) -> Option<usize> {
+/// memory under the local name `save_as`, and return its byte count (or `None`
+/// on failure).
+pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
     let server = CTX.lock().unwrap().as_ref().map(|i| i.server)?;
     if server == Ipv4Addr::UNSPECIFIED {
         return None;
@@ -122,7 +123,7 @@ pub fn fetch_file(name: &str) -> Option<usize> {
         let mut sink = FileSink { data: &mut data };
         crate::net::tftp_download(server, name, &mut sink)?;
     }
-    FILES.lock().unwrap().push((name.to_string(), data.clone()));
+    FILES.lock().unwrap().push((save_as.to_string(), data.clone()));
     Some(data.len())
 }
 

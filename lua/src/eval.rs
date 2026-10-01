@@ -456,25 +456,47 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             ExecResult::Normal
         }
         Value::Native(1) => {
-            // fetch(filename) -> byte count, or nil if the download failed.
-            if argc != 1 {
-                return Err("fetch expects 1 argument");
+            // fetch(filename [, dest]) -> byte count, or nil if the download
+            // failed. `dest` is the local name the file is saved/recorded under
+            // (shown by `ls`); it defaults to the source name.
+            if argc != 1 && argc != 2 {
+                return Err("fetch expects 1 or 2 arguments");
             }
             match argbuf[0] {
                 Value::Str(r) => {
+                    let mut nbuf = [0u8; 128];
                     let bytes = s.str_bytes(r);
                     if bytes.len() >= 128 {
                         return Err("fetch filename too long");
                     }
-                    let mut nbuf = [0u8; 128];
                     nbuf[..bytes.len()].copy_from_slice(bytes);
                     let name = core::str::from_utf8(&nbuf[..bytes.len()])
                         .map_err(|_| "fetch filename must be ASCII")?;
+
+                    let mut dbuf = [0u8; 128];
+                    let (save_ref, save_name) = if argc == 2 {
+                        match argbuf[1] {
+                            Value::Str(dr) => {
+                                let dbytes = s.str_bytes(dr);
+                                if dbytes.len() >= 128 {
+                                    return Err("fetch dest too long");
+                                }
+                                dbuf[..dbytes.len()].copy_from_slice(dbytes);
+                                let n = core::str::from_utf8(&dbuf[..dbytes.len()])
+                                    .map_err(|_| "fetch dest must be ASCII")?;
+                                (dr, n)
+                            }
+                            _ => return Err("fetch dest must be a string"),
+                        }
+                    } else {
+                        (r, name)
+                    };
+
                     let fetch = s.fetch;
                     match fetch {
-                        Some(f) => match f(name) {
+                        Some(f) => match f(name, save_name) {
                             Some(n) => {
-                                s.record_fetch_ref(r, n as u64)?;
+                                s.record_fetch_ref(save_ref, n as u64)?;
                                 ExecResult::Ret(Value::Num(n as i64))
                             }
                             None => ExecResult::Ret(Value::Nil),

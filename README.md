@@ -117,7 +117,7 @@ Supported: integers, strings, booleans, `nil`, `local`/`global` variables,
 
 Builtins:
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
-- `fetch("file")` — download a file from the TFTP server, return its byte count (or `nil`)
+- `fetch("file"[, "dest"])` — download a file from the TFTP server, saving it under the optional local `dest` name, and return its byte count (or `nil`)
 - `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
 - `ls` / `ls()` — list the files downloaded with `fetch()`, as `name (N bytes)`
 - `exit` — leave the shell; `shell()` — nested shell (not supported)
@@ -227,7 +227,7 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 260 tests across all crates
+cargo test --workspace   # 262 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |

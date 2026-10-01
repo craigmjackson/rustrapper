@@ -176,9 +176,13 @@ pub fn dhcp_values(v: &mut lua::DhcpValues) {
 
 /// Host `fetch()` callback: download `name` from the TFTP server, record it
 /// in a slot, and return the byte count (or `None` on failure).
-pub fn fetch_file(name: &str) -> Option<usize> {
+pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() >= 64 {
+        return None;
+    }
+    let save = save_as.as_bytes();
+    if save.is_empty() || save.len() >= 64 {
         return None;
     }
 
@@ -233,7 +237,7 @@ pub fn fetch_file(name: &str) -> Option<usize> {
 
     unsafe {
         let mut n = [0u8; 64];
-        n[..bytes.len()].copy_from_slice(bytes);
+        n[..save.len()].copy_from_slice(save);
         FETCH_FILES[idx] = FetchFile {
             name: n,
             base: slot_base,

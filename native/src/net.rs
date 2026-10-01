@@ -67,7 +67,7 @@ pub fn setup_fetch_context() -> bool {
 
 /// Host `dhcp` builtin: set up the network and return the `fetch` callback if
 /// a TFTP server is reachable.
-pub fn dhcp_fn() -> Option<fn(&str) -> Option<usize>> {
+pub fn dhcp_fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>> {
     if setup_fetch_context() {
         Some(crate::fetch::fetch_file)
     } else {

@@ -97,7 +97,7 @@ boot_drive:  dd 0
 ; RUST_PAYLOAD_BYTES and BSS_ZERO_SIZE are computed at assembly time.
 ; BSS_ZERO_SIZE covers BSS for descriptor rings, packet buffers, and statics.
 RUST_PAYLOAD_BYTES equ __payload_end - __payload_start
-BSS_ZERO_SIZE     equ 0x2000
+BSS_ZERO_SIZE     equ 0x5000
 
 gdt:
     dq 0                    ; Null

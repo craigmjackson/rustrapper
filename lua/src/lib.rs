@@ -22,10 +22,12 @@
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
-//! - `fetch("file")` builtin: downloads a file from the TFTP server (DHCP
-//!   `next_server`) into host memory and returns its byte count as a number,
-//!   or `nil` if the download fails. Requires a host callback, so scripts
-//!   using it must run through [`LuaState::run_with_fetch`] / [`run_with_fetch`].
+//! - `fetch("file")` / `fetch("file", "dest")` builtin: downloads a file from
+//!   the TFTP server (DHCP `next_server`) into host memory, saving it under the
+//!   optional local `dest` name (defaults to the source name; shown by `ls`),
+//!   and returns its byte count as a number, or `nil` if the download fails.
+//!   Requires a host callback, so scripts using it must run through
+//!   [`LuaState::run_with_fetch`] / [`run_with_fetch`].
 //! - `dofile("file")` builtin: loads a Lua source chunk by name (e.g. via
 //!   TFTP), executes it in the current interpreter state, and returns the
 //!   chunk's return value (`nil` if it doesn't return). Errors inside the
@@ -371,15 +373,16 @@ pub struct LuaState {
     pub fetched_n: u8,
     /// Character output callback used by `print()`.
     pub putc: fn(u8),
-    /// Host callback for the `fetch()` builtin: downloads `name` from the
-    /// TFTP server and returns its byte count, or `None` on failure. Set by
-    /// [`LuaState::run_with_fetch`] or by a successful `dhcp`; `None` means
-    /// `fetch()` errors out.
-    pub fetch: Option<fn(&str) -> Option<usize>>,
+    /// Host callback for the `fetch()` builtin: downloads `source` from the
+    /// TFTP server, saving it under the local name `save_as` (equal to
+    /// `source` when `fetch` is called with one argument), and returns its byte
+    /// count, or `None` on failure. Set by [`LuaState::run_with_fetch`] or by a
+    /// successful `dhcp`; `None` means `fetch()` errors out.
+    pub fetch: Option<fn(source: &str, save_as: &str) -> Option<usize>>,
     /// Host callback for the `dhcp` builtin: runs the network setup (e1000 +
     /// DHCP) and returns the `fetch` callback if a TFTP server is reachable.
     /// Set by the host before entering the REPL; `None` means `dhcp` errors.
-    pub dhcp: Option<fn() -> Option<fn(&str) -> Option<usize>>>,
+    pub dhcp: Option<fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>>,
     /// Host callback for the `dofile()` builtin: loads the Lua source for
     /// `name` (e.g. via TFTP) into `buf` and returns its length, or `None` if
     /// the file can't be loaded. The interpreter owns `buf` (`DOFILE_CAP`
@@ -497,14 +500,17 @@ impl LuaState {
     /// Install a host `fetch()` callback. Call `set_fetch(None)` to explicitly
     /// disable fetch (e.g. when no TFTP server is reachable). The REPL starts
     /// with `fetch` disabled and enables it only after a successful `dhcp`.
-    pub fn set_fetch(&mut self, fetch: Option<fn(&str) -> Option<usize>>) {
+    pub fn set_fetch(&mut self, fetch: Option<fn(source: &str, save_as: &str) -> Option<usize>>) {
         self.fetch = fetch;
     }
 
     /// Install a host `dhcp` callback: runs the network setup (e1000 + DHCP)
     /// and returns the `fetch` callback when a TFTP server is reachable.
     /// Call `set_dhcp(None)` to disable the `dhcp` builtin.
-    pub fn set_dhcp(&mut self, dhcp: Option<fn() -> Option<fn(&str) -> Option<usize>>>) {
+    pub fn set_dhcp(
+        &mut self,
+        dhcp: Option<fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>>,
+    ) {
         self.dhcp = dhcp;
     }
 
@@ -633,7 +639,7 @@ impl LuaState {
         &mut self,
         source: &[u8],
         putc: fn(u8),
-        fetch: fn(&str) -> Option<usize>,
+        fetch: fn(source: &str, save_as: &str) -> Option<usize>,
     ) -> Result<(), &'static str> {
         self.fetch = Some(fetch);
         self.run(source, putc)
@@ -646,7 +652,7 @@ impl LuaState {
         &mut self,
         source: &[u8],
         putc: fn(u8),
-        fetch: fn(&str) -> Option<usize>,
+        fetch: fn(source: &str, save_as: &str) -> Option<usize>,
         load: fn(&str, &mut [u8]) -> Option<usize>,
     ) -> Result<(), &'static str> {
         self.fetch = Some(fetch);
@@ -865,7 +871,7 @@ pub fn run(source: &[u8], putc: fn(u8)) -> Result<(), &'static str> {
 pub fn run_with_fetch(
     source: &[u8],
     putc: fn(u8),
-    fetch: fn(&str) -> Option<usize>,
+    fetch: fn(source: &str, save_as: &str) -> Option<usize>,
 ) -> Result<(), &'static str> {
     let mut state = LuaState::new();
     state.run_with_fetch(source, putc, fetch)
@@ -876,7 +882,7 @@ pub fn run_with_fetch(
 pub fn run_with_fetch_load(
     source: &[u8],
     putc: fn(u8),
-    fetch: fn(&str) -> Option<usize>,
+    fetch: fn(source: &str, save_as: &str) -> Option<usize>,
     load: fn(&str, &mut [u8]) -> Option<usize>,
 ) -> Result<(), &'static str> {
     let mut state = LuaState::new();
@@ -1304,7 +1310,7 @@ mod tests {
     }
 
     /// Mock `fetch()` host callback matching the two files the demo fetches.
-    fn fetch_demo(name: &str) -> Option<usize> {
+    fn fetch_demo(name: &str, _save_as: &str) -> Option<usize> {
         match name {
             "test.txt" => Some(21),
             "rust_payload.bin" => Some(7400),
@@ -1327,7 +1333,7 @@ mod tests {
 
     /// Mock `fetch()` host callback: returns a size for known names, `None`
     /// for anything else (simulating a TFTP download failure).
-    fn fetch_count(name: &str) -> Option<usize> {
+    fn fetch_count(name: &str, _save_as: &str) -> Option<usize> {
         match name {
             "a.txt" => Some(5),
             "b.txt" => Some(12),
@@ -1364,6 +1370,35 @@ mod tests {
         assert!(exec_fetch("fetch(true)").is_err());
         // No host callback installed (plain `run`) -> clear error
         assert!(exec("print(fetch(\"a.txt\"))").is_err());
+    }
+
+    #[test]
+    fn fetch_with_dest() {
+        // fetch(src, dest) returns the count; ls lists the local dest name.
+        assert_eq!(
+            exec_fetch("n = fetch(\"a.txt\", \"mine.txt\")\nprint(n)\nls").unwrap(),
+            "5\nmine.txt (5 bytes)\n"
+        );
+        // Without dest, ls shows the source name.
+        assert_eq!(exec_fetch("fetch(\"a.txt\")\nls").unwrap(), "a.txt (5 bytes)\n");
+        // The dest can come from a variable.
+        assert_eq!(
+            exec_fetch("d = \"save.bin\"\nprint(fetch(\"b.txt\", d))").unwrap(),
+            "12\n"
+        );
+        // 2-arg form still returns nil on download failure.
+        assert_eq!(
+            exec_fetch("print(fetch(\"missing.txt\", \"m.bin\"))").unwrap(),
+            "nil\n"
+        );
+    }
+
+    #[test]
+    fn fetch_dest_errors() {
+        // Non-string dest, or more than two arguments.
+        assert!(exec_fetch("fetch(\"a.txt\", 5)").is_err());
+        assert!(exec_fetch("fetch(\"a.txt\", true)").is_err());
+        assert!(exec_fetch("fetch(\"a.txt\", \"x\", 1)").is_err());
     }
 
     /// Mock `dofile()` loader callback: returns the source for known chunk
@@ -1463,17 +1498,17 @@ mod tests {
     }
 
     /// Mock `dhcp()` host callback: network setup succeeds and enables `fetch`.
-    fn dhcp_ok() -> Option<fn(&str) -> Option<usize>> {
+    fn dhcp_ok() -> Option<fn(source: &str, save_as: &str) -> Option<usize>> {
         Some(fetch_count)
     }
 
     /// Mock `dhcp()` host callback: network setup fails.
-    fn dhcp_fail() -> Option<fn(&str) -> Option<usize>> {
+    fn dhcp_fail() -> Option<fn(source: &str, save_as: &str) -> Option<usize>> {
         None
     }
 
     /// Run a script with a mock `dhcp` callback installed (fetch disabled).
-    fn exec_dhcp(src: &str, dhcp: fn() -> Option<fn(&str) -> Option<usize>>) -> Result<String, &'static str> {
+    fn exec_dhcp(src: &str, dhcp: fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>) -> Result<String, &'static str> {
         OUT.with(|o| o.borrow_mut().clear());
         let mut state = super::LuaState::new();
         state.register_builtins(putc_test);
@@ -1499,7 +1534,7 @@ mod tests {
     /// Run a script with both a mock `dhcp` and a mock `dhcp_info` callback.
     fn exec_dhcp_info(
         src: &str,
-        dhcp: fn() -> Option<fn(&str) -> Option<usize>>,
+        dhcp: fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>,
     ) -> Result<String, &'static str> {
         OUT.with(|o| o.borrow_mut().clear());
         let mut state = super::LuaState::new();
@@ -1547,7 +1582,7 @@ mod tests {
     /// Run a script with mock `dhcp` and `dhcp_values` callbacks installed.
     fn exec_dhcp_vars(
         src: &str,
-        dhcp: fn() -> Option<fn(&str) -> Option<usize>>,
+        dhcp: fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>,
     ) -> Result<String, &'static str> {
         OUT.with(|o| o.borrow_mut().clear());
         let mut state = super::LuaState::new();
