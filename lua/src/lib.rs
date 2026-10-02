@@ -24,6 +24,9 @@
 //!   `nil` at the end / for an empty table). Calls can yield two values, which
 //!   `local k, v = next(t)`, `k, v = next(t)`, `return next(t)` and a final
 //!   call argument (`print(next(t))`) consume. `t[k] = nil` removes the field.
+//! - `pairs(t)` builtin: returns the `next` function and the table, so
+//!   `for k, v in pairs(t) do ... end` iterates every key/value pair. This
+//!   subset has no metatables, so there is no `__pairs` metamethod.
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
@@ -174,7 +177,7 @@ pub enum Value {
     Table(u16),
     Func(u16),
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
-    /// `dofile` is `Native(2)`, `next` is `Native(3)`.
+    /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -493,6 +496,9 @@ impl LuaState {
         let _ = self.intern(b"next");
         let next_name = self.intern(b"next").unwrap();
         self.set_global(next_name, Value::Native(3));
+        let _ = self.intern(b"pairs");
+        let pairs_name = self.intern(b"pairs").unwrap();
+        self.set_global(pairs_name, Value::Native(4));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1334,6 +1340,40 @@ mod tests {
         assert!(exec("next(5)").is_err());
         assert!(exec("next()").is_err());
         assert!(exec("next({}, 1, 2)").is_err());
+    }
+
+    #[test]
+    fn pairs_builtin() {
+        // `for ... in pairs(t)` iterates every key/value pair.
+        assert_eq!(
+            exec("t = {\"a\", \"b\"}\nfor k, v in pairs(t) do print(k, v) end").unwrap(),
+            "1\ta\n2\tb\n"
+        );
+        // Keys only.
+        assert_eq!(
+            exec("t = {x = 1, y = 2}\nfor k in pairs(t) do print(k) end").unwrap(),
+            "x\ny\n"
+        );
+        // Empty table -> no iterations.
+        assert_eq!(
+            exec("for k, v in pairs({}) do print(1) end\nprint(0)").unwrap(),
+            "0\n"
+        );
+        // pairs(t) yields the next function and the table as its first two
+        // results, so it can also be captured and used manually.
+        assert_eq!(exec("local f, s = pairs({7})\nprint(f(s))").unwrap(), "1\t7\n");
+        // The (implicit) third result is nil, like Lua's control variable.
+        assert_eq!(exec("local f, s, c = pairs({7})\nprint(c)").unwrap(), "nil\n");
+        // A call yielding a table also works (`p(t)` -> t).
+        assert_eq!(
+            exec("function p(t) return t end\nfor k, v in p({9}) do print(k, v) end").unwrap(),
+            "1\t9\n"
+        );
+        // Errors: non-table argument, wrong arity.
+        assert!(exec("pairs(5)").is_err());
+        assert!(exec("pairs()").is_err());
+        assert!(exec("pairs({}, {})").is_err());
+        assert!(exec("for k in pairs(5) do end").is_err());
     }
 
     #[test]

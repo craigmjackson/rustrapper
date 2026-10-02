@@ -380,10 +380,14 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             Ok(result)
         }
         Node::ForInStmt(kvar, vvar, table, body) => {
-            let t = eval(s, table)?;
-            let tid = match t {
-                Value::Table(i) => i,
-                _ => return Err("'for in' requires a table value"),
+            // Accepts the bare table form (`for k, v in t`) and the Lua
+            // iterator form (`for k, v in pairs(t)`), where the call yields
+            // `next, t`.
+            let (t, second, _) = eval_multi(s, table)?;
+            let tid = match (t, second) {
+                (Value::Table(i), _) => i,
+                (Value::Native(3), Value::Table(i)) => i,
+                _ => return Err("'for in' requires a table or pairs(t)"),
             };
             let kname = node_name(s, kvar);
             let vname = if vvar != NO_NODE {
@@ -708,6 +712,19 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             } else {
                 let slot = s.tbls[tid as usize].slots[start];
                 ExecResult::Ret2(slot.key, slot.value)
+            }
+        }
+        Value::Native(4) => {
+            // pairs(t) -> next, t. This subset has no metatables (no
+            // __pairs), and Lua's third result is nil, so two values suffice:
+            // `for k, v in pairs(t)` iterates t and `local f, s, c = pairs(t)`
+            // still leaves c == nil.
+            if argc != 1 {
+                return Err("pairs expects 1 argument");
+            }
+            match argbuf[0] {
+                Value::Table(i) => ExecResult::Ret2(Value::Native(3), Value::Table(i)),
+                _ => return Err("pairs expects a table"),
             }
         }
         Value::Shell => {

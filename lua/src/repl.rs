@@ -740,6 +740,14 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   whether t is empty.\n",
     },
     HelpEntry {
+        name: "pairs",
+        short: "Iterator for all key/value pairs of a table",
+        detail: "pairs(t)\n\
+                  Returns the next function and the table, so that\n\
+                  'for k, v in pairs(t) do ... end' iterates every pair. This\n\
+                  subset has no metatables, so there is no __pairs metamethod.\n",
+    },
+    HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
         detail: "fetch(\"file\"[, \"dest\"])\n\
