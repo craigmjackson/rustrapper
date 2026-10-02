@@ -10,6 +10,10 @@ pub enum ExecResult {
     /// Two return values (`next` returns key and value; a user function can
     /// forward them with `return next(t)`).
     Ret2(Value, Value),
+    /// N return values (`select` returns an arbitrary count): the top `n`
+    /// values of the value stack are the results. `call` moves them down over
+    /// the call's arguments before the caller sees them.
+    RetN(u8),
     /// `break` — unwinds to the innermost loop, which stops iterating.
     Break,
     /// `goto` — jump to the label node. Unwinds through block frames until the
@@ -55,7 +59,7 @@ pub fn exec_script(s: &mut LuaState, first: u16) -> Result<(), &'static str> {
     s.pop_frame();
     match r {
         Ok(ExecResult::Normal) => Ok(()),
-        Ok(ExecResult::Ret(_)) | Ok(ExecResult::Ret2(..)) => Ok(()),
+        Ok(ExecResult::Ret(_)) | Ok(ExecResult::Ret2(..)) | Ok(ExecResult::RetN(_)) => Ok(()),
         Ok(ExecResult::Break) => Err("break outside loop"),
         Ok(ExecResult::Goto(_)) => Err("unknown label"),
         Ok(ExecResult::Shell) | Ok(ExecResult::Exit) => Ok(()),
@@ -135,10 +139,18 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
             let stmt = p.parse_assignment_from(e)?;
             return exec_script(s, stmt).map(|_| ExecResult::Normal);
         }
-        let (v, second, n) = eval_multi(s, e)?;
+        let n = eval_values(s, e)? as usize;
+        let base = s.vsp as usize - n;
+        let v = if n >= 1 { s.vstack[base] } else { Value::Nil };
         match v {
-            Value::Exit => return Ok(ExecResult::Exit),
-            Value::Shell => return Ok(ExecResult::Shell),
+            Value::Exit => {
+                pop_values(s, n);
+                return Ok(ExecResult::Exit);
+            }
+            Value::Shell => {
+                pop_values(s, n);
+                return Ok(ExecResult::Shell);
+            }
             Value::Dhcp => {
                 let ok = s.run_dhcp()?;
                 if ok {
@@ -146,10 +158,12 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
                 }
                 tostring(s, Value::Bool(ok))?;
                 emit(s, b'\n');
+                pop_values(s, n);
                 return Ok(ExecResult::Normal);
             }
             Value::Ls => {
                 ls_run(s)?;
+                pop_values(s, n);
                 return Ok(ExecResult::Normal);
             }
             _ => {
@@ -158,15 +172,17 @@ pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<Exe
                     // behavior; Lua's REPL prints nothing).
                     tostring(s, Value::Nil)?;
                 } else {
-                    tostring(s, v)?;
-                    if n == 2 {
-                        emit(s, b'\t');
-                        tostring(s, second)?;
+                    for i in 0..n {
+                        if i > 0 {
+                            emit(s, b'\t');
+                        }
+                        tostring(s, s.vstack[base + i])?;
                     }
                 }
                 emit(s, b'\n');
             }
         }
+        pop_values(s, n);
         return Ok(ExecResult::Normal);
     }
     let first = {
@@ -188,21 +204,24 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
     match s.nodes[n as usize] {
         Node::LocalDecl(first_name, val_node) => {
             // Name nodes are chained through `next[]`; a call in the value
-            // position can supply two values (`local k, v = next(t)`).
-            let (a, b, n) = eval_multi(s, val_node)?;
+            // position can supply any number of values (`local k, v = next(t)`,
+            // `local a, b, c = select(1, x, y, z)`); extra names get nil.
+            let n = eval_values(s, val_node)? as usize;
+            let base = s.vsp as usize - n;
             let mut name_node = first_name;
-            let mut idx = 0u8;
+            let mut idx = 0usize;
             while name_node != NO_NODE {
                 let name = node_name(s, name_node);
-                let v = match idx {
-                    0 => a,
-                    1 if n == 2 => b,
-                    _ => Value::Nil,
+                let v = if idx < n {
+                    s.vstack[base + idx]
+                } else {
+                    Value::Nil
                 };
                 s.declare_local(name, v)?;
                 name_node = s.next[name_node as usize];
                 idx += 1;
             }
+            pop_values(s, n);
             Ok(ExecResult::Normal)
         }
         Node::GlobalDecl(name_node, val_node) => {
@@ -218,19 +237,21 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
         Node::AssignStmt(first_target, v) => {
             // Targets are chained through `next[]`; all values are computed
             // before any assignment (`k, v = next(t)`).
-            let (a, b, n) = eval_multi(s, v)?;
+            let n = eval_values(s, v)? as usize;
+            let base = s.vsp as usize - n;
             let mut target = first_target;
-            let mut idx = 0u8;
+            let mut idx = 0usize;
             while target != NO_NODE {
-                let vv = match idx {
-                    0 => a,
-                    1 if n == 2 => b,
-                    _ => Value::Nil,
+                let vv = if idx < n {
+                    s.vstack[base + idx]
+                } else {
+                    Value::Nil
                 };
                 assign(s, target, vv)?;
                 target = s.next[target as usize];
                 idx += 1;
             }
+            pop_values(s, n);
             Ok(ExecResult::Normal)
         }
         Node::CallStmt(e) => {
@@ -383,8 +404,12 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             // Accepts the bare table form (`for k, v in t`) and the Lua
             // iterator form (`for k, v in pairs(t)`), where the call yields
             // `next, t`.
-            let (t, second, _) = eval_multi(s, table)?;
-            let tid = match (t, second) {
+            let n = eval_values(s, table)? as usize;
+            let base = s.vsp as usize - n;
+            let first = if n >= 1 { s.vstack[base] } else { Value::Nil };
+            let second = if n >= 2 { s.vstack[base + 1] } else { Value::Nil };
+            pop_values(s, n);
+            let tid = match (first, second) {
                 (Value::Table(i), _) => i,
                 (Value::Native(3), Value::Table(i)) => i,
                 _ => return Err("'for in' requires a table or pairs(t)"),
@@ -441,13 +466,9 @@ fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
             if v == NO_NODE {
                 return Ok(ExecResult::Ret(Value::Nil));
             }
-            // `return next(t)` forwards both values to the caller.
-            let (a, b, n) = eval_multi(s, v)?;
-            Ok(if n == 2 {
-                ExecResult::Ret2(a, b)
-            } else {
-                ExecResult::Ret(a)
-            })
+            // `return next(t)` / `return select(...)` forwards every result to
+            // the caller.
+            Ok(ExecResult::RetN(eval_values(s, v)?))
         }
         _ => Err("internal error: statement expected"),
     }
@@ -475,15 +496,9 @@ fn eval_call(s: &mut LuaState, f: u16, first_arg: u16) -> Result<ExecResult, &'s
             _ => return Err("internal error: expected argument"),
         };
         if is_last {
-            let (a, b, cnt) = eval_multi(s, vnode)?;
-            if cnt >= 1 {
-                s.push_val(a)?;
-                argc += 1;
-            }
-            if cnt == 2 {
-                s.push_val(b)?;
-                argc += 1;
-            }
+            // A final call argument expands; `eval_values` pushes its results
+            // directly onto our argument stack.
+            argc += eval_values(s, vnode)?;
         } else {
             let v = eval(s, vnode)?;
             s.push_val(v)?;
@@ -497,22 +512,44 @@ fn eval_call(s: &mut LuaState, f: u16, first_arg: u16) -> Result<ExecResult, &'s
     call(s, fv, argc)
 }
 
-/// Evaluate an expression in a multiple-value context. A call may yield two
-/// values (e.g. `next`); anything else yields one. Returns `(first, second,
-/// count)` where `count` is 0 (a call returning nothing), 1, or 2.
-fn eval_multi(s: &mut LuaState, n: u16) -> Result<(Value, Value, u8), &'static str> {
+/// Evaluate an expression in a multiple-value context: push its results onto
+/// the value stack and return the count. A call may yield any number of values
+/// (`select`, `next`, `pairs`); anything else yields one.
+fn eval_values(s: &mut LuaState, n: u16) -> Result<u8, &'static str> {
     if let Node::Call(f, first_arg) = s.nodes[n as usize] {
         return match eval_call(s, f, first_arg)? {
-            ExecResult::Normal => Ok((Value::Nil, Value::Nil, 0)),
-            ExecResult::Ret(v) => Ok((v, Value::Nil, 1)),
-            ExecResult::Ret2(a, b) => Ok((a, b, 2)),
+            ExecResult::Normal => Ok(0),
+            ExecResult::Ret(v) => {
+                s.push_val(v)?;
+                Ok(1)
+            }
+            ExecResult::Ret2(a, b) => {
+                s.push_val(a)?;
+                s.push_val(b)?;
+                Ok(2)
+            }
+            // The results are already on the stack.
+            ExecResult::RetN(cnt) => Ok(cnt),
             ExecResult::Break => Err("break outside loop"),
             ExecResult::Goto(_) => Err("goto outside function"),
-            ExecResult::Shell => Ok((Value::Shell, Value::Nil, 1)),
-            ExecResult::Exit => Ok((Value::Exit, Value::Nil, 1)),
+            ExecResult::Shell => {
+                s.push_val(Value::Shell)?;
+                Ok(1)
+            }
+            ExecResult::Exit => {
+                s.push_val(Value::Exit)?;
+                Ok(1)
+            }
         };
     }
-    Ok((eval(s, n)?, Value::Nil, 1))
+    let v = eval(s, n)?;
+    s.push_val(v)?;
+    Ok(1)
+}
+
+/// Pop `count` values that [`eval_values`] left on the stack.
+fn pop_values(s: &mut LuaState, count: usize) {
+    s.vsp -= count as u32;
 }
 
 /// Evaluate an expression node.
@@ -557,6 +594,15 @@ fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
             ExecResult::Ret(v) => Ok(v),
             // Single-value context: keep the first result.
             ExecResult::Ret2(a, _) => Ok(a),
+            ExecResult::RetN(n) => {
+                let v = if n == 0 {
+                    Value::Nil
+                } else {
+                    s.vstack[s.vsp as usize - n as usize]
+                };
+                s.vsp -= n as u32;
+                Ok(v)
+            }
             ExecResult::Break => Err("break outside loop"),
             ExecResult::Goto(_) => Err("goto outside function"),
             ExecResult::Shell => Ok(Value::Shell),
@@ -786,6 +832,39 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             tset(s, argbuf[0], argbuf[1], argbuf[2])?;
             ExecResult::Ret(argbuf[0])
         }
+        Value::Native(9) => {
+            // select(index, ...): "#" returns the number of extra arguments;
+            // a number returns the arguments after position `index` (-1 is the
+            // last argument).
+            if argc < 1 {
+                return Err("select expects at least 1 argument");
+            }
+            let extras = argc as usize - 1;
+            match argbuf[0] {
+                Value::Str(r) if s.str_bytes(r) == b"#" => ExecResult::Ret(Value::Num(extras as i64)),
+                k => {
+                    let mut i = match k {
+                        Value::Num(n) => n,
+                        Value::Float(f) if f.is_finite() && f == float_floor(f) => f as i64,
+                        _ => return Err("select index must be an integer"),
+                    };
+                    let total = argc as i64;
+                    if i < 0 {
+                        i += total;
+                    } else if i > total {
+                        i = total;
+                    }
+                    if i < 1 {
+                        return Err("select index out of range");
+                    }
+                    let start = i as usize;
+                    for j in start..argc as usize {
+                        s.push_val(argbuf[j])?;
+                    }
+                    ExecResult::RetN((argc as usize - start) as u8)
+                }
+            }
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");
@@ -829,6 +908,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 Ok(ExecResult::Normal) => ExecResult::Normal,
                 Ok(ExecResult::Ret(v)) => ExecResult::Ret(v),
                 Ok(ExecResult::Ret2(a, b)) => ExecResult::Ret2(a, b),
+                Ok(ExecResult::RetN(n)) => ExecResult::RetN(n),
                 Ok(ExecResult::Break) => return Err("break outside loop"),
                 Ok(ExecResult::Goto(_)) => return Err("goto outside function"),
                 Ok(ExecResult::Shell) => ExecResult::Shell,
@@ -839,7 +919,18 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
         _ => return Err("attempt to call a non-function value"),
     };
 
-    s.vsp = base as u32;
+    match result {
+        ExecResult::RetN(n) => {
+            // Move the n results down over the call's arguments; they stay on
+            // the stack for the caller to consume.
+            let src = s.vsp as usize - n as usize;
+            for j in 0..n as usize {
+                s.vstack[base + j] = s.vstack[src + j];
+            }
+            s.vsp = (base + n as usize) as u32;
+        }
+        _ => s.vsp = base as u32,
+    }
     Ok(result)
 }
 
@@ -871,6 +962,15 @@ fn dofile_exec(s: &mut LuaState, name: &str) -> Result<Value, &'static str> {
         Ok(ExecResult::Ret(v)) => Ok(v),
         // Single-value context: keep the first result.
         Ok(ExecResult::Ret2(a, _)) => Ok(a),
+        Ok(ExecResult::RetN(n)) => {
+            let v = if n == 0 {
+                Value::Nil
+            } else {
+                s.vstack[s.vsp as usize - n as usize]
+            };
+            s.vsp -= n as u32;
+            Ok(v)
+        }
         Ok(ExecResult::Break) => Err("break outside loop"),
         Ok(ExecResult::Goto(_)) => Err("unknown label"),
         Ok(ExecResult::Shell) => Ok(Value::Shell),
@@ -1119,7 +1219,10 @@ fn fmt_float(v: f64, out: &mut [u8]) -> usize {
         return s.len();
     }
 
-    // Render with 14 significant digits and read off the decimal exponent.
+    // Render with core::fmt using only the exponential form: it yields the
+    // correctly rounded 14 significant digits, and avoids linking the
+    // fixed-notation formatting path (worth ~3.6 KB on the firmware targets).
+    // The digits are then rearranged into Lua's `%.14g` style below.
     let mut sci = [0u8; 32];
     let n = {
         let mut w = FmtBuf {
@@ -1155,18 +1258,32 @@ fn fmt_float(v: f64, out: &mut [u8]) -> usize {
         exp = -exp;
     }
 
+    // Collect the 14 mantissa digits (`[-]d.ddddddddddddd`), dropping the
+    // decimal point and trimming trailing zeros.
+    let mstart = if sci[0] == b'-' { 1 } else { 0 };
+    let mut digits = [0u8; 14];
+    digits[0] = sci[mstart];
+    digits[1..].copy_from_slice(&sci[mstart + 2..mstart + 15]);
+    let mut nd = 14usize;
+    while nd > 1 && digits[nd - 1] == b'0' {
+        nd -= 1;
+    }
+
+    let mut o = 0usize;
+    if sci[0] == b'-' {
+        out[o] = b'-';
+        o += 1;
+    }
     if exp < -4 || exp >= 14 {
-        // Scientific notation: trim trailing zeros from the mantissa.
-        let mut mend = epos;
-        while mend > 1 && sci[mend - 1] == b'0' {
-            mend -= 1;
+        // Scientific notation: `d[.ddd]e±NN`.
+        out[o] = digits[0];
+        o += 1;
+        if nd > 1 {
+            out[o] = b'.';
+            o += 1;
+            out[o..o + nd - 1].copy_from_slice(&digits[1..nd]);
+            o += nd - 1;
         }
-        if mend > 1 && sci[mend - 1] == b'.' {
-            mend -= 1;
-        }
-        let mut o = 0;
-        out[..mend].copy_from_slice(&sci[..mend]);
-        o += mend;
         out[o] = b'e';
         o += 1;
         out[o] = if exp < 0 { b'-' } else { b'+' };
@@ -1192,33 +1309,39 @@ fn fmt_float(v: f64, out: &mut [u8]) -> usize {
             t += 1;
         }
         o
-    } else {
-        // Fixed notation with `13 - exp` decimals (14 significant digits).
-        let prec = (13 - exp) as usize;
-        let n2 = {
-            let mut w = FmtBuf { buf: out, len: 0 };
-            if write!(w, "{:.*}", prec, v).is_err() {
-                return 0;
-            }
-            w.len
-        };
-        if let Some(dot) = out[..n2].iter().position(|&b| b == b'.') {
-            let mut end = n2;
-            while end > dot + 1 && out[end - 1] == b'0' {
-                end -= 1;
-            }
-            if end == dot + 1 {
-                // Every decimal was zero: keep one (`5.` -> `5.0`).
-                out[end] = b'0';
-                end += 1;
-            }
-            end
-        } else {
-            // No fractional point at all (`12345678901234`): append `.0`.
-            out[n2] = b'.';
-            out[n2 + 1] = b'0';
-            n2 + 2
+    } else if exp >= 0 {
+        // Fixed notation with the integer part first (`exp + 1` digits).
+        let ip = exp as usize + 1;
+        let mut j = 0;
+        while j < ip {
+            out[o] = if j < nd { digits[j] } else { b'0' };
+            o += 1;
+            j += 1;
         }
+        out[o] = b'.';
+        o += 1;
+        if nd > ip {
+            out[o..o + nd - ip].copy_from_slice(&digits[ip..nd]);
+            o += nd - ip;
+        } else {
+            // All decimals were zero: keep one (`5` -> `5.0`).
+            out[o] = b'0';
+            o += 1;
+        }
+        o
+    } else {
+        // `0.` then `-exp - 1` zeros then the digits (`0.025`).
+        out[o] = b'0';
+        o += 1;
+        out[o] = b'.';
+        o += 1;
+        for _ in 0..(-exp - 1) {
+            out[o] = b'0';
+            o += 1;
+        }
+        out[o..o + nd].copy_from_slice(&digits[..nd]);
+        o += nd;
+        o
     }
 }
 

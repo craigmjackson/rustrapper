@@ -231,6 +231,7 @@ pub fn repl_loop(
                                     Ok(eval::ExecResult::Break) => {}
                                     Ok(eval::ExecResult::Goto(_)) => {}
                                     Ok(eval::ExecResult::Ret2(..)) => {}
+                                    Ok(eval::ExecResult::RetN(_)) => {}
                                     Ok(eval::ExecResult::Exit) => exited = true,
                                     Ok(eval::ExecResult::Shell) => {
                                         puts("\n(nested shell not supported)\n\n");
@@ -778,6 +779,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Sets the real value of table[index] and returns the table.\n\
                   This subset has no metatables, so it agrees with\n\
                   'table[index] = value'. The index may not be nil or NaN.\n",
+    },
+    HelpEntry {
+        name: "select",
+        short: "Return arguments after an index, or count with '#'",
+        detail: "select(index, ...)\n\
+                  With a number index, returns the arguments after position\n\
+                  index (-1 is the last argument). With the string \"#\",\n\
+                  returns the number of extra arguments it received.\n\
+                  Example: select(2, \"a\", \"b\", \"c\") -> b c\n",
     },
     HelpEntry {
         name: "fetch",

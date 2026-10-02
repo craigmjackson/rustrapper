@@ -21,9 +21,13 @@
 //! - Tables: array fields, `name =` fields, `[expr] =` fields, `t.key`, `t[key]`
 //! - `print(...)` builtin, `--` line comments
 //! - `next(t [, k])` builtin: returns the next key/value pair of a table (or
-//!   `nil` at the end / for an empty table). Calls can yield two values, which
-//!   `local k, v = next(t)`, `k, v = next(t)`, `return next(t)` and a final
-//!   call argument (`print(next(t))`) consume. `t[k] = nil` removes the field.
+//!   `nil` at the end / for an empty table). Calls can yield multiple values,
+//!   which `local a, b = f()`, `a, b = f()`, `return f()` and a final call
+//!   argument (`print(f())`) consume (`next`/`pairs` yield two, `select` any
+//!   number). `t[k] = nil` removes the field.
+//! - `select(index, ...)` builtin: with a number index, returns the arguments
+//!   after that position (-1 is the last); with `"#"`, returns the number of
+//!   extra arguments.
 //! - `pairs(t)` builtin: returns the `next` function and the table, so
 //!   `for k, v in pairs(t) do ... end` iterates every key/value pair. This
 //!   subset has no metatables, so there is no `__pairs` metamethod.
@@ -188,7 +192,7 @@ pub enum Value {
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
     /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`,
     /// `rawequal` is `Native(5)`, `rawget` is `Native(6)`, `rawlen` is
-    /// `Native(7)`, `rawset` is `Native(8)`.
+    /// `Native(7)`, `rawset` is `Native(8)`, `select` is `Native(9)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -522,6 +526,9 @@ impl LuaState {
         let _ = self.intern(b"rawset");
         let rawset_name = self.intern(b"rawset").unwrap();
         self.set_global(rawset_name, Value::Native(8));
+        let _ = self.intern(b"select");
+        let select_name = self.intern(b"select").unwrap();
+        self.set_global(select_name, Value::Native(9));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -954,6 +961,7 @@ pub fn run_repl(
             Ok(eval::ExecResult::Goto(_)) => {}
             Ok(eval::ExecResult::Ret(_)) => {}
             Ok(eval::ExecResult::Ret2(..)) => {}
+            Ok(eval::ExecResult::RetN(_)) => {}
             Ok(eval::ExecResult::Exit) => break,
             Ok(eval::ExecResult::Shell) => {
                 // Nested shell — not supported in this simple REPL.
@@ -1504,6 +1512,46 @@ mod tests {
         assert!(exec("t = {}\nt[0.0/0.0] = 1").is_err());
         assert_eq!(exec("t = {}\nprint(t[nil], t[0.0/0.0])").unwrap(), "nil\tnil\n");
         assert!(exec("t = {[0.0/0.0] = 1}").is_err());
+    }
+
+    #[test]
+    fn select_builtin() {
+        // "#" returns the number of extra arguments.
+        assert_eq!(exec("print(select(\"#\", 1, 2, 3))").unwrap(), "3\n");
+        assert_eq!(exec("print(select(\"#\"))").unwrap(), "0\n");
+        // A number index returns the arguments after it.
+        assert_eq!(exec("print(select(1, \"a\", \"b\", \"c\"))").unwrap(), "a\tb\tc\n");
+        assert_eq!(exec("print(select(2, \"a\", \"b\", \"c\"))").unwrap(), "b\tc\n");
+        assert_eq!(exec("print(select(3, \"a\", \"b\", \"c\"))").unwrap(), "c\n");
+        // Negative indexes count from the end (-1 is the last argument).
+        assert_eq!(exec("print(select(-1, \"a\", \"b\", \"c\"))").unwrap(), "c\n");
+        assert_eq!(exec("print(select(-2, \"a\", \"b\", \"c\"))").unwrap(), "b\tc\n");
+        // An index past the end yields no values.
+        assert_eq!(exec("print(select(4, \"a\"))").unwrap(), "\n");
+        // Any number of results can be consumed.
+        assert_eq!(
+            exec("local a, b, c = select(1, 10, 20, 30)\nprint(a, b, c)").unwrap(),
+            "10\t20\t30\n"
+        );
+        assert_eq!(
+            exec("local a, b, c = select(1)\nprint(a, b, c)").unwrap(),
+            "nil\tnil\tnil\n"
+        );
+        // A non-final call argument is truncated to one value.
+        assert_eq!(exec("print(select(1, \"a\", \"b\"), \"z\")").unwrap(), "a\tz\n");
+        // Forwarding every result through a function.
+        assert_eq!(
+            exec("function f() return select(2, \"x\", \"y\", \"z\") end\nprint(f())").unwrap(),
+            "y\tz\n"
+        );
+        // Integral float indexes are accepted.
+        assert_eq!(exec("print(select(1.0, \"f\"))").unwrap(), "f\n");
+        // Errors: index out of range, non-integer/strange index, arity.
+        assert!(exec("select(0, 1)").is_err());
+        assert!(exec("select(-4, 1, 2)").is_err());
+        assert!(exec("select(\"x\", 1)").is_err());
+        assert!(exec("select(1.5, 1)").is_err());
+        assert!(exec("select()").is_err());
     }
 
     #[test]
