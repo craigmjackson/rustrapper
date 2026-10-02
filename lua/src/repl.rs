@@ -755,6 +755,14 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   subset has no metatables, so it agrees with `v1 == v2`.\n",
     },
     HelpEntry {
+        name: "rawget",
+        short: "Get table[index] without the __index metavalue",
+        detail: "rawget(table, index)\n\
+                  Returns the real value of table[index]. This subset has no\n\
+                  metatables, so it agrees with 'table[index]'. The index may\n\
+                  be any value; the table must be a table.\n",
+    },
+    HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
         detail: "fetch(\"file\"[, \"dest\"])\n\

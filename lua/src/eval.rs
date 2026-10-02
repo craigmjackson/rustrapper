@@ -735,6 +735,17 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
             ExecResult::Ret(Value::Bool(val_eq(argbuf[0], argbuf[1])))
         }
+        Value::Native(6) => {
+            // rawget(table, index): the real `table[index]`, without `__index`.
+            // This subset has no metatables, so it agrees with `table[index]`.
+            if argc != 2 {
+                return Err("rawget expects 2 arguments");
+            }
+            match argbuf[0] {
+                Value::Table(_) => ExecResult::Ret(tget(s, argbuf[0], argbuf[1])?),
+                _ => return Err("rawget expects a table"),
+            }
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");

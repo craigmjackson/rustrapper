@@ -129,6 +129,7 @@ Builtins:
 - `next(t [, k])` — return the next key/value pair of a table (or `nil` at the end); `next(t) == nil` tests for an empty table
 - `pairs(t)` — the `next` function plus the table, for `for k, v in pairs(t) do ... end` (no metatables, so no `__pairs`)
 - `rawequal(v1, v2)` — primitive equality without metamethods (agrees with `==` in this subset)
+- `rawget(table, index)` — the real `table[index]` without `__index` (agrees with `table[index]`)
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
 - `fetch("file"[, "dest"])` — download a file from the TFTP server, saving it under the optional local `dest` name, and return its byte count (or `nil`)
 - `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
@@ -249,13 +250,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 270 tests across all crates
+cargo test --workspace   # 271 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 92    | Lexer, parser, evaluator, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal` + multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
+| `lua`        | 93    | Lexer, parser, evaluator, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget` + multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

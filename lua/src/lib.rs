@@ -29,6 +29,8 @@
 //!   subset has no metatables, so there is no `__pairs` metamethod.
 //! - `rawequal(v1, v2)` builtin: primitive equality without metamethods
 //!   (there are none here, so it agrees with `==`).
+//! - `rawget(table, index)` builtin: the real `table[index]` without the
+//!   `__index` metavalue (there are none here, so it agrees with `table[index]`).
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
@@ -180,7 +182,7 @@ pub enum Value {
     Func(u16),
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
     /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`,
-    /// `rawequal` is `Native(5)`.
+    /// `rawequal` is `Native(5)`, `rawget` is `Native(6)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -505,6 +507,9 @@ impl LuaState {
         let _ = self.intern(b"rawequal");
         let rawequal_name = self.intern(b"rawequal").unwrap();
         self.set_global(rawequal_name, Value::Native(5));
+        let _ = self.intern(b"rawget");
+        let rawget_name = self.intern(b"rawget").unwrap();
+        self.set_global(rawget_name, Value::Native(6));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1407,6 +1412,34 @@ mod tests {
         );
         assert!(exec("rawequal(1)").is_err());
         assert!(exec("rawequal(1, 2, 3)").is_err());
+    }
+
+    #[test]
+    fn rawget_builtin() {
+        assert_eq!(
+            exec("t = {10, x = 20}\nprint(rawget(t, 1), rawget(t, \"x\"))").unwrap(),
+            "10\t20\n"
+        );
+        // A missing key yields nil.
+        assert_eq!(
+            exec("print(rawget({}, 1), rawget({}, \"missing\"))").unwrap(),
+            "nil\tnil\n"
+        );
+        // Any index value is accepted.
+        assert_eq!(exec("t = {}\nprint(rawget(t, nil))").unwrap(), "nil\n");
+        assert_eq!(exec("print(rawget({7}, 1.0))").unwrap(), "7\n");
+        // No metatables exist, so rawget agrees with t[k].
+        assert_eq!(exec("t = {5}\nprint(rawget(t, 1) == t[1])").unwrap(), "true\n");
+        // Values compare by identity (a table-valued field).
+        assert_eq!(
+            exec("u = {}\nt = {u}\nprint(rawget(t, 1) == u)").unwrap(),
+            "true\n"
+        );
+        // Errors: non-table / arity.
+        assert!(exec("rawget(1, 1)").is_err());
+        assert!(exec("rawget()").is_err());
+        assert!(exec("rawget({})").is_err());
+        assert!(exec("rawget({}, 1, 2)").is_err());
     }
 
     #[test]
