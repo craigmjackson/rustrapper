@@ -18,7 +18,7 @@
 //! - Generic `for k [, v] in table do ... end` (iterates a table's key/value
 //!   pairs; the `in` keyword) — array fields iterate `1..n`, named fields by key
 //! - Named functions `function name(a, b) ... end` and `return`
-//! - Tables: array fields, `name =` fields, `[expr]` fields, `t.key`, `t[key]`
+//! - Tables: array fields, `name =` fields, `[expr] =` fields, `t.key`, `t[key]`
 //! - `print(...)` builtin, `--` line comments
 //! - `next(t [, k])` builtin: returns the next key/value pair of a table (or
 //!   `nil` at the end / for an empty table). Calls can yield two values, which
@@ -31,6 +31,11 @@
 //!   (there are none here, so it agrees with `==`).
 //! - `rawget(table, index)` builtin: the real `table[index]` without the
 //!   `__index` metavalue (there are none here, so it agrees with `table[index]`).
+//! - `rawlen(v)` builtin: length of a table or string without `__len`. A
+//!   table's length is the run of consecutive integer keys starting at 1.
+//! - `rawset(table, index, value)` builtin: the real `table[index] = value`
+//!   without `__newindex`, returning the table. The index may not be nil or
+//!   NaN (plain assignment enforces the same rule).
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
@@ -182,7 +187,8 @@ pub enum Value {
     Func(u16),
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
     /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`,
-    /// `rawequal` is `Native(5)`, `rawget` is `Native(6)`.
+    /// `rawequal` is `Native(5)`, `rawget` is `Native(6)`, `rawlen` is
+    /// `Native(7)`, `rawset` is `Native(8)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -510,6 +516,12 @@ impl LuaState {
         let _ = self.intern(b"rawget");
         let rawget_name = self.intern(b"rawget").unwrap();
         self.set_global(rawget_name, Value::Native(6));
+        let _ = self.intern(b"rawlen");
+        let rawlen_name = self.intern(b"rawlen").unwrap();
+        self.set_global(rawlen_name, Value::Native(7));
+        let _ = self.intern(b"rawset");
+        let rawset_name = self.intern(b"rawset").unwrap();
+        self.set_global(rawset_name, Value::Native(8));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1443,6 +1455,58 @@ mod tests {
     }
 
     #[test]
+    fn rawlen_builtin() {
+        // Strings: byte length.
+        assert_eq!(exec("print(rawlen(\"hello\"), rawlen(\"\"))").unwrap(), "5\t0\n");
+        assert_eq!(exec("print(rawlen(\"a\\tb\"))").unwrap(), "3\n");
+        // Tables: run of consecutive integer keys from 1.
+        assert_eq!(exec("print(rawlen({1, 2, 3}), rawlen({}))").unwrap(), "3\t0\n");
+        assert_eq!(exec("print(rawlen({1, 2, name = \"x\"}))").unwrap(), "2\n");
+        assert_eq!(exec("print(rawlen({[2] = 5}))").unwrap(), "0\n");
+        assert_eq!(exec("print(rawlen({[1] = 5, [3] = 7}))").unwrap(), "1\n");
+        // Removing an array field shrinks the table.
+        assert_eq!(exec("t = {1, 2, 3}\nt[3] = nil\nprint(rawlen(t))").unwrap(), "2\n");
+        // Errors: non-table/string, arity.
+        assert!(exec("rawlen(5)").is_err());
+        assert!(exec("rawlen(nil)").is_err());
+        assert!(exec("rawlen(true)").is_err());
+        assert!(exec("rawlen()").is_err());
+        assert!(exec("rawlen(\"a\", \"b\")").is_err());
+    }
+
+    #[test]
+    fn rawset_builtin() {
+        // Sets the field and returns the table (so results can be indexed).
+        assert_eq!(exec("t = {}\nprint(rawset(t, 1, 10)[1])").unwrap(), "10\n");
+        assert_eq!(exec("t = {}\nprint(rawset(t, \"x\", 5).x)").unwrap(), "5\n");
+        // Returns the same table it was given.
+        assert_eq!(
+            exec("t = {}\nprint(rawequal(rawset(t, 1, 1), t))").unwrap(),
+            "true\n"
+        );
+        // Any index value except nil/NaN; float keys match int keys.
+        assert_eq!(exec("t = {}\nrawset(t, 1.0, 7)\nprint(t[1])").unwrap(), "7\n");
+        assert_eq!(exec("t = {}\nrawset(t, true, 1)\nprint(t[true])").unwrap(), "1\n");
+        // Setting nil removes the field.
+        assert_eq!(
+            exec("t = {1, 2}\nrawset(t, 1, nil)\nprint(t[1], rawlen(t))").unwrap(),
+            "nil\t0\n"
+        );
+        // Errors: non-table, nil/NaN index, arity.
+        assert!(exec("rawset(1, \"k\", 1)").is_err());
+        assert!(exec("rawset({}, nil, 1)").is_err());
+        assert!(exec("rawset({}, 0.0/0.0, 1)").is_err());
+        assert!(exec("rawset({}, 1)").is_err());
+        assert!(exec("rawset({}, 1, 2, 3)").is_err());
+        // Plain assignment rejects nil/NaN keys too (Lua semantics), while
+        // reading them is still fine.
+        assert!(exec("t = {}\nt[nil] = 1").is_err());
+        assert!(exec("t = {}\nt[0.0/0.0] = 1").is_err());
+        assert_eq!(exec("t = {}\nprint(t[nil], t[0.0/0.0])").unwrap(), "nil\tnil\n");
+        assert!(exec("t = {[0.0/0.0] = 1}").is_err());
+    }
+
+    #[test]
     fn nil_removes_table_fields() {
         // `t[k] = nil` removes the key (Lua), it does not store a nil value.
         assert_eq!(exec("t = {a = 1}\nt.a = nil\nprint(t.a)").unwrap(), "nil\n");
@@ -1504,6 +1568,13 @@ mod tests {
             exec("a = {2, 3}\nb = {10, 20, 30}\nprint(b[a[1]])").unwrap(),
             "20\n"
         );
+        // Computed-key fields use Lua's `[expr] = value` form.
+        assert_eq!(
+            exec("k = \"x\"\nt = {[2] = 5, [k] = 6}\nprint(t[2], t.x)").unwrap(),
+            "5\t6\n"
+        );
+        // The `=` is required.
+        assert!(exec("t = {[2] 5}").is_err());
     }
 
     #[test]

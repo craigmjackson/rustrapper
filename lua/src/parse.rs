@@ -662,6 +662,7 @@ impl<'s, 'l> Parser<'s, 'l> {
                         self.advance()?;
                         let k = self.parse_expr()?;
                         self.expect(Tok::RBracket, "expected ']'")?;
+                        self.expect(Tok::Equals, "expected '=' after '[expr]' key")?;
                         let v = self.parse_expr()?;
                         (k, v)
                     }

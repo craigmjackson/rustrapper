@@ -746,6 +746,46 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 _ => return Err("rawget expects a table"),
             }
         }
+        Value::Native(7) => {
+            // rawlen(v): length of a table or string, without `__len`. There
+            // are no metatables, so this is the plain length. A table's length
+            // is the run of consecutive integer keys starting at 1.
+            if argc != 1 {
+                return Err("rawlen expects 1 argument");
+            }
+            let len = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r).len(),
+                Value::Table(_) => {
+                    let mut n = 0usize;
+                    loop {
+                        let next = tget(s, argbuf[0], Value::Num((n + 1) as i64))?;
+                        if matches!(next, Value::Nil) {
+                            break;
+                        }
+                        n += 1;
+                        if n >= super::TABLE_SLOTS {
+                            break;
+                        }
+                    }
+                    n
+                }
+                _ => return Err("rawlen expects a table or a string"),
+            };
+            ExecResult::Ret(Value::Num(len as i64))
+        }
+        Value::Native(8) => {
+            // rawset(table, index, value): the real assignment without
+            // `__newindex` (no metatables exist, so it agrees with `t[k] = v`).
+            // Returns the table.
+            if argc != 3 {
+                return Err("rawset expects 3 arguments");
+            }
+            if !matches!(argbuf[0], Value::Table(_)) {
+                return Err("rawset expects a table");
+            }
+            tset(s, argbuf[0], argbuf[1], argbuf[2])?;
+            ExecResult::Ret(argbuf[0])
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");
@@ -1247,6 +1287,13 @@ fn tset(s: &mut LuaState, t: Value, k: Value, v: Value) -> Result<(), &'static s
         Value::Table(i) => i,
         _ => return Err("attempt to index a non-table value"),
     };
+    // Lua: a nil or NaN key can never be assigned (reading is fine).
+    if matches!(k, Value::Nil) {
+        return Err("table index is nil");
+    }
+    if matches!(k, Value::Float(f) if f.is_nan()) {
+        return Err("table index is NaN");
+    }
     let nil = matches!(v, Value::Nil);
     let len = s.tbls[tid as usize].len as usize;
     for i in 0..len {

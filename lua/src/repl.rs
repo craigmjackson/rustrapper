@@ -763,6 +763,23 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   be any value; the table must be a table.\n",
     },
     HelpEntry {
+        name: "rawlen",
+        short: "Length of a table or string (no __len)",
+        detail: "rawlen(v)\n\
+                  Returns the length of v, which must be a table or a string.\n\
+                  A table's length is the run of consecutive integer keys\n\
+                  starting at 1. This subset has no metatables, so it agrees\n\
+                  with the plain length.\n",
+    },
+    HelpEntry {
+        name: "rawset",
+        short: "Set table[index] without the __newindex metavalue",
+        detail: "rawset(table, index, value)\n\
+                  Sets the real value of table[index] and returns the table.\n\
+                  This subset has no metatables, so it agrees with\n\
+                  'table[index] = value'. The index may not be nil or NaN.\n",
+    },
+    HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
         detail: "fetch(\"file\"[, \"dest\"])\n\
