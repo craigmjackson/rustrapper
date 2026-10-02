@@ -27,6 +27,8 @@
 //! - `pairs(t)` builtin: returns the `next` function and the table, so
 //!   `for k, v in pairs(t) do ... end` iterates every key/value pair. This
 //!   subset has no metatables, so there is no `__pairs` metamethod.
+//! - `rawequal(v1, v2)` builtin: primitive equality without metamethods
+//!   (there are none here, so it agrees with `==`).
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
@@ -177,7 +179,8 @@ pub enum Value {
     Table(u16),
     Func(u16),
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
-    /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`.
+    /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`,
+    /// `rawequal` is `Native(5)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -499,6 +502,9 @@ impl LuaState {
         let _ = self.intern(b"pairs");
         let pairs_name = self.intern(b"pairs").unwrap();
         self.set_global(pairs_name, Value::Native(4));
+        let _ = self.intern(b"rawequal");
+        let rawequal_name = self.intern(b"rawequal").unwrap();
+        self.set_global(rawequal_name, Value::Native(5));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1374,6 +1380,33 @@ mod tests {
         assert!(exec("pairs()").is_err());
         assert!(exec("pairs({}, {})").is_err());
         assert!(exec("for k in pairs(5) do end").is_err());
+    }
+
+    #[test]
+    fn rawequal_builtin() {
+        assert_eq!(exec("print(rawequal(1, 1), rawequal(1, 2))").unwrap(), "true\tfalse\n");
+        // Numbers compare across int/float subtypes.
+        assert_eq!(exec("print(rawequal(1, 1.0))").unwrap(), "true\n");
+        assert_eq!(exec("print(rawequal(nil, nil), rawequal(nil, false))").unwrap(), "true\tfalse\n");
+        assert_eq!(exec("print(rawequal(true, true), rawequal(true, false))").unwrap(), "true\tfalse\n");
+        assert_eq!(exec("print(rawequal(\"a\", \"a\"), rawequal(\"a\", \"b\"))").unwrap(), "true\tfalse\n");
+        // Tables/functions compare by identity.
+        assert_eq!(
+            exec("t = {}\nprint(rawequal(t, t), rawequal({}, {}))").unwrap(),
+            "true\tfalse\n"
+        );
+        assert_eq!(
+            exec("print(rawequal(print, print), rawequal(print, next))").unwrap(),
+            "true\tfalse\n"
+        );
+        assert_eq!(exec("print(rawequal(dhcp, dhcp), rawequal(dhcp, ls))").unwrap(), "true\tfalse\n");
+        // No metatables exist, so `==` and `rawequal` agree.
+        assert_eq!(
+            exec("print((1 == 1.0) == rawequal(1, 1.0))").unwrap(),
+            "true\n"
+        );
+        assert!(exec("rawequal(1)").is_err());
+        assert!(exec("rawequal(1, 2, 3)").is_err());
     }
 
     #[test]

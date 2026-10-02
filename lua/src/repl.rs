@@ -748,6 +748,13 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   subset has no metatables, so there is no __pairs metamethod.\n",
     },
     HelpEntry {
+        name: "rawequal",
+        short: "Compare two values without metamethods",
+        detail: "rawequal(v1, v2)\n\
+                  Returns whether v1 equals v2 using primitive equality. This\n\
+                  subset has no metatables, so it agrees with `v1 == v2`.\n",
+    },
+    HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
         detail: "fetch(\"file\"[, \"dest\"])\n\

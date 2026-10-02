@@ -727,6 +727,14 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 _ => return Err("pairs expects a table"),
             }
         }
+        Value::Native(5) => {
+            // rawequal(v1, v2): primitive equality, without metamethods. This
+            // subset has no metatables, so `==` and `rawequal` agree.
+            if argc != 2 {
+                return Err("rawequal expects 2 arguments");
+            }
+            ExecResult::Ret(Value::Bool(val_eq(argbuf[0], argbuf[1])))
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");
@@ -868,6 +876,11 @@ fn val_eq(a: Value, b: Value) -> bool {
         (Value::Table(x), Value::Table(y)) => x == y,
         (Value::Func(x), Value::Func(y)) => x == y,
         (Value::Native(x), Value::Native(y)) => x == y,
+        // Unit builtins compare equal to themselves.
+        (Value::Shell, Value::Shell)
+        | (Value::Dhcp, Value::Dhcp)
+        | (Value::Exit, Value::Exit)
+        | (Value::Ls, Value::Ls) => true,
         _ => false,
     }
 }
