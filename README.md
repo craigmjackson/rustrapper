@@ -15,7 +15,7 @@ target links only the shared `common` and `lua` crates.
 
 ## Features
 
-- **BIOS** — 16‑bit MBR + 32-bit Rust stage2: menu, PCI storage scan, e1000 MMIO DHCP + DNS lookup, PXE boot
+- **BIOS** — 16‑bit MBR + 32-bit Rust stage2: menu, PCI storage scan, E820 memory map, e1000 MMIO DHCP + DNS lookup, PXE boot
 - **x86_64 UEFI** — Pure Rust PE/COFF: SNP protocol, DHCP client, ARP resolve, DNS lookup, storage scan, PXE boot
 - **UEFI option ROM** — PCI expansion ROM with direct e1000 MMIO driver (no UEFI protocols needed during DXE)
 - **ARM64 UEFI** — Same Rust code compiled for `aarch64-unknown-uefi` (large custom stack for the Lua interpreter)
@@ -135,6 +135,9 @@ Builtins:
 - `rawlen(v)` — length of a table or string without `__len` (a table's length is the run of integer keys from 1)
 - `rawset(table, index, value)` — the real `table[index] = value` without `__newindex`; returns the table (nil/NaN indexes error)
 - `select(index, ...)` — arguments after `index` (`-1` is the last), or the argument count when `index` is `"#"`
+- `tonumber(e [, base])` — convert a number or numeric string to a number (or `nil`); with `base` 2..36, parse a string as an integer in that base
+- `tostring(v)` — the human-readable string form of any value (same rendering as `print`)
+- `type(v)` — the Lua type name of a value: `"nil"`, `"boolean"`, `"number"`, `"string"`, `"table"`, or `"function"` (native builtins count as functions)
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
 - `fetch("file"[, "dest"])` — download a file from the TFTP server, saving it under the optional local `dest` name, and return its byte count (or `nil`)
 - `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
@@ -215,7 +218,7 @@ directory. This needs no root privileges and no external TFTP server.
 │       ├── vga.rs      # VGA text-mode driver with scrolling
 │       ├── pci.rs      # PCI scan via I/O ports 0xCF8/0xCFC
 │       ├── net.rs      # PCI + e1000 scan, DHCP, PXE boot (thin wrapper over common)
-│       ├── mem.rs      # Extended memory allocation via INT 15h E820
+│       ├── mem.rs      # E820 map + TFTP buffer region selection (captured by the stub)
 │       └── loader.rs   # ELF32/Multiboot execution
 ├── uefi/               # Rust UEFI binary (x86_64 + ARM64)
 │   └── src/
@@ -255,17 +258,18 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 275 tests across all crates
+cargo test --workspace   # 286 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 97    | Lexer, parser, evaluator, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable` + multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
+| `lua`        | 101   | Lexer, parser, evaluator, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type` + multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |
 | `native`     | 2     | `/proc/net/route` gateway hex decode, TFTP RRQ build                                          |
+| `bios`       | 7     | E820 region selection for the TFTP buffer (min/4 GB bounds, filtering, largest region)         |
 
 ## Requirements
 

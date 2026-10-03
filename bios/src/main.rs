@@ -5,10 +5,9 @@
 mod serial;
 mod vga;
 mod pci;
+mod mem;
 #[cfg(not(test))]
 mod net;
-#[cfg(not(test))]
-mod mem;
 #[cfg(not(test))]
 mod loader;
 #[cfg(not(test))]
@@ -43,9 +42,11 @@ fn dhcp_fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>> {
 
 #[cfg(not(test))]
 #[no_mangle]
-pub extern "C" fn _start(_boot_drive: u32) -> ! {
+pub extern "C" fn _start(_boot_drive: u32, e820_addr: u32, e820_count: u32) -> ! {
+    mem::init(e820_addr, e820_count);
     print::init(dual_putc);
     print::puts("\nRustrapper BIOS Stage2 (Rust)\n");
+    mem::print_summary();
     pci::pci_print_all();
     loop {
         match show_menu(common::print::puts, common::print::putc, serial::getc) {

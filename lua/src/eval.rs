@@ -52,6 +52,108 @@ fn float_floor(x: f64) -> f64 {
     }
 }
 
+/// Trim leading/trailing ASCII whitespace.
+fn trim_ascii(b: &[u8]) -> &[u8] {
+    let mut s = 0;
+    let mut e = b.len();
+    while s < e && b[s].is_ascii_whitespace() {
+        s += 1;
+    }
+    while e > s && b[e - 1].is_ascii_whitespace() {
+        e -= 1;
+    }
+    &b[s..e]
+}
+
+/// `tonumber(e)` for a string: parse an integer or float following the
+/// interpreter's decimal lexical conventions. `inf`/`nan`/hex are rejected
+/// (core's `f64` parser would otherwise accept `inf`/`nan`).
+fn str_to_number(b: &[u8]) -> Option<Value> {
+    let s = trim_ascii(b);
+    if s.is_empty() {
+        return None;
+    }
+    let text = core::str::from_utf8(s).ok()?;
+    if let Ok(i) = text.parse::<i64>() {
+        return Some(Value::Num(i));
+    }
+    let t = text.as_bytes();
+    let mut i = 0;
+    if t[i] == b'+' || t[i] == b'-' {
+        i += 1;
+    }
+    let mut digits = 0;
+    while i < t.len() && t[i].is_ascii_digit() {
+        i += 1;
+        digits += 1;
+    }
+    if i < t.len() && t[i] == b'.' {
+        i += 1;
+        while i < t.len() && t[i].is_ascii_digit() {
+            i += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    if i < t.len() && (t[i] == b'e' || t[i] == b'E') {
+        i += 1;
+        if i < t.len() && (t[i] == b'+' || t[i] == b'-') {
+            i += 1;
+        }
+        let mut ed = 0;
+        while i < t.len() && t[i].is_ascii_digit() {
+            i += 1;
+            ed += 1;
+        }
+        if ed == 0 {
+            return None;
+        }
+    }
+    if i != t.len() {
+        return None;
+    }
+    text.parse::<f64>().ok().map(Value::Float)
+}
+
+/// `tonumber(e, base)`: parse a decimal/alpha-numeric string as an integer in
+/// `base` (2..=36). An optional leading sign is allowed; overflow yields
+/// `None`.
+fn str_to_base(b: &[u8], base: i64) -> Option<i64> {
+    let s = trim_ascii(b);
+    if s.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let mut neg = false;
+    if s[i] == b'-' {
+        neg = true;
+        i += 1;
+    } else if s[i] == b'+' {
+        i += 1;
+    }
+    if i >= s.len() {
+        return None;
+    }
+    let mut n: i64 = 0;
+    while i < s.len() {
+        let c = s[i];
+        let d = match c {
+            b'0'..=b'9' => (c - b'0') as i64,
+            b'a'..=b'z' => (c - b'a') as i64 + 10,
+            b'A'..=b'Z' => (c - b'A') as i64 + 10,
+            _ => return None,
+        };
+        if d >= base {
+            return None;
+        }
+        n = n.checked_mul(base)?.checked_add(d)?;
+        i += 1;
+    }
+    Some(if neg { -n } else { n })
+}
+
 /// Execute the top-level script (its own scope frame).
 pub fn exec_script(s: &mut LuaState, first: u16) -> Result<(), &'static str> {
     s.push_frame()?;
@@ -894,6 +996,56 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             s.tbls[tid as usize].mt = new_mt;
             ExecResult::Ret(argbuf[0])
         }
+        Value::Native(11) => {
+            // tonumber(e [, base]): convert a number or a numeric string. With
+            // a base (2..36) the first argument must be a string and the
+            // result is an integer (or nil).
+            if argc < 1 || argc > 2 {
+                return Err("tonumber expects 1 or 2 arguments");
+            }
+            if argc == 1 || matches!(argbuf[1], Value::Nil) {
+                let v = match argbuf[0] {
+                    Value::Num(_) | Value::Float(_) => argbuf[0],
+                    Value::Str(r) => str_to_number(s.str_bytes(r)).unwrap_or(Value::Nil),
+                    _ => Value::Nil,
+                };
+                ExecResult::Ret(v)
+            } else {
+                let base = match argbuf[1] {
+                    Value::Num(n) => n,
+                    Value::Float(f) if f.is_finite() && f == float_floor(f) => f as i64,
+                    _ => return Err("tonumber base must be an integer"),
+                };
+                if !(2..=36).contains(&base) {
+                    return Err("tonumber base out of range");
+                }
+                let r = match argbuf[0] {
+                    Value::Str(r) => r,
+                    _ => return Err("tonumber expects a string with a base"),
+                };
+                ExecResult::Ret(match str_to_base(s.str_bytes(r), base) {
+                    Some(n) => Value::Num(n),
+                    None => Value::Nil,
+                })
+            }
+        }
+        Value::Native(12) => {
+            // tostring(v): the human-readable string form (the same rendering
+            // `print` uses). Metamethods are not dispatched, so a `__tostring`
+            // field is not consulted.
+            if argc != 1 {
+                return Err("tostring expects 1 argument");
+            }
+            ExecResult::Ret(Value::Str(value_to_string(s, argbuf[0])?))
+        }
+        Value::Native(13) => {
+            // type(v): the Lua type name of a value. Every callable value
+            // (including native builtins) reports "function".
+            if argc != 1 {
+                return Err("type expects 1 argument");
+            }
+            ExecResult::Ret(Value::Str(s.intern(type_name(argbuf[0]))?))
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");
@@ -1162,6 +1314,50 @@ fn string_of(s: &mut LuaState, v: Value) -> Result<super::StrRef, &'static str> 
             s.intern(&buf[..len])
         }
         _ => Err("attempt to concatenate a non-string value"),
+    }
+}
+
+/// The Lua type name of a value — the `type` builtin. Every callable value
+/// (user functions, native builtins, and the shell/dhcp/exit/ls keywords)
+/// reports "function".
+fn type_name(v: Value) -> &'static [u8] {
+    match v {
+        Value::Nil => b"nil",
+        Value::Bool(_) => b"boolean",
+        Value::Num(_) | Value::Float(_) => b"number",
+        Value::Str(_) => b"string",
+        Value::Table(_) => b"table",
+        Value::Func(_) | Value::Native(_) | Value::Shell | Value::Dhcp | Value::Exit | Value::Ls => {
+            b"function"
+        }
+    }
+}
+
+/// Convert a value to an interned string — the `tostring` builtin. Strings are
+/// returned as-is (they are already interned); other values use the same
+/// rendering as the `tostring` emitter below.
+fn value_to_string(s: &mut LuaState, v: Value) -> Result<super::StrRef, &'static str> {
+    match v {
+        Value::Str(r) => Ok(r),
+        Value::Num(n) => {
+            let (buf, len) = itoa(n);
+            s.intern(&buf[..len])
+        }
+        Value::Float(f) => {
+            let mut buf = [0u8; FLOAT_BUF];
+            let len = fmt_float(f, &mut buf);
+            s.intern(&buf[..len])
+        }
+        Value::Nil => s.intern(b"nil"),
+        Value::Bool(true) => s.intern(b"true"),
+        Value::Bool(false) => s.intern(b"false"),
+        Value::Table(_) => s.intern(b"table"),
+        Value::Func(_) => s.intern(b"function"),
+        Value::Native(_) => s.intern(b"native"),
+        Value::Shell => s.intern(b"shell"),
+        Value::Dhcp => s.intern(b"dhcp"),
+        Value::Exit => s.intern(b"exit"),
+        Value::Ls => s.intern(b"ls"),
     }
 }
 

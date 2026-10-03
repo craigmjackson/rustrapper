@@ -799,6 +799,30 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   protected: trying to change it raises an error.\n",
     },
     HelpEntry {
+        name: "tonumber",
+        short: "Convert a value or numeric string to a number",
+        detail: "tonumber(e [, base])\n\
+                  Without a base, converts a number or a numeric string to an\n\
+                  integer or float (nil if it cannot). With a base (2..36) the\n\
+                  first argument must be a string, parsed as an integer in\n\
+                  that base. Example: tonumber(\"ff\", 16) -> 255\n",
+    },
+    HelpEntry {
+        name: "tostring",
+        short: "Convert a value to its string form",
+        detail: "tostring(v)\n\
+                  Returns the human-readable string form of any value, using\n\
+                  the same rendering as print. Metamethods are not dispatched,\n\
+                  so a __tostring field is not consulted.\n",
+    },
+    HelpEntry {
+        name: "type",
+        short: "Return the type name of a value",
+        detail: "type(v)\n\
+                  Returns \"nil\", \"boolean\", \"number\", \"string\", \"table\"\n\
+                  or \"function\". Metamethods are not consulted.\n",
+    },
+    HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
         detail: "fetch(\"file\"[, \"dest\"])\n\
@@ -865,10 +889,13 @@ fn trim(b: &[u8]) -> &[u8] {
 
 fn print_general_help(puts: fn(&str)) {
     puts("Commands:\n");
+    // Pad every name to the longest one plus one space, so the descriptions
+    // line up in a column even for names longer than the old fixed width.
+    let width = HELP_COMMANDS.iter().map(|e| e.name.len()).max().unwrap_or(0);
     for e in HELP_COMMANDS {
         puts("  ");
         puts(e.name);
-        for _ in e.name.len()..8 {
+        for _ in e.name.len()..=width {
             puts(" ");
         }
         puts(e.short);
@@ -1183,10 +1210,44 @@ mod tests {
     #[test]
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
-        for cmd in ["help", "exit", "clear", "print", "fetch", "dofile", "ls", "shell", "dhcp"] {
+        for cmd in ["help", "exit", "clear", "print", "fetch", "dofile", "ls", "shell", "dhcp", "type"] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
         }
         assert!(out.contains("Type 'help <cmd>'"));
+    }
+
+    #[test]
+    fn help_columns_aligned() {
+        // Every command's description starts in the same column, whatever the
+        // name length (regression: names of 8+ chars used to run into their
+        // description).
+        let out = run_session(b"help\rexit\r");
+        let mut desc_col = None;
+        let mut count = 0;
+        for line in out.split('\n') {
+            let line = line.trim_end_matches('\r');
+            let rest = match line.strip_prefix("  ") {
+                Some(r) => r,
+                None => continue,
+            };
+            let name_len = match rest.find(' ') {
+                Some(n) => n,
+                None => continue,
+            };
+            let tail = &rest[name_len..];
+            let desc = tail.trim_start_matches(' ');
+            if desc.is_empty() {
+                continue;
+            }
+            let col = 2 + name_len + (tail.len() - desc.len());
+            if let Some(c) = desc_col {
+                assert_eq!(c, col, "misaligned help line: {:?}", line);
+            } else {
+                desc_col = Some(col);
+            }
+            count += 1;
+        }
+        assert!(count >= 15, "expected the full command list, got {}", count);
     }
 
     #[test]

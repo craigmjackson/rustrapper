@@ -206,8 +206,8 @@ fn pxe_boot(base: u64, mac: &[u8; 6], cfg: &DhcpConfig) {
     print_ip(&cfg.next_server);
     puts("...\n");
     
-    // Allocate memory for the file
-    let mut sink = crate::mem::BiosExtendedMemorySink::new(16 * 1024 * 1024); // 16MB
+    // Allocate memory for the file from the BIOS E820 map
+    let mut sink = crate::mem::BiosExtendedMemorySink::new(crate::mem::TFTP_SIZE_HINT);
     
     // Perform TFTP download
     let tftp_result = tftp_download(base, mac, &cfg.yiaddr, &cfg.next_server, filename, &mut sink);

@@ -33,6 +33,12 @@
 //!   this subset; the stored metatable is only observable through the
 //!   `__metatable` protection rule (changing an already-protected metatable
 //!   errors).
+//! - `tonumber(e [, base])` builtin: converts a number or a decimal numeric
+//!   string to an integer/float (or `nil`); with a `base` (2..36) the first
+//!   argument must be a string and the result is an integer in that base.
+//! - `tostring(v)` builtin: the human-readable string form of any value (the
+//!   same rendering `print` uses). Metamethods are not dispatched, so
+//!   `__tostring` is not consulted.
 //! - `pairs(t)` builtin: returns the `next` function and the table, so
 //!   `for k, v in pairs(t) do ... end` iterates every key/value pair.
 //!   Metamethods are not dispatched in this subset, so `__pairs` is never
@@ -199,7 +205,8 @@ pub enum Value {
     /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`,
     /// `rawequal` is `Native(5)`, `rawget` is `Native(6)`, `rawlen` is
     /// `Native(7)`, `rawset` is `Native(8)`, `select` is `Native(9)`,
-    /// `setmetatable` is `Native(10)`.
+    /// `setmetatable` is `Native(10)`, `tonumber` is `Native(11)`,
+    /// `tostring` is `Native(12)`, `type` is `Native(13)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -544,6 +551,15 @@ impl LuaState {
         let _ = self.intern(b"setmetatable");
         let setmetatable_name = self.intern(b"setmetatable").unwrap();
         self.set_global(setmetatable_name, Value::Native(10));
+        let _ = self.intern(b"tonumber");
+        let tonumber_name = self.intern(b"tonumber").unwrap();
+        self.set_global(tonumber_name, Value::Native(11));
+        let _ = self.intern(b"tostring");
+        let tostring_name = self.intern(b"tostring").unwrap();
+        self.set_global(tostring_name, Value::Native(12));
+        let _ = self.intern(b"type");
+        let type_name = self.intern(b"type").unwrap();
+        self.set_global(type_name, Value::Native(13));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1594,6 +1610,91 @@ mod tests {
         assert!(exec("setmetatable({}, \"x\")").is_err());
         assert!(exec("setmetatable({})").is_err());
         assert!(exec("setmetatable({}, {}, 1)").is_err());
+    }
+
+    #[test]
+    fn tonumber_builtin() {
+        // Numbers pass through.
+        assert_eq!(exec("print(tonumber(5), tonumber(5.5))").unwrap(), "5\t5.5\n");
+        // Decimal strings follow the lexer's conventions.
+        assert_eq!(exec("print(tonumber(\"10\"))").unwrap(), "10\n");
+        assert_eq!(exec("print(tonumber(\"  10  \"))").unwrap(), "10\n");
+        assert_eq!(exec("print(tonumber(\"-3\"), tonumber(\"+7\"))").unwrap(), "-3\t7\n");
+        assert_eq!(exec("print(tonumber(\"5.5\"), tonumber(\".5\"), tonumber(\"5.\"))").unwrap(), "5.5\t0.5\t5.0\n");
+        assert_eq!(exec("print(tonumber(\"1e3\"), tonumber(\"2.5e-2\"))").unwrap(), "1000.0\t0.025\n");
+        assert_eq!(exec("print(tonumber(\"-0.0\"))").unwrap(), "-0.0\n");
+        // A too-large integer becomes a float.
+        assert_eq!(exec("print(tonumber(\"9223372036854775808\"))").unwrap(), "9.2233720368548e+18\n");
+        // Non-numeric strings and non-string values give nil.
+        assert_eq!(exec("print(tonumber(\"abc\"), tonumber(\"\"), tonumber(\"5x\"))").unwrap(), "nil\tnil\tnil\n");
+        assert_eq!(exec("print(tonumber(\"inf\"), tonumber(\"nan\"))").unwrap(), "nil\tnil\n");
+        assert_eq!(exec("print(tonumber(nil), tonumber(true), tonumber({}))").unwrap(), "nil\tnil\tnil\n");
+        // Base form (2..36); letters are case-insensitive.
+        assert_eq!(exec("print(tonumber(\"ff\", 16), tonumber(\"FF\", 16))").unwrap(), "255\t255\n");
+        assert_eq!(exec("print(tonumber(\"101\", 2), tonumber(\"z\", 36))").unwrap(), "5\t35\n");
+        assert_eq!(exec("print(tonumber(\"-ff\", 16), tonumber(\"  ff  \", 16))").unwrap(), "-255\t255\n");
+        assert_eq!(exec("print(tonumber(\"10\", 10.0))").unwrap(), "10\n");
+        // Invalid digits give nil; a nil base acts like no base.
+        assert_eq!(
+            exec("print(tonumber(\"2\", 2), tonumber(\"12\", 2), tonumber(\"g\", 16))").unwrap(),
+            "nil\tnil\tnil\n"
+        );
+        assert_eq!(exec("print(tonumber(\"10\", nil))").unwrap(), "10\n");
+        // Errors: number with a base, base out of range, arity.
+        assert!(exec("tonumber(5, 10)").is_err());
+        assert!(exec("tonumber(\"10\", 1)").is_err());
+        assert!(exec("tonumber(\"10\", 37)").is_err());
+        assert!(exec("tonumber()").is_err());
+        assert!(exec("tonumber(\"10\", 16, 1)").is_err());
+    }
+
+    #[test]
+    fn tostring_builtin() {
+        assert_eq!(exec("print(tostring(1), tostring(1.5))").unwrap(), "1\t1.5\n");
+        assert_eq!(
+            exec("print(tostring(nil), tostring(true), tostring(false))").unwrap(),
+            "nil\ttrue\tfalse\n"
+        );
+        assert_eq!(exec("print(tostring(\"abc\"))").unwrap(), "abc\n");
+        assert_eq!(exec("print(tostring({}), tostring(print), tostring(next))").unwrap(), "table\tnative\tnative\n");
+        // Numbers use the same float formatting as print.
+        assert_eq!(exec("print(tostring(1.0/3))").unwrap(), "0.33333333333333\n");
+        assert_eq!(exec("print(tostring(1e14), tostring(-0.0))").unwrap(), "1e+14\t-0.0\n");
+        // Strings come back as themselves (so they compare/concatenate).
+        assert_eq!(exec("print(tostring(\"x\") == \"x\")").unwrap(), "true\n");
+        assert_eq!(exec("print(tostring(5) .. \"!\")").unwrap(), "5!\n");
+        // Errors: arity.
+        assert!(exec("tostring()").is_err());
+        assert!(exec("tostring(1, 2)").is_err());
+    }
+
+    #[test]
+    fn type_builtin() {
+        assert_eq!(
+            exec("print(type(nil), type(true), type(false))").unwrap(),
+            "nil\tboolean\tboolean\n"
+        );
+        assert_eq!(
+            exec("print(type(1), type(1.5))").unwrap(),
+            "number\tnumber\n"
+        );
+        assert_eq!(exec("print(type(\"s\"), type({}))").unwrap(), "string\ttable\n");
+        // Every callable value is a function, including native builtins.
+        assert_eq!(
+            exec("print(type(print), type(next), type(type))").unwrap(),
+            "function\tfunction\tfunction\n"
+        );
+        assert_eq!(
+            exec("function f() end\nprint(type(f), type(shell), type(dhcp), type(exit), type(ls))")
+                .unwrap(),
+            "function\tfunction\tfunction\tfunction\tfunction\n"
+        );
+        // The result is a string usable in comparisons and concatenation.
+        assert_eq!(exec("print(type(1) == \"number\", type({}) .. \"!\")").unwrap(), "true\ttable!\n");
+        assert_eq!(exec("print(type(type(1)))").unwrap(), "string\n");
+        // Errors: arity.
+        assert!(exec("type()").is_err());
+        assert!(exec("type(1, 2)").is_err());
     }
 
     #[test]
