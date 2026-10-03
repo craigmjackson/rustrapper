@@ -746,21 +746,21 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "pairs(t)\n\
                   Returns the next function and the table, so that\n\
                   'for k, v in pairs(t) do ... end' iterates every pair. This\n\
-                  subset has no metatables, so there is no __pairs metamethod.\n",
+                  subset does not dispatch metamethods, so __pairs is never consulted.\n",
     },
     HelpEntry {
         name: "rawequal",
         short: "Compare two values without metamethods",
         detail: "rawequal(v1, v2)\n\
                   Returns whether v1 equals v2 using primitive equality. This\n\
-                  subset has no metatables, so it agrees with `v1 == v2`.\n",
+                  subset does not dispatch metamethods, so it agrees with `v1 == v2`.\n",
     },
     HelpEntry {
         name: "rawget",
         short: "Get table[index] without the __index metavalue",
         detail: "rawget(table, index)\n\
                   Returns the real value of table[index]. This subset has no\n\
-                  metatables, so it agrees with 'table[index]'. The index may\n\
+                  metamethods, so it agrees with 'table[index]'. The index may\n\
                   be any value; the table must be a table.\n",
     },
     HelpEntry {
@@ -769,7 +769,7 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "rawlen(v)\n\
                   Returns the length of v, which must be a table or a string.\n\
                   A table's length is the run of consecutive integer keys\n\
-                  starting at 1. This subset has no metatables, so it agrees\n\
+                  starting at 1. Metamethods are not dispatched, so it agrees\n\
                   with the plain length.\n",
     },
     HelpEntry {
@@ -777,7 +777,7 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         short: "Set table[index] without the __newindex metavalue",
         detail: "rawset(table, index, value)\n\
                   Sets the real value of table[index] and returns the table.\n\
-                  This subset has no metatables, so it agrees with\n\
+                  Metamethods are not dispatched, so it agrees with\n\
                   'table[index] = value'. The index may not be nil or NaN.\n",
     },
     HelpEntry {
@@ -788,6 +788,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   index (-1 is the last argument). With the string \"#\",\n\
                   returns the number of extra arguments it received.\n\
                   Example: select(2, \"a\", \"b\", \"c\") -> b c\n",
+    },
+    HelpEntry {
+        name: "setmetatable",
+        short: "Set (or remove) a table's metatable",
+        detail: "setmetatable(table, metatable)\n\
+                  Stores the metatable for the table (nil removes it) and\n\
+                  returns the table. Metamethods are not dispatched in this\n\
+                  subset. A metatable with a non-nil __metatable field is\n\
+                  protected: trying to change it raises an error.\n",
     },
     HelpEntry {
         name: "fetch",

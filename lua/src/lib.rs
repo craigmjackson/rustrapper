@@ -28,13 +28,19 @@
 //! - `select(index, ...)` builtin: with a number index, returns the arguments
 //!   after that position (-1 is the last); with `"#"`, returns the number of
 //!   extra arguments.
+//! - `setmetatable(table, mt|nil)` builtin: stores/removes a table's
+//!   metatable (returning the table). Metamethods are *not* dispatched in
+//!   this subset; the stored metatable is only observable through the
+//!   `__metatable` protection rule (changing an already-protected metatable
+//!   errors).
 //! - `pairs(t)` builtin: returns the `next` function and the table, so
-//!   `for k, v in pairs(t) do ... end` iterates every key/value pair. This
-//!   subset has no metatables, so there is no `__pairs` metamethod.
+//!   `for k, v in pairs(t) do ... end` iterates every key/value pair.
+//!   Metamethods are not dispatched in this subset, so `__pairs` is never
+//!   consulted.
 //! - `rawequal(v1, v2)` builtin: primitive equality without metamethods
-//!   (there are none here, so it agrees with `==`).
+//!   (not dispatched, so it agrees with `==`).
 //! - `rawget(table, index)` builtin: the real `table[index]` without the
-//!   `__index` metavalue (there are none here, so it agrees with `table[index]`).
+//!   `__index` metavalue (not dispatched, so it agrees with `table[index]`).
 //! - `rawlen(v)` builtin: length of a table or string without `__len`. A
 //!   table's length is the run of consecutive integer keys starting at 1.
 //! - `rawset(table, index, value)` builtin: the real `table[index] = value`
@@ -192,7 +198,8 @@ pub enum Value {
     /// Builtin function: `print` is `Native(0)`, `fetch` is `Native(1)`,
     /// `dofile` is `Native(2)`, `next` is `Native(3)`, `pairs` is `Native(4)`,
     /// `rawequal` is `Native(5)`, `rawget` is `Native(6)`, `rawlen` is
-    /// `Native(7)`, `rawset` is `Native(8)`, `select` is `Native(9)`.
+    /// `Native(7)`, `rawset` is `Native(8)`, `select` is `Native(9)`,
+    /// `setmetatable` is `Native(10)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -354,6 +361,10 @@ pub struct Global {
 pub struct TableRec {
     pub slots: [TableSlot; TABLE_SLOTS],
     pub len: u8,
+    /// Metatable, set by `setmetatable`. Metamethods are not dispatched in
+    /// this subset, so the field is only observable via the `__metatable`
+    /// protection rule (and any future `getmetatable`).
+    pub mt: Option<u16>,
 }
 
 /// One key/value pair in a table.
@@ -467,6 +478,7 @@ impl LuaState {
                     value: Value::Nil,
                 }; TABLE_SLOTS],
                 len: 0,
+                mt: None,
             }; MAX_TABLES],
             ntables: 0,
             steps: 0,
@@ -529,6 +541,9 @@ impl LuaState {
         let _ = self.intern(b"select");
         let select_name = self.intern(b"select").unwrap();
         self.set_global(select_name, Value::Native(9));
+        let _ = self.intern(b"setmetatable");
+        let setmetatable_name = self.intern(b"setmetatable").unwrap();
+        self.set_global(setmetatable_name, Value::Native(10));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1425,7 +1440,7 @@ mod tests {
             "true\tfalse\n"
         );
         assert_eq!(exec("print(rawequal(dhcp, dhcp), rawequal(dhcp, ls))").unwrap(), "true\tfalse\n");
-        // No metatables exist, so `==` and `rawequal` agree.
+        // Metamethods are not dispatched, so `==` and `rawequal` agree.
         assert_eq!(
             exec("print((1 == 1.0) == rawequal(1, 1.0))").unwrap(),
             "true\n"
@@ -1448,7 +1463,7 @@ mod tests {
         // Any index value is accepted.
         assert_eq!(exec("t = {}\nprint(rawget(t, nil))").unwrap(), "nil\n");
         assert_eq!(exec("print(rawget({7}, 1.0))").unwrap(), "7\n");
-        // No metatables exist, so rawget agrees with t[k].
+        // Metamethods are not dispatched, so rawget agrees with t[k].
         assert_eq!(exec("t = {5}\nprint(rawget(t, 1) == t[1])").unwrap(), "true\n");
         // Values compare by identity (a table-valued field).
         assert_eq!(
@@ -1552,6 +1567,33 @@ mod tests {
         assert!(exec("select(\"x\", 1)").is_err());
         assert!(exec("select(1.5, 1)").is_err());
         assert!(exec("select()").is_err());
+    }
+
+    #[test]
+    fn setmetatable_builtin() {
+        // Returns the given table (so it can be chained).
+        assert_eq!(
+            exec("t = {}\nprint(rawequal(setmetatable(t, {}), t))").unwrap(),
+            "true\n"
+        );
+        assert_eq!(exec("t = {}\nprint(setmetatable(t, nil))").unwrap(), "table\n");
+        // Setting a metatable twice is fine while it is unprotected.
+        assert_eq!(
+            exec("t = {}\nsetmetatable(t, {})\nsetmetatable(t, {})").unwrap(),
+            ""
+        );
+        // A `__metatable` field protects the metatable from change...
+        assert!(exec("t = {}\nsetmetatable(t, {__metatable = true})\nsetmetatable(t, nil)").is_err());
+        assert!(exec("t = {}\nsetmetatable(t, {__metatable = true})\nsetmetatable(t, {})").is_err());
+        // ...even a false value protects (Lua: any non-nil __metatable).
+        assert!(exec("t = {}\nsetmetatable(t, {__metatable = false})\nsetmetatable(t, {})").is_err());
+        // Errors: non-table first arg, non-table/non-nil metatable, arity.
+        assert!(exec("setmetatable(1, {})").is_err());
+        assert!(exec("setmetatable(\"s\", {})").is_err());
+        assert!(exec("setmetatable({}, 1)").is_err());
+        assert!(exec("setmetatable({}, \"x\")").is_err());
+        assert!(exec("setmetatable({})").is_err());
+        assert!(exec("setmetatable({}, {}, 1)").is_err());
     }
 
     #[test]

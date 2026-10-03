@@ -761,8 +761,9 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
         }
         Value::Native(4) => {
-            // pairs(t) -> next, t. This subset has no metatables (no
-            // __pairs), and Lua's third result is nil, so two values suffice:
+            // pairs(t) -> next, t. Metamethods are not dispatched in this
+            // subset (no __pairs), and Lua's third result is nil, so two values
+            // suffice:
             // `for k, v in pairs(t)` iterates t and `local f, s, c = pairs(t)`
             // still leaves c == nil.
             if argc != 1 {
@@ -775,7 +776,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
         }
         Value::Native(5) => {
             // rawequal(v1, v2): primitive equality, without metamethods. This
-            // subset has no metatables, so `==` and `rawequal` agree.
+            // subset does not dispatch metamethods, so `==` and `rawequal` agree.
             if argc != 2 {
                 return Err("rawequal expects 2 arguments");
             }
@@ -783,7 +784,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
         }
         Value::Native(6) => {
             // rawget(table, index): the real `table[index]`, without `__index`.
-            // This subset has no metatables, so it agrees with `table[index]`.
+            // This subset does not dispatch metamethods, so it agrees with `table[index]`.
             if argc != 2 {
                 return Err("rawget expects 2 arguments");
             }
@@ -793,8 +794,8 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
         }
         Value::Native(7) => {
-            // rawlen(v): length of a table or string, without `__len`. There
-            // are no metatables, so this is the plain length. A table's length
+            // rawlen(v): length of a table or string, without `__len`. Metamethods
+            // are not dispatched, so this is the plain length. A table's length
             // is the run of consecutive integer keys starting at 1.
             if argc != 1 {
                 return Err("rawlen expects 1 argument");
@@ -821,7 +822,8 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
         }
         Value::Native(8) => {
             // rawset(table, index, value): the real assignment without
-            // `__newindex` (no metatables exist, so it agrees with `t[k] = v`).
+            // `__newindex` (metamethods are not dispatched, so it agrees with
+            // `t[k] = v`).
             // Returns the table.
             if argc != 3 {
                 return Err("rawset expects 3 arguments");
@@ -864,6 +866,33 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                     ExecResult::RetN((argc as usize - start) as u8)
                 }
             }
+        }
+        Value::Native(10) => {
+            // setmetatable(table, metatable|nil): stores (`nil` removes) the
+            // metatable and returns the table. A metatable whose `__metatable`
+            // field is not nil is protected and cannot be changed. This subset
+            // stores metatables but does not dispatch metamethods.
+            if argc != 2 {
+                return Err("setmetatable expects 2 arguments");
+            }
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("setmetatable expects a table"),
+            };
+            let new_mt = match argbuf[1] {
+                Value::Nil => None,
+                Value::Table(i) => Some(i),
+                _ => return Err("setmetatable expects a table or nil"),
+            };
+            if let Some(cur) = s.tbls[tid as usize].mt {
+                let protected_name = s.intern(b"__metatable")?;
+                let protected = tget(s, Value::Table(cur), Value::Str(protected_name))?;
+                if !matches!(protected, Value::Nil) {
+                    return Err("cannot change a protected metatable");
+                }
+            }
+            s.tbls[tid as usize].mt = new_mt;
+            ExecResult::Ret(argbuf[0])
         }
         Value::Shell => {
             if argc != 0 {
@@ -1386,6 +1415,7 @@ fn new_table(s: &mut LuaState) -> Result<u16, &'static str> {
             value: Value::Nil,
         }; super::TABLE_SLOTS],
         len: 0,
+        mt: None,
     };
     s.ntables += 1;
     Ok(tid as u16)
