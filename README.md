@@ -127,6 +127,7 @@ next(t)` walks a table (assigning `t[k] = nil` removes the field) and
 `local a, b, c = select(1, x, y, z)` binds several.
 
 Builtins:
+- `_VERSION` — the interpreter version string, `"Lua 5.5"`
 - `next(t [, k])` — return the next key/value pair of a table (or `nil` at the end); `next(t) == nil` tests for an empty table
 - `pairs(t)` — the `next` function plus the table, for `for k, v in pairs(t) do ... end` (metamethods aren't dispatched, so no `__pairs`)
 - `setmetatable(table, metatable|nil)` — store/remove a table's metatable and return the table; a `__metatable` field protects it (metamethods aren't dispatched in this subset)
@@ -138,6 +139,7 @@ Builtins:
 - `tonumber(e [, base])` — convert a number or numeric string to a number (or `nil`); with `base` 2..36, parse a string as an integer in that base
 - `tostring(v)` — the human-readable string form of any value (same rendering as `print`)
 - `type(v)` — the Lua type name of a value: `"nil"`, `"boolean"`, `"number"`, `"string"`, `"table"`, or `"function"` (native builtins count as functions)
+- `warn(msg, ...)` — concatenate string/number arguments and print `Lua warning: <msg>`; the control messages `"@off"`/`"@on"` toggle warnings
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
 - `fetch("file"[, "dest"])` — download a file from the TFTP server, saving it under the optional local `dest` name, and return its byte count (or `nil`)
 - `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
@@ -258,13 +260,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 286 tests across all crates
+cargo test --workspace   # 288 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 101   | Lexer, parser, evaluator, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type` + multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
+| `lua`        | 103   | Lexer, parser, evaluator, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn` + `_VERSION`, multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help) |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

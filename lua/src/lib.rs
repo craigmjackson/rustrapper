@@ -206,7 +206,8 @@ pub enum Value {
     /// `rawequal` is `Native(5)`, `rawget` is `Native(6)`, `rawlen` is
     /// `Native(7)`, `rawset` is `Native(8)`, `select` is `Native(9)`,
     /// `setmetatable` is `Native(10)`, `tonumber` is `Native(11)`,
-    /// `tostring` is `Native(12)`, `type` is `Native(13)`.
+    /// `tostring` is `Native(12)`, `type` is `Native(13)`, `warn` is
+    /// `Native(14)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -443,6 +444,9 @@ pub struct LuaState {
     /// [`DhcpValues`] (mac, ip, subnet, gateway, server, bootfile), which the
     /// interpreter exposes as Lua globals after a successful `dhcp`.
     pub dhcp_values: Option<fn(&mut DhcpValues)>,
+    /// Whether `warn()` emits messages; toggled by the `"@on"`/`"@off"`
+    /// control messages. Persists across `run()` calls in the same state.
+    pub warn_on: bool,
 }
 
 fn noop(_c: u8) {}
@@ -498,12 +502,13 @@ impl LuaState {
             load: None,
             dhcp_info: None,
             dhcp_values: None,
+            warn_on: true,
         }
     }
 
     /// Register built-in globals (`print`, `fetch`, `shell`, `dhcp`, `dofile`,
-    /// `exit`, `ls`). Call this once after creating a fresh `LuaState` before
-    /// entering the REPL.
+    /// `exit`, `ls`, the standard library functions, and `_VERSION`). Call
+    /// this once after creating a fresh `LuaState` before entering the REPL.
     pub fn register_builtins(&mut self, putc: fn(u8)) {
         self.putc = putc;
         let _ = self.intern(b"print");
@@ -560,6 +565,14 @@ impl LuaState {
         let _ = self.intern(b"type");
         let type_name = self.intern(b"type").unwrap();
         self.set_global(type_name, Value::Native(13));
+        let _ = self.intern(b"Lua 5.5");
+        let version_value = self.intern(b"Lua 5.5").unwrap();
+        let _ = self.intern(b"_VERSION");
+        let version_name = self.intern(b"_VERSION").unwrap();
+        self.set_global(version_name, Value::Str(version_value));
+        let _ = self.intern(b"warn");
+        let warn_name = self.intern(b"warn").unwrap();
+        self.set_global(warn_name, Value::Native(14));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1695,6 +1708,39 @@ mod tests {
         // Errors: arity.
         assert!(exec("type()").is_err());
         assert!(exec("type(1, 2)").is_err());
+    }
+
+    #[test]
+    fn version_global() {
+        assert_eq!(exec("print(_VERSION)").unwrap(), "Lua 5.5\n");
+        assert_eq!(
+            exec("print(type(_VERSION), _VERSION == \"Lua 5.5\")").unwrap(),
+            "string\ttrue\n"
+        );
+        // It is an ordinary global: readable, shadowed by a local, and
+        // assignable (Lua semantics).
+        assert_eq!(exec("local v = _VERSION\nprint(v)").unwrap(), "Lua 5.5\n");
+        assert_eq!(exec("_VERSION = \"other\"\nprint(_VERSION)").unwrap(), "other\n");
+    }
+
+    #[test]
+    fn warn_builtin() {
+        // Arguments are concatenated with no separator; numbers are coerced.
+        assert_eq!(exec("warn(\"hello\")").unwrap(), "Lua warning: hello\n");
+        assert_eq!(exec("warn(\"a\", \"b\", 1, 2.5)").unwrap(), "Lua warning: ab12.5\n");
+        // The control messages toggle warnings and emit nothing themselves.
+        assert_eq!(exec("warn(\"@off\")").unwrap(), "");
+        assert_eq!(
+            exec("warn(\"@off\")\nwarn(\"hidden\")\nwarn(\"@on\")\nwarn(\"shown\")").unwrap(),
+            "Lua warning: shown\n"
+        );
+        // Errors: no arguments, or a non-string/non-number value — validated
+        // even while warnings are off.
+        assert!(exec("warn()").is_err());
+        assert!(exec("warn(nil)").is_err());
+        assert!(exec("warn({})").is_err());
+        assert!(exec("warn(true)").is_err());
+        assert!(exec("warn(\"@off\")\nwarn(nil)").is_err());
     }
 
     #[test]

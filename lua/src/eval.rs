@@ -1046,6 +1046,43 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
             ExecResult::Ret(Value::Str(s.intern(type_name(argbuf[0]))?))
         }
+        Value::Native(14) => {
+            // warn(msg, ...): concatenate the string (or number) arguments and
+            // emit "Lua warning: <msg>". The control messages "@on"/"@off"
+            // toggle warnings instead of emitting. Only the single-argument
+            // form can be a control message (Lua concatenates first, but the
+            // multi-argument spelling of a control message is pathological).
+            if argc == 0 {
+                return Err("warn expects at least 1 argument");
+            }
+            let mut control = false;
+            if argc == 1 {
+                if let Value::Str(r) = argbuf[0] {
+                    if s.str_bytes(r) == b"@on" {
+                        s.warn_on = true;
+                        control = true;
+                    } else if s.str_bytes(r) == b"@off" {
+                        s.warn_on = false;
+                        control = true;
+                    }
+                }
+            }
+            // Arguments are validated even while warnings are off, like Lua.
+            for i in 0..argc as usize {
+                match argbuf[i] {
+                    Value::Str(_) | Value::Num(_) | Value::Float(_) => {}
+                    _ => return Err("warn expects string arguments"),
+                }
+            }
+            if !control && s.warn_on {
+                emit_str(s, b"Lua warning: ");
+                for i in 0..argc as usize {
+                    tostring(s, argbuf[i])?;
+                }
+                emit(s, b'\n');
+            }
+            ExecResult::Normal
+        }
         Value::Shell => {
             if argc != 0 {
                 return Err("shell expects no arguments");

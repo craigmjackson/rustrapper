@@ -823,6 +823,14 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   or \"function\". Metamethods are not consulted.\n",
     },
     HelpEntry {
+        name: "warn",
+        short: "Emit a warning message",
+        detail: "warn(msg, ...)\n\
+                  Concatenates its string (or number) arguments and prints\n\
+                  'Lua warning: <msg>'. The control messages \"@off\" and \"@on\"\n\
+                  turn warnings off and on again.\n",
+    },
+    HelpEntry {
         name: "fetch",
         short: "Download a file from the TFTP server",
         detail: "fetch(\"file\"[, \"dest\"])\n\
@@ -1210,7 +1218,7 @@ mod tests {
     #[test]
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
-        for cmd in ["help", "exit", "clear", "print", "fetch", "dofile", "ls", "shell", "dhcp", "type"] {
+        for cmd in ["help", "exit", "clear", "print", "fetch", "dofile", "ls", "shell", "dhcp", "type", "warn"] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
         }
         assert!(out.contains("Type 'help <cmd>'"));
