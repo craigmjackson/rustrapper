@@ -206,7 +206,7 @@ directory. This needs no root privileges and no external TFTP server.
 ├── lua/                  # Minimal no_std Lua interpreter (no heap, fixed static buffers)
 │   ├── demo/test.lua   # PXE demo script (fib, tables, fetch())
 │   └── src/
-│       ├── lib.rs      # LuaState (~100 KB), values, errors, builtins, host tests
+│       ├── lib.rs      # LuaState (~104 KB), values, errors, closures, builtins, host tests
 │       ├── lex.rs      # Tokenizer (ints, floats, strings, comments, symbols)
 │       ├── parse.rs    # Recursive-descent parser → AST
 │       ├── vm.rs       # Bytecode compiler + stack-machine interpreter, coroutines
@@ -264,13 +264,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 295 tests across all crates
+cargo test --workspace   # 296 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 110   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
+| `lua`        | 111   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

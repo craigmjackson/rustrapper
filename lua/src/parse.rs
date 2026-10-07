@@ -6,6 +6,40 @@ use super::{LuaState, Node, Op, StrRef, NO_NODE};
 const MAX_SCOPES: usize = 16;
 const MAX_LABELS_PER_SCOPE: usize = 8;
 const MAX_GOTOS_PER_SCOPE: usize = 8;
+/// Maximum locals tracked for closure-capture analysis.
+const MAX_RESOLVED_LOCALS: usize = 64;
+/// Maximum nested function scopes.
+const MAX_FUNC_SCOPES: usize = 8;
+
+/// A declared local, for lexical name resolution and closure-capture
+/// analysis. Locals captured by a closure are boxed lazily into a cell when
+/// the closure is created.
+#[derive(Clone, Copy)]
+struct LocalRec {
+    name: StrRef,
+    /// Function nesting level that declared it (0 = the script).
+    func: u8,
+    /// Statement node patched when the local is captured (for-loop control
+    /// variables), or `NO_NODE`.
+    decl_node: u16,
+    captured: bool,
+}
+
+/// One function's upvalue names, accumulated while parsing its body.
+#[derive(Clone, Copy)]
+struct FuncScope {
+    ups: [StrRef; super::MAX_UPVALS],
+    nups: u8,
+}
+
+impl FuncScope {
+    fn empty() -> Self {
+        FuncScope {
+            ups: [0; super::MAX_UPVALS],
+            nups: 0,
+        }
+    }
+}
 
 /// One block's label/goto bookkeeping, used to resolve `goto`/`::label::` at
 /// the end of the block. Labels and gotos in nested blocks are scoped: a goto
@@ -42,6 +76,12 @@ pub struct Parser<'s, 'l> {
     /// Label/goto scopes, one per in-progress block.
     scopes: [Scope; MAX_SCOPES],
     n_scopes: usize,
+    /// Declared locals, for name resolution and capture analysis.
+    locals: [LocalRec; MAX_RESOLVED_LOCALS],
+    nlocals: u8,
+    /// Function scopes (index 0 is the script), each collecting upvalue names.
+    funcs: [FuncScope; MAX_FUNC_SCOPES],
+    nfuncs: u8,
     state: &'s mut LuaState,
 }
 
@@ -55,8 +95,132 @@ impl<'s, 'l> Parser<'s, 'l> {
             loop_depth: 0,
             scopes: [Scope::empty(); MAX_SCOPES],
             n_scopes: 0,
+            locals: [LocalRec {
+                name: 0,
+                func: 0,
+                decl_node: NO_NODE,
+                captured: false,
+            }; MAX_RESOLVED_LOCALS],
+            nlocals: 0,
+            funcs: [FuncScope::empty(); MAX_FUNC_SCOPES],
+            nfuncs: 1,
             state,
         }
+    }
+
+    // ── Lexical scope / closure capture analysis ────────────────────────────
+
+    fn func_level(&self) -> u8 {
+        self.nfuncs - 1
+    }
+
+    fn declare_local_rec(&mut self, name: StrRef, decl_node: u16) -> Result<usize, &'static str> {
+        if self.nlocals as usize >= MAX_RESOLVED_LOCALS {
+            return Err("too many locals");
+        }
+        let i = self.nlocals as usize;
+        self.locals[i] = LocalRec {
+            name,
+            func: self.func_level(),
+            decl_node,
+            captured: false,
+        };
+        self.nlocals += 1;
+        Ok(i)
+    }
+
+    /// Record `name` as an upvalue of function `level` (deduplicated).
+    fn add_up(&mut self, level: usize, name: StrRef) -> Result<(), &'static str> {
+        let fs = &mut self.funcs[level];
+        for i in 0..fs.nups as usize {
+            if fs.ups[i] == name {
+                return Ok(());
+            }
+        }
+        if fs.nups as usize >= super::MAX_UPVALS {
+            return Err("too many upvalues");
+        }
+        fs.ups[fs.nups as usize] = name;
+        fs.nups += 1;
+        Ok(())
+    }
+
+    /// Mark local `i` as captured. `local` declarations are boxed lazily when
+    /// the closure is created; captured `for` control variables switch their
+    /// statement node to the per-iteration-cell variant.
+    fn mark_captured(&mut self, i: usize) -> Result<(), &'static str> {
+        if self.locals[i].captured {
+            return Ok(());
+        }
+        self.locals[i].captured = true;
+        let node = self.locals[i].decl_node;
+        if node == NO_NODE {
+            return Ok(());
+        }
+        match self.state.nodes[node as usize] {
+            Node::ForStmt(a, b, c, d, e) => {
+                self.state.nodes[node as usize] = Node::ForStmtCell(a, b, c, d, e);
+            }
+            Node::ForInStmt(a, b, c, d) => {
+                self.state.nodes[node as usize] = Node::ForInStmtCell(a, b, c, d);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Resolve a name reference: a local of the current function, an outer
+    /// local (captured as an upvalue), or a global (no record).
+    fn resolve_name(&mut self, name: StrRef) -> Result<(), &'static str> {
+        let cur = self.func_level();
+        let mut i = self.nlocals as usize;
+        while i > 0 {
+            i -= 1;
+            if self.locals[i].name == name {
+                let lf = self.locals[i].func;
+                if lf == cur {
+                    return Ok(());
+                }
+                self.mark_captured(i)?;
+                for lvl in (lf as usize + 1)..self.nfuncs as usize {
+                    self.add_up(lvl, name)?;
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse `(params) body end` (the `(` is current) and define the function.
+    fn parse_func_body(&mut self) -> Result<u16, &'static str> {
+        self.expect(Tok::LParen, "expected '(' after 'function'")?;
+        if self.nfuncs as usize >= MAX_FUNC_SCOPES {
+            return Err("too many nested functions");
+        }
+        let func_mark = self.nlocals;
+        self.funcs[self.nfuncs as usize] = FuncScope::empty();
+        self.nfuncs += 1;
+        let (params, nparams) = self.parse_params()?;
+        for p in 0..nparams as usize {
+            let name = match self.state.nodes[params as usize + p] {
+                Node::Var(n) => n,
+                _ => 0,
+            };
+            self.declare_local_rec(name, NO_NODE)?;
+        }
+        let saved_loop = self.loop_depth;
+        self.loop_depth = 0;
+        let saved_scopes = self.n_scopes;
+        self.n_scopes = 0;
+        let body = self.parse_block()?;
+        self.n_scopes = saved_scopes;
+        self.loop_depth = saved_loop;
+        self.expect(Tok::End, "expected 'end' to close function")?;
+        let fs = self.funcs[self.nfuncs as usize - 1];
+        self.nfuncs -= 1;
+        self.nlocals = func_mark;
+        let ups = &fs.ups[..fs.nups as usize];
+        self.state.alloc_func(params, nparams, body, ups)
     }
 
     fn advance(&mut self) -> Result<(), &'static str> {
@@ -118,6 +282,7 @@ impl<'s, 'l> Parser<'s, 'l> {
         if self.n_scopes >= MAX_SCOPES {
             return Err("script too complex");
         }
+        let local_mark = self.nlocals;
         self.scopes[self.n_scopes] = Scope::empty();
         self.n_scopes += 1;
         let mut first: u16 = NO_NODE;
@@ -135,6 +300,8 @@ impl<'s, 'l> Parser<'s, 'l> {
             }
             prev = s;
         }
+        // Locals declared in this block go out of scope at its end.
+        self.nlocals = local_mark;
         self.resolve_scope()?;
         Ok(first)
     }
@@ -212,6 +379,16 @@ impl<'s, 'l> Parser<'s, 'l> {
         match self.cur {
             Tok::Local => {
                 self.advance()?;
+                // `local function name(...) ... end`: declare the local before
+                // parsing the body so it can recurse.
+                if self.cur == Tok::Function {
+                    self.advance()?;
+                    let name = self.expect_name()?;
+                    self.declare_local_rec(name, NO_NODE)?;
+                    let fi = self.parse_func_body()?;
+                    let name_node = self.alloc(Node::Var(name))?;
+                    return self.alloc(Node::LocalFunc(name_node, fi));
+                }
                 // One or more names, chained through `next[]`, so a call value
                 // can supply two of them (`local k, v = next(t)`).
                 let name = self.expect_name()?;
@@ -232,7 +409,18 @@ impl<'s, 'l> Parser<'s, 'l> {
                 self.expect(Tok::Equals, "expected '=' in local declaration")?;
                 let v = self.parse_expr()?;
                 self.opt_semi();
-                self.alloc(Node::LocalDecl(first, v))
+                let node = self.alloc(Node::LocalDecl(first, v))?;
+                // Declare the names after the initializer is parsed.
+                let mut np = first;
+                while np != NO_NODE {
+                    let name = match self.state.nodes[np as usize] {
+                        Node::Var(n) => n,
+                        _ => 0,
+                    };
+                    self.declare_local_rec(name, node)?;
+                    np = self.state.next[np as usize];
+                }
+                Ok(node)
             }
             Tok::Global => {
                 self.advance()?;
@@ -250,19 +438,7 @@ impl<'s, 'l> Parser<'s, 'l> {
             Tok::Function => {
                 self.advance()?;
                 let name = self.expect_name()?;
-                self.expect(Tok::LParen, "expected '(' after function name")?;
-                let (params, nparams) = self.parse_params()?;
-                let saved_loop = self.loop_depth;
-                self.loop_depth = 0;
-                // Function bodies are their own label scope: gotos cannot
-                // reference labels outside the function.
-                let saved_scopes = self.n_scopes;
-                self.n_scopes = 0;
-                let body = self.parse_block()?;
-                self.n_scopes = saved_scopes;
-                self.loop_depth = saved_loop;
-                self.expect(Tok::End, "expected 'end' to close function")?;
-                let fi = self.state.alloc_func(params, nparams, body)?;
+                let fi = self.parse_func_body()?;
                 let name_node = self.alloc(Node::Var(name))?;
                 let fl = self.alloc(Node::FuncLit(fi))?;
                 self.alloc(Node::AssignStmt(name_node, fl))
@@ -302,11 +478,20 @@ impl<'s, 'l> Parser<'s, 'l> {
                         NO_NODE
                     };
                     self.expect(Tok::Do, "expected 'do'")?;
+                    let mark = self.nlocals;
+                    let rec = self.declare_local_rec(name, NO_NODE)?;
                     self.loop_depth += 1;
                     let body = self.parse_block()?;
                     self.loop_depth -= 1;
                     self.expect(Tok::End, "expected 'end' to close for")?;
-                    self.alloc(Node::ForStmt(name_node, start, limit, step, body))
+                    let node = if self.locals[rec].captured {
+                        self.alloc(Node::ForStmtCell(name_node, start, limit, step, body))?
+                    } else {
+                        self.alloc(Node::ForStmt(name_node, start, limit, step, body))?
+                    };
+                    self.locals[rec].decl_node = node;
+                    self.nlocals = mark;
+                    Ok(node)
                 } else {
                     // Generic for: `for k [, v] in table do .. end`.
                     let vnode = if self.cur == Tok::Comma {
@@ -319,11 +504,34 @@ impl<'s, 'l> Parser<'s, 'l> {
                     self.expect(Tok::In, "expected 'in' in for statement")?;
                     let table = self.parse_expr()?;
                     self.expect(Tok::Do, "expected 'do'")?;
+                    let mark = self.nlocals;
+                    let rec = self.declare_local_rec(name, NO_NODE)?;
+                    let vrec = if vnode != NO_NODE {
+                        let vname = match self.state.nodes[vnode as usize] {
+                            Node::Var(n) => n,
+                            _ => 0,
+                        };
+                        Some(self.declare_local_rec(vname, NO_NODE)?)
+                    } else {
+                        None
+                    };
                     self.loop_depth += 1;
                     let body = self.parse_block()?;
                     self.loop_depth -= 1;
                     self.expect(Tok::End, "expected 'end' to close for")?;
-                    self.alloc(Node::ForInStmt(name_node, vnode, table, body))
+                    let captured = self.locals[rec].captured
+                        || vrec.map(|r| self.locals[r].captured).unwrap_or(false);
+                    let node = if captured {
+                        self.alloc(Node::ForInStmtCell(name_node, vnode, table, body))?
+                    } else {
+                        self.alloc(Node::ForInStmt(name_node, vnode, table, body))?
+                    };
+                    self.locals[rec].decl_node = node;
+                    if let Some(r) = vrec {
+                        self.locals[r].decl_node = node;
+                    }
+                    self.nlocals = mark;
+                    Ok(node)
                 }
             }
             Tok::Repeat => {
@@ -601,6 +809,8 @@ impl<'s, 'l> Parser<'s, 'l> {
                     .state
                     .intern(&self.lex.src()[off as usize..][..len as usize])?;
                 self.advance()?;
+                // Record lexical references so closures capture correctly.
+                self.resolve_name(r)?;
                 self.alloc(Node::Var(r))?
             }
             Tok::LParen => {
@@ -613,17 +823,7 @@ impl<'s, 'l> Parser<'s, 'l> {
             Tok::Function => {
                 // Anonymous function literal: `function (params) ... end`.
                 self.advance()?;
-                self.expect(Tok::LParen, "expected '(' after 'function'")?;
-                let (params, nparams) = self.parse_params()?;
-                let saved_loop = self.loop_depth;
-                self.loop_depth = 0;
-                let saved_scopes = self.n_scopes;
-                self.n_scopes = 0;
-                let body = self.parse_block()?;
-                self.n_scopes = saved_scopes;
-                self.loop_depth = saved_loop;
-                self.expect(Tok::End, "expected 'end' to close function")?;
-                let fi = self.state.alloc_func(params, nparams, body)?;
+                let fi = self.parse_func_body()?;
                 self.alloc(Node::FuncLit(fi))?
             }
             _ => return Err("unexpected token in expression"),

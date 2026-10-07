@@ -17,7 +17,12 @@
 //! - Numeric `for i = a, b [, step] do ... end`
 //! - Generic `for k [, v] in table do ... end` (iterates a table's key/value
 //!   pairs; the `in` keyword) — array fields iterate `1..n`, named fields by key
-//! - Named functions `function name(a, b) ... end` and `return`
+//! - Functions: named (`function name(a, b) ... end`), `local function
+//!   name(...)`, and anonymous (`function(...) ... end`) literals, plus
+//!   `return`. Functions capture enclosing locals as shared upvalues
+//!   (closures): two closures over the same local see each other's writes, and
+//!   each `for` iteration (and each execution of a block declaring a captured
+//!   local) captures a fresh variable.
 //! - Tables: array fields, `name =` fields, `[expr] =` fields, `t.key`, `t[key]`
 //! - `print(...)` builtin, `--` line comments
 //! - `next(t [, k])` builtin: returns the next key/value pair of a table (or
@@ -91,10 +96,10 @@
 //! stack machine (no execution state on the Rust stack). Builtins and runtime
 //! helpers live in [`eval`].
 //!
-//! Not supported: closures/upvalues, `local function`, string methods,
-//! right-hand-side expression lists (`a, b = 1, 2`), yielding across `pcall`
-//! (like Lua 5.1), and generic `for` iterators that are not the `next`/table
-//! pair (`__pairs` must return a table or `pairs(t)`).
+//! Not supported: string methods, right-hand-side expression lists
+//! (`a, b = 1, 2`), yielding across `pcall` (like Lua 5.1), and generic `for`
+//! iterators that are not the `next`/table pair (`__pairs` must return a table
+//! or `pairs(t)`).
 //!
 //! All interpreter state lives in a fixed-size [`LuaState`] with no dynamic
 //! allocation. `LuaState` is passed by `&mut` everywhere (no global mutable
@@ -149,6 +154,16 @@ pub const MAX_THREADS: usize = MAX_COS + 1;
 
 /// Number of dispatched metamethod names (see `MM_NAMES` in [`crate::eval`]).
 pub const MM_COUNT: usize = 15;
+/// Maximum upvalues per closure.
+pub const MAX_UPVALS: usize = 8;
+/// Maximum captured-variable cells (no GC: each capture allocates one).
+pub const MAX_CELLS: usize = 64;
+/// Maximum live closures.
+pub const MAX_CLOSURES: usize = 32;
+/// Sentinel: a local holds its value directly (not in a cell).
+pub const NO_CELL: u16 = u16::MAX;
+/// Sentinel: a frame is not a closure (no captured upvalues).
+pub const NO_CLOSURE: u16 = u16::MAX;
 
 /// Coroutine status values (stored in [`CoState::status`]).
 pub const CO_DEAD: u8 = 0;
@@ -260,6 +275,9 @@ pub enum Value {
     /// A wrapped coroutine (`coroutine.wrap`) — callable, resumes the
     /// coroutine and propagates errors; `type()` is "function".
     Wrapped(u8),
+    /// A closure (function plus captured upvalue cells), index into
+    /// [`LuaState::closures`].
+    Closure(u16),
 }
 
 /// A runtime error. Internal errors carry a static message; the `error()`
@@ -379,6 +397,10 @@ pub enum Node {
     Field(u16, u16),
     /// `local name = value`.
     LocalDecl(u16, u16),
+    /// `local function name(...) ... end` — `name` (a `Var` node) plus the
+    /// function index; the local is declared before the closure is assigned so
+    /// the body can recurse.
+    LocalFunc(u16, u16),
     /// `global name [= value]` — force a write to the global table, ignoring
     /// any local that shadows `name`.
     GlobalDecl(u16, u16),
@@ -394,9 +416,15 @@ pub enum Node {
     WhileStmt(u16, u16),
     /// `for i = start, limit [, step] do .. end`.
     ForStmt(u16, u16, u16, u16, u16),
+    /// Numeric `for` whose control variable is captured by a closure: each
+    /// iteration gets a fresh cell.
+    ForStmtCell(u16, u16, u16, u16, u16),
     /// `for k [, v] in table do .. end` — iterate a table's key/value pairs.
     /// Fields are (key_var, value_var or `NO_NODE`, table_expr, body).
     ForInStmt(u16, u16, u16, u16),
+    /// Generic `for` whose variables are captured by a closure: each iteration
+    /// gets fresh cells.
+    ForInStmtCell(u16, u16, u16, u16),
     /// `break` — terminate the innermost loop. Only valid inside a loop.
     BreakStmt,
     /// `repeat body until cond` — run `body` at least once, then repeat until
@@ -420,6 +448,25 @@ pub struct FuncDef {
     pub nparams: u8,
     pub body: u16,
     pub entry: u16,
+    /// Names of the upvalues this function captures (resolved by the parser).
+    pub up_names: [StrRef; MAX_UPVALS],
+    pub nup: u8,
+}
+
+/// One captured upvalue: the name and the cell holding its value
+/// ([`NO_CELL`] means the name resolves to a global at call time).
+#[derive(Clone, Copy)]
+pub struct UpEntry {
+    pub name: StrRef,
+    pub cell: u16,
+}
+
+/// A closure: a function plus the upvalue cells captured when it was created.
+#[derive(Clone, Copy)]
+pub struct ClosureDef {
+    pub func: u16,
+    pub ups: [UpEntry; MAX_UPVALS],
+    pub nup: u8,
 }
 
 /// One bytecode instruction. `a`/`b` are operands whose meaning depends on the
@@ -451,6 +498,8 @@ pub enum InstrOp {
     SetGlobal,
     /// Pop a value and set/declare the local named by `Var` node `a`.
     SetLocalTop,
+    /// Like `SetLocalTop`, but into a fresh cell (per-iteration capture).
+    SetLocalTopCell,
     /// Declare the names chained from node `a` (b values on the stack).
     DeclareLocal,
     /// Pop key then base, push `base[key]`.
@@ -482,6 +531,9 @@ pub enum InstrOp {
     JumpIfTrueKeep,
     /// Push `Value::Func(a)`.
     LoadFunc,
+    /// Push a closure for function `a`, capturing the upvalue cells its
+    /// `FuncDef` lists.
+    MakeClosure,
     /// Record the current operand-stack position for a dynamic call.
     Mark,
     /// Call: `a` arguments plus callee on the stack; leave `b` results
@@ -507,6 +559,10 @@ pub enum InstrOp {
     /// Numeric `for` step: increments the control, sets the loop variable
     /// (`b`), and jumps to the body at `a` when it is still in range.
     ForLoop,
+    /// Like `ForPrep`, but the captured loop variable gets a fresh cell.
+    ForPrepCell,
+    /// Like `ForLoop`, but the captured loop variable gets a fresh cell.
+    ForLoopCell,
     /// Generic `for` setup: pops the two `pairs(t)`/table values and records
     /// the table in the current frame.
     ForInPrep,
@@ -544,12 +600,14 @@ impl Thread {
                 locals: [Local {
                     name: 0,
                     value: Value::Nil,
+                    cell: NO_CELL,
                 }; MAX_LOCALS],
                 count: 0,
                 ret_ip: 0,
                 want: 0,
                 base: 0,
                 ctrl: [Value::Nil; 4],
+                closure: NO_CLOSURE,
             }; MAX_FRAMES],
             fsp: 0,
             call_marks: [0; MAX_FRAMES],
@@ -559,11 +617,14 @@ impl Thread {
     }
 }
 
-/// A local variable slot within a frame.
+/// A local variable slot within a frame. When `cell != NO_CELL` the value
+/// lives in [`LuaState::cells`] (the local was captured by a closure, so all
+/// accesses must go through the shared cell).
 #[derive(Clone, Copy)]
 pub struct Local {
     pub name: StrRef,
     pub value: Value,
+    pub cell: u16,
 }
 
 /// One call/block scope: a fixed array of locals, plus call bookkeeping
@@ -580,6 +641,9 @@ pub struct Frame {
     pub base: u32,
     /// Loop control slots (numeric/generic `for`).
     pub ctrl: [Value; 4],
+    /// Closure running in this frame ([`NO_CLOSURE`] for plain functions and
+    /// block scopes); its upvalues are visible to name lookup.
+    pub closure: u16,
 }
 
 /// A global variable slot.
@@ -690,6 +754,12 @@ pub struct LuaState {
     /// after the `yield` call, and the number of results it expects).
     pub yield_ip: u16,
     pub yield_want: u16,
+    /// Captured-variable cells (bump-allocated, no GC).
+    pub cells: [Value; MAX_CELLS],
+    pub ncells: u16,
+    /// Live closures.
+    pub closures: [ClosureDef; MAX_CLOSURES],
+    pub nclosures: u16,
     /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
     pub mm_refs: [StrRef; MM_COUNT],
     pub mm_ready: bool,
@@ -739,12 +809,14 @@ impl LuaState {
                 locals: [Local {
                     name: 0,
                     value: Value::Nil,
+                    cell: NO_CELL,
                 }; MAX_LOCALS],
                 count: 0,
                 ret_ip: 0,
                 want: 0,
                 base: 0,
                 ctrl: [Value::Nil; 4],
+                closure: NO_CLOSURE,
             }; MAX_FRAMES],
             fsp: 0,
             funcs: [FuncDef {
@@ -752,6 +824,8 @@ impl LuaState {
                 nparams: 0,
                 body: 0,
                 entry: 0,
+                up_names: [0; MAX_UPVALS],
+                nup: 0,
             }; MAX_FUNCS],
             funcs_used: 0,
             globals: [Global {
@@ -791,6 +865,17 @@ impl LuaState {
             }; MAX_COS],
             yield_ip: 0,
             yield_want: 0,
+            cells: [Value::Nil; MAX_CELLS],
+            ncells: 0,
+            closures: [ClosureDef {
+                func: 0,
+                ups: [UpEntry {
+                    name: 0,
+                    cell: NO_CELL,
+                }; MAX_UPVALS],
+                nup: 0,
+            }; MAX_CLOSURES],
+            nclosures: 0,
             mm_refs: [0; MM_COUNT],
             mm_ready: false,
             mm_depth: 0,
@@ -1109,6 +1194,8 @@ impl LuaState {
         self.current = 0;
         self.mm_ready = false;
         self.mm_depth = 0;
+        self.ncells = 0;
+        self.nclosures = 0;
         for c in self.cos.iter_mut() {
             c.status = CO_DEAD;
         }
@@ -1174,16 +1261,29 @@ impl LuaState {
 
     /// Define a function (parameters are `nparams` contiguous [`Node::Var`]
     /// nodes starting at `params`), returning its function index.
-    pub fn alloc_func(&mut self, params: u16, nparams: u8, body: u16) -> Result<u16, &'static str> {
+    pub fn alloc_func(
+        &mut self,
+        params: u16,
+        nparams: u8,
+        body: u16,
+        up_names: &[StrRef],
+    ) -> Result<u16, &'static str> {
         if self.funcs_used as usize >= MAX_FUNCS {
             return Err("too many functions");
         }
+        if up_names.len() > MAX_UPVALS {
+            return Err("too many upvalues");
+        }
+        let mut ups = [0; MAX_UPVALS];
+        ups[..up_names.len()].copy_from_slice(up_names);
         let idx = self.funcs_used;
         self.funcs[idx as usize] = FuncDef {
             params,
             nparams,
             body,
             entry: 0,
+            up_names: ups,
+            nup: up_names.len() as u8,
         };
         self.funcs_used += 1;
         Ok(idx as u16)
@@ -1210,12 +1310,14 @@ impl LuaState {
             locals: [Local {
                 name: 0,
                 value: Value::Nil,
+                cell: NO_CELL,
             }; MAX_LOCALS],
             count: 0,
             ret_ip: 0,
             want: 0,
             base: 0,
             ctrl: [Value::Nil; 4],
+            closure: NO_CLOSURE,
         };
         self.fsp += 1;
         Ok(())
@@ -1237,7 +1339,11 @@ impl LuaState {
             return Err("too many locals");
         }
         let i = self.frames[f].count as usize;
-        self.frames[f].locals[i] = Local { name, value };
+        self.frames[f].locals[i] = Local {
+            name,
+            value,
+            cell: NO_CELL,
+        };
         self.frames[f].count += 1;
         Ok(())
     }
@@ -1251,38 +1357,212 @@ impl LuaState {
         let f = (self.fsp - 1) as usize;
         for i in 0..self.frames[f].count as usize {
             if self.frames[f].locals[i].name == name {
-                self.frames[f].locals[i].value = value;
+                let cell = self.frames[f].locals[i].cell;
+                if cell == NO_CELL {
+                    self.frames[f].locals[i].value = value;
+                } else {
+                    self.cells[cell as usize] = value;
+                }
                 return Ok(());
             }
         }
         self.declare_local(name, value)
     }
 
-    /// Set a local in the innermost scope that has it. Returns whether found.
+    /// Set a captured loop variable to a *fresh* cell (each `for` iteration
+    /// gets its own cell, so closures created in the body capture that
+    /// iteration's value). Declares the local on the first iteration.
+    pub fn set_local_top_cell(&mut self, name: StrRef, value: Value) -> Result<(), &'static str> {
+        if self.fsp == 0 {
+            return Err("no active scope");
+        }
+        let cell = self.alloc_cell(value)?;
+        let f = (self.fsp - 1) as usize;
+        for i in 0..self.frames[f].count as usize {
+            if self.frames[f].locals[i].name == name {
+                self.frames[f].locals[i].cell = cell;
+                return Ok(());
+            }
+        }
+        if self.frames[f].count as usize >= MAX_LOCALS {
+            return Err("too many locals");
+        }
+        let i = self.frames[f].count as usize;
+        self.frames[f].locals[i] = Local {
+            name,
+            value: Value::Nil,
+            cell,
+        };
+        self.frames[f].count += 1;
+        Ok(())
+    }
+
+    /// The current function's frames: block scopes (ret_ip == 0) above the
+    /// call frame. Returns the frame index of the function frame, if any.
+    fn function_frame(&self) -> Option<usize> {
+        let mut f = self.fsp as usize;
+        while f > 0 {
+            f -= 1;
+            if self.frames[f].ret_ip != 0 {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// Set a local in the current function's scopes (innermost outwards), or
+    /// an upvalue cell of the running closure. Returns whether found.
     pub fn assign_local(&mut self, name: StrRef, value: Value) -> bool {
-        for f in (0..self.fsp as usize).rev() {
+        let mut f = self.fsp as usize;
+        while f > 0 {
+            f -= 1;
+            let mut found = None;
             for i in 0..self.frames[f].count as usize {
                 if self.frames[f].locals[i].name == name {
-                    self.frames[f].locals[i].value = value;
-                    return true;
+                    found = Some(i);
+                    break;
                 }
+            }
+            if let Some(i) = found {
+                let cell = self.frames[f].locals[i].cell;
+                if cell == NO_CELL {
+                    self.frames[f].locals[i].value = value;
+                } else {
+                    self.cells[cell as usize] = value;
+                }
+                return true;
+            }
+            if self.frames[f].ret_ip != 0 {
+                let ci = self.frames[f].closure;
+                if ci != NO_CLOSURE {
+                    for i in 0..self.closures[ci as usize].nup as usize {
+                        let up = self.closures[ci as usize].ups[i];
+                        if up.name == name {
+                            if up.cell != NO_CELL {
+                                self.cells[up.cell as usize] = value;
+                            }
+                            return true;
+                        }
+                    }
+                }
+                break;
             }
         }
         false
     }
 
-    /// Look up a variable: innermost frame outwards, then globals.
+    /// Look up a variable: the current function's locals, then the running
+    /// closure's upvalues, then globals (lexical scoping).
     pub fn lookup(&self, name: StrRef) -> Option<Value> {
-        for f in (0..self.fsp as usize).rev() {
+        let mut f = self.fsp as usize;
+        while f > 0 {
+            f -= 1;
             for i in 0..self.frames[f].count as usize {
-                if self.frames[f].locals[i].name == name {
-                    return Some(self.frames[f].locals[i].value);
+                let l = self.frames[f].locals[i];
+                if l.name == name {
+                    return Some(if l.cell == NO_CELL {
+                        l.value
+                    } else {
+                        self.cells[l.cell as usize]
+                    });
                 }
+            }
+            if self.frames[f].ret_ip != 0 {
+                let ci = self.frames[f].closure;
+                if ci != NO_CLOSURE {
+                    let c = &self.closures[ci as usize];
+                    for i in 0..c.nup as usize {
+                        if c.ups[i].name == name {
+                            let cell = c.ups[i].cell;
+                            return Some(if cell == NO_CELL {
+                                Value::Nil
+                            } else {
+                                self.cells[cell as usize]
+                            });
+                        }
+                    }
+                }
+                break;
             }
         }
         for i in 0..self.nglobals as usize {
             if self.globals[i].name == name {
                 return Some(self.globals[i].value);
+            }
+        }
+        None
+    }
+
+    /// Allocate a captured-variable cell holding `value`.
+    pub fn alloc_cell(&mut self, value: Value) -> Result<u16, &'static str> {
+        if self.ncells as usize >= MAX_CELLS {
+            return Err("too many captured variables");
+        }
+        let i = self.ncells;
+        self.cells[i as usize] = value;
+        self.ncells += 1;
+        Ok(i)
+    }
+
+    /// Allocate a closure slot for `func`.
+    pub fn alloc_closure(&mut self, func: u16) -> Result<u16, &'static str> {
+        if self.nclosures as usize >= MAX_CLOSURES {
+            return Err("too many closures");
+        }
+        let i = self.nclosures;
+        self.closures[i as usize] = ClosureDef {
+            func,
+            ups: [UpEntry {
+                name: 0,
+                cell: NO_CELL,
+            }; MAX_UPVALS],
+            nup: 0,
+        };
+        self.nclosures += 1;
+        Ok(i)
+    }
+
+    /// Find a local with `name` in the current function's scopes and return
+    /// its cell, boxing it (allocating a cell) if it is still direct.
+    pub fn find_or_box_local_cell(&mut self, name: StrRef) -> Result<Option<u16>, &'static str> {
+        let mut f = self.fsp as usize;
+        while f > 0 {
+            f -= 1;
+            let mut found = None;
+            for i in 0..self.frames[f].count as usize {
+                if self.frames[f].locals[i].name == name {
+                    found = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = found {
+                let cell = self.frames[f].locals[i].cell;
+                if cell != NO_CELL {
+                    return Ok(Some(cell));
+                }
+                let value = self.frames[f].locals[i].value;
+                let cell = self.alloc_cell(value)?;
+                self.frames[f].locals[i].cell = cell;
+                return Ok(Some(cell));
+            }
+            if self.frames[f].ret_ip != 0 {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// The cell of an upvalue of the running closure, by name.
+    pub fn closure_up_cell(&self, name: StrRef) -> Option<u16> {
+        let f = self.function_frame()?;
+        let ci = self.frames[f].closure;
+        if ci == NO_CLOSURE {
+            return None;
+        }
+        let c = &self.closures[ci as usize];
+        for i in 0..c.nup as usize {
+            if c.ups[i].name == name {
+                return Some(c.ups[i].cell);
             }
         }
         None
@@ -1945,6 +2225,81 @@ mod tests {
         assert!(exec("select(\"x\", 1)").is_err());
         assert!(exec("select(1.5, 1)").is_err());
         assert!(exec("select()").is_err());
+    }
+
+    #[test]
+    fn closures() {
+        // A closure captures a local by reference.
+        assert_eq!(
+            exec("function counter()\nlocal n = 0\nreturn function() n = n + 1 return n end\nend\nc = counter()\nprint(c(), c(), c())").unwrap(),
+            "1\t2\t3\n"
+        );
+        // Independent invocations have independent upvalues.
+        assert_eq!(
+            exec("function counter()\nlocal n = 0\nreturn function() n = n + 1 return n end\nend\nc = counter()\nc()\nprint(counter()())").unwrap(),
+            "1\n"
+        );
+        // Two closures share the same upvalue.
+        assert_eq!(
+            exec("function make()\nlocal x = 0\nt = {inc = function() x = x + 1 end, get = function() return x end}\nend\nmake()\nt.inc()\nt.inc()\nprint(t.get())").unwrap(),
+            "2\n"
+        );
+        // The defining scope sees mutations made through the closure.
+        assert_eq!(
+            exec("function f()\nlocal x = 1\nlocal get = function() return x end\nx = 2\nreturn get()\nend\nprint(f())").unwrap(),
+            "2\n"
+        );
+        // `local function` supports recursion.
+        assert_eq!(
+            exec("local function fact(n)\nif n <= 1 then return 1 end\nreturn n * fact(n - 1)\nend\nprint(fact(5))").unwrap(),
+            "120\n"
+        );
+        // Parameters are captured.
+        assert_eq!(
+            exec("function adder(n)\nreturn function(x) return x + n end\nend\nadd5 = adder(5)\nprint(add5(10))").unwrap(),
+            "15\n"
+        );
+        // Each numeric-for iteration captures its own variable.
+        assert_eq!(
+            exec("fns = {}\nfor i = 1, 3 do fns[i] = function() return i end end\nprint(fns[1](), fns[2](), fns[3]())").unwrap(),
+            "1\t2\t3\n"
+        );
+        // Captured `local`s in a loop body are per-iteration.
+        assert_eq!(
+            exec("fns = {}\nfor i = 1, 2 do\nlocal v = i * 10\nfns[i] = function() return v end\nend\nprint(fns[1](), fns[2]())").unwrap(),
+            "10\t20\n"
+        );
+        // Generic-for variables are captured per iteration.
+        assert_eq!(
+            exec("fns = {}\nfor k, v in {10, 20} do fns[k] = function() return v end end\nprint(fns[1](), fns[2]())").unwrap(),
+            "10\t20\n"
+        );
+        // Transitive capture through nested closures.
+        assert_eq!(
+            exec("function outer()\nlocal a = 7\nreturn function()\nreturn function() return a end\nend\nend\nprint(outer()()())").unwrap(),
+            "7\n"
+        );
+        // type()/tostring of a closure.
+        assert_eq!(
+            exec("function f()\nlocal x = 1\nreturn function() return x end\nend\nc = f()\nprint(type(c), tostring(c))").unwrap(),
+            "function\tfunction\n"
+        );
+        // Closures as coroutine bodies keep their upvalues across yields.
+        assert_eq!(
+            exec("function f()\nlocal n = 0\nreturn function() while true do n = n + 1 coroutine.yield(n) end end\nend\nco = coroutine.create(f())\nprint(coroutine.resume(co))\nprint(coroutine.resume(co))").unwrap(),
+            "true\t1\ntrue\t2\n"
+        );
+        // A `local function` is not visible outside its block.
+        assert!(exec("if true then local function f() end end\nprint(f)").is_err());
+        // Closures work through pcall and metamethods.
+        assert_eq!(
+            exec("function f()\nlocal x = 41\nreturn function() return x + 1 end\nend\nprint(pcall(f()))").unwrap(),
+            "true\t42\n"
+        );
+        assert_eq!(
+            exec("function f()\nlocal x = 5\nreturn function() return x end\nend\nt = setmetatable({}, {__index = f()})\nprint(t.anything)").unwrap(),
+            "5\n"
+        );
     }
 
     #[test]

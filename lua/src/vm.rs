@@ -10,9 +10,9 @@ use super::eval::{self, ExecResult};
 use super::lex::{Lexer, Tok};
 use super::parse::Parser;
 use super::{
-    CoState, Instr, InstrOp, LuaError, LuaState, Node, Op, StrRef, Thread, Value, CO_DEAD,
-    CO_NORMAL, CO_RUNNING, CO_SUSPENDED, DOFILE_CAP, MAX_CODE, MAX_COS, MAX_FUNCS, NO_NODE,
-    WANT_ALL,
+    CoState, Instr, InstrOp, LuaError, LuaState, Node, Op, StrRef, Thread, UpEntry, Value,
+    CO_DEAD, CO_NORMAL, CO_RUNNING, CO_SUSPENDED, DOFILE_CAP, MAX_CODE, MAX_COS, MAX_FUNCS,
+    NO_CELL, NO_CLOSURE, NO_NODE, WANT_ALL,
 };
 
 /// Sentinel return address marking the root frame of a `run()` invocation.
@@ -189,6 +189,14 @@ impl Compiler {
                 self.compile_expr(s, val_node, count)?;
                 self.emit(s, InstrOp::DeclareLocal, first_name, count)?;
             }
+            Node::LocalFunc(name_node, fi) => {
+                // `local f; f = function ... end`, so the body can recurse
+                // through the (possibly captured) local.
+                self.emit(s, InstrOp::PushNil, 0, 0)?;
+                self.emit(s, InstrOp::DeclareLocal, name_node, 1)?;
+                self.compile_func_value(s, fi)?;
+                self.emit(s, InstrOp::SetVar, name_node, 0)?;
+            }
             Node::GlobalDecl(name_node, val_node) => {
                 if val_node != NO_NODE {
                     self.compile_expr(s, val_node, 1)?;
@@ -258,7 +266,9 @@ impl Compiler {
                 let end = s.ncode;
                 self.end_loop(s, end);
             }
-            Node::ForStmt(var, start, limit, step, body) => {
+            Node::ForStmt(var, start, limit, step, body)
+            | Node::ForStmtCell(var, start, limit, step, body) => {
+                let captured = matches!(s.nodes[n as usize], Node::ForStmtCell(..));
                 self.push_scope(s)?;
                 self.compile_expr(s, start, 1)?;
                 self.compile_expr(s, limit, 1)?;
@@ -267,32 +277,57 @@ impl Compiler {
                 } else {
                     self.emit(s, InstrOp::PushInt, 1, 0)?;
                 }
-                let prep = self.emit(s, InstrOp::ForPrep, 0, var)?;
+                let prep = self.emit(
+                    s,
+                    if captured {
+                        InstrOp::ForPrepCell
+                    } else {
+                        InstrOp::ForPrep
+                    },
+                    0,
+                    var,
+                )?;
                 let body_ip = s.ncode;
                 self.begin_loop(self.scope - 1)?;
                 self.push_scope(s)?;
                 self.compile_chain(s, body)?;
                 self.pop_scope(s)?;
-                self.emit(s, InstrOp::ForLoop, body_ip, var)?;
+                self.emit(
+                    s,
+                    if captured {
+                        InstrOp::ForLoopCell
+                    } else {
+                        InstrOp::ForLoop
+                    },
+                    body_ip,
+                    var,
+                )?;
                 let for_end = s.ncode;
                 self.pop_scope(s)?;
                 s.code[prep as usize].a = for_end;
                 let end = s.ncode;
                 self.end_loop(s, end);
             }
-            Node::ForInStmt(kvar, vvar, table, body) => {
+            Node::ForInStmt(kvar, vvar, table, body)
+            | Node::ForInStmtCell(kvar, vvar, table, body) => {
+                let captured = matches!(s.nodes[n as usize], Node::ForInStmtCell(..));
                 self.push_scope(s)?;
                 self.compile_expr(s, table, 2)?;
                 self.emit(s, InstrOp::ForInPrep, 0, 0)?;
                 let loop_ip = s.ncode;
                 let next = self.emit(s, InstrOp::ForInNext, 0, 0)?;
+                let set_op = if captured {
+                    InstrOp::SetLocalTopCell
+                } else {
+                    InstrOp::SetLocalTop
+                };
                 if vvar != NO_NODE {
-                    self.emit(s, InstrOp::SetLocalTop, vvar, 0)?;
+                    self.emit(s, set_op, vvar, 0)?;
                 } else {
                     // Keys-only loop: discard the value left on top.
                     self.emit(s, InstrOp::Pop, 0, 0)?;
                 }
-                self.emit(s, InstrOp::SetLocalTop, kvar, 0)?;
+                self.emit(s, set_op, kvar, 0)?;
                 self.begin_loop(self.scope - 1)?;
                 self.push_scope(s)?;
                 self.compile_chain(s, body)?;
@@ -384,15 +419,7 @@ impl Compiler {
                 self.emit(s, InstrOp::GetIndex, 0, 0)?;
             }
             Node::FuncLit(fi) => {
-                if !self.compiled[fi as usize] {
-                    self.compiled[fi as usize] = true;
-                    if self.npending as usize >= MAX_FUNCS {
-                        return Err("too many functions".into());
-                    }
-                    self.pending[self.npending as usize] = fi;
-                    self.npending += 1;
-                }
-                self.emit(s, InstrOp::LoadFunc, fi, 0)?;
+                self.compile_func_value(s, fi)?;
             }
             Node::TableLit(first_field) => {
                 self.emit(s, InstrOp::NewTable, 0, 0)?;
@@ -418,6 +445,25 @@ impl Compiler {
             for _ in 1..want {
                 self.emit(s, InstrOp::PushNil, 0, 0)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Queue a function body for compilation and emit either a plain function
+    /// value or (when it captures upvalues) a closure.
+    fn compile_func_value(&mut self, s: &mut LuaState, fi: u16) -> Result<(), LuaError> {
+        if !self.compiled[fi as usize] {
+            self.compiled[fi as usize] = true;
+            if self.npending as usize >= MAX_FUNCS {
+                return Err("too many functions".into());
+            }
+            self.pending[self.npending as usize] = fi;
+            self.npending += 1;
+        }
+        if s.funcs[fi as usize].nup > 0 {
+            self.emit(s, InstrOp::MakeClosure, fi, 0)?;
+        } else {
+            self.emit(s, InstrOp::LoadFunc, fi, 0)?;
         }
         Ok(())
     }
@@ -582,6 +628,7 @@ fn setup_func_frame(
     args_offset: usize,
     ret_ip: u16,
     want: u16,
+    closure: u16,
 ) -> Result<(), LuaError> {
     let fd = s.funcs[fi as usize];
     let mut args = [Value::Nil; 32];
@@ -593,6 +640,7 @@ fn setup_func_frame(
     s.frames[f].ret_ip = ret_ip;
     s.frames[f].want = want;
     s.frames[f].base = base as u32;
+    s.frames[f].closure = closure;
     for p in 0..fd.nparams as usize {
         let name = node_name(s, fd.params + p as u16);
         let v = if p < argc as usize { args[p] } else { Value::Nil };
@@ -612,7 +660,14 @@ pub fn call_value(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, L
     match fv {
         Value::Func(fi) => {
             let base = s.vsp as usize - argc as usize;
-            setup_func_frame(s, fi, argc, base, 0, RET_HALT, WANT_ALL)?;
+            setup_func_frame(s, fi, argc, base, 0, RET_HALT, WANT_ALL, NO_CLOSURE)?;
+            let entry = s.funcs[fi as usize].entry;
+            run(s, entry)
+        }
+        Value::Closure(ci) => {
+            let fi = s.closures[ci as usize].func;
+            let base = s.vsp as usize - argc as usize;
+            setup_func_frame(s, fi, argc, base, 0, RET_HALT, WANT_ALL, ci)?;
             let entry = s.funcs[fi as usize].entry;
             run(s, entry)
         }
@@ -666,6 +721,11 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
                 let v = pop(s);
                 let name = node_name(s, ins.a);
                 s.set_local_top(name, v)?;
+            }
+            InstrOp::SetLocalTopCell => {
+                let v = pop(s);
+                let name = node_name(s, ins.a);
+                s.set_local_top_cell(name, v)?;
             }
             InstrOp::DeclareLocal => {
                 let count = ins.b as usize;
@@ -798,6 +858,22 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
             InstrOp::LoadFunc => {
                 s.push_val(Value::Func(ins.a))?;
             }
+            InstrOp::MakeClosure => {
+                let fd = s.funcs[ins.a as usize];
+                let ci = s.alloc_closure(ins.a)?;
+                for i in 0..fd.nup as usize {
+                    let name = fd.up_names[i];
+                    // Capture the local cell from the enclosing function, or
+                    // an upvalue of the running closure (transitive capture).
+                    let cell = match s.find_or_box_local_cell(name)? {
+                        Some(c) => c,
+                        None => s.closure_up_cell(name).unwrap_or(NO_CELL),
+                    };
+                    s.closures[ci as usize].ups[i] = UpEntry { name, cell };
+                }
+                s.closures[ci as usize].nup = fd.nup;
+                s.push_val(Value::Closure(ci))?;
+            }
             InstrOp::Mark => {
                 if s.mark_sp as usize >= super::MAX_FRAMES {
                     return Err("call too complex".into());
@@ -821,7 +897,13 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
                 match fv {
                     Value::Func(fi) => {
                         let ret = ip;
-                        setup_func_frame(s, fi, argc as u8, base, 1, ret, ins.b)?;
+                        setup_func_frame(s, fi, argc as u8, base, 1, ret, ins.b, NO_CLOSURE)?;
+                        ip = s.funcs[fi as usize].entry;
+                    }
+                    Value::Closure(ci) => {
+                        let fi = s.closures[ci as usize].func;
+                        let ret = ip;
+                        setup_func_frame(s, fi, argc as u8, base, 1, ret, ins.b, ci)?;
                         ip = s.funcs[fi as usize].entry;
                     }
                     _ => {
@@ -913,23 +995,20 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
             InstrOp::PopScope => {
                 s.pop_frame();
             }
-            InstrOp::ForPrep => {
+            InstrOp::ForPrep | InstrOp::ForPrepCell => {
                 let step = pop(s);
                 let limit = pop(s);
                 let start = pop(s);
                 let var = ins.b;
+                let captured = ins.op == InstrOp::ForPrepCell;
                 let f = (s.fsp - 1) as usize;
-                match (start, limit, step) {
+                let (skip, value) = match (start, limit, step) {
                     (Value::Num(a), Value::Num(b), Value::Num(c)) => {
                         s.frames[f].ctrl[0] = Value::Num(a);
                         s.frames[f].ctrl[1] = Value::Num(b);
                         s.frames[f].ctrl[2] = Value::Num(c);
                         let skip = if c >= 0 { a > b } else { a < b };
-                        if skip {
-                            ip = ins.a;
-                        } else {
-                            s.set_local_top(node_name(s, var), Value::Num(a))?;
-                        }
+                        (skip, Value::Num(a))
                     }
                     (a, b, c) => {
                         let fa = eval::float_of(a).ok_or(LuaError::Msg(
@@ -945,36 +1024,53 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
                         s.frames[f].ctrl[1] = Value::Float(fb);
                         s.frames[f].ctrl[2] = Value::Float(fc);
                         let skip = if fc >= 0.0 { fa > fb } else { fa < fb };
-                        if skip {
-                            ip = ins.a;
-                        } else {
-                            s.set_local_top(node_name(s, var), Value::Float(fa))?;
-                        }
+                        (skip, Value::Float(fa))
+                    }
+                };
+                if skip {
+                    ip = ins.a;
+                } else {
+                    let name = node_name(s, var);
+                    if captured {
+                        s.set_local_top_cell(name, value)?;
+                    } else {
+                        s.set_local_top(name, value)?;
                     }
                 }
             }
-            InstrOp::ForLoop => {
+            InstrOp::ForLoop | InstrOp::ForLoopCell => {
+                let captured = ins.op == InstrOp::ForLoopCell;
                 let f = (s.fsp - 1) as usize;
-                match (s.frames[f].ctrl[0], s.frames[f].ctrl[1], s.frames[f].ctrl[2]) {
+                let next = match (s.frames[f].ctrl[0], s.frames[f].ctrl[1], s.frames[f].ctrl[2]) {
                     (Value::Num(cur), Value::Num(lim), Value::Num(stp)) => {
                         let next = cur.wrapping_add(stp);
                         let done = if stp >= 0 { next > lim } else { next < lim };
-                        if !done {
-                            s.frames[f].ctrl[0] = Value::Num(next);
-                            s.set_local_top(node_name(s, ins.b), Value::Num(next))?;
-                            ip = ins.a;
+                        if done {
+                            None
+                        } else {
+                            Some(Value::Num(next))
                         }
                     }
                     (Value::Float(cur), Value::Float(lim), Value::Float(stp)) => {
                         let next = cur + stp;
                         let done = if stp >= 0.0 { next > lim } else { next < lim };
-                        if !done {
-                            s.frames[f].ctrl[0] = Value::Float(next);
-                            s.set_local_top(node_name(s, ins.b), Value::Float(next))?;
-                            ip = ins.a;
+                        if done {
+                            None
+                        } else {
+                            Some(Value::Float(next))
                         }
                     }
                     _ => return Err("internal error: bad for control".into()),
+                };
+                if let Some(value) = next {
+                    s.frames[f].ctrl[0] = value;
+                    let name = node_name(s, ins.b);
+                    if captured {
+                        s.set_local_top_cell(name, value)?;
+                    } else {
+                        s.set_local_top(name, value)?;
+                    }
+                    ip = ins.a;
                 }
             }
             InstrOp::ForInPrep => {
@@ -1070,7 +1166,7 @@ fn collect_results(s: &mut LuaState, r: ExecResult, out: &mut [Value; 32]) -> us
 
 /// `coroutine.create(f)`: allocate a coroutine slot.
 pub fn co_create(s: &mut LuaState, f: Value) -> Result<Value, LuaError> {
-    if !matches!(f, Value::Func(_) | Value::Native(_)) {
+    if !matches!(f, Value::Func(_) | Value::Native(_) | Value::Closure(_)) {
         return Err("coroutine.create expects a function".into());
     }
     for i in 0..MAX_COS {
@@ -1137,7 +1233,14 @@ pub fn co_resume_value(s: &mut LuaState, id: u8, argc: u8) -> Result<ExecResult,
         match f {
             Value::Func(fi) => {
                 let base = s.vsp as usize - argc as usize;
-                setup_func_frame(s, fi, argc, base, 0, RET_HALT, WANT_ALL)?;
+                setup_func_frame(s, fi, argc, base, 0, RET_HALT, WANT_ALL, NO_CLOSURE)?;
+                let entry = s.funcs[fi as usize].entry;
+                result = run(s, entry);
+            }
+            Value::Closure(ci) => {
+                let fi = s.closures[ci as usize].func;
+                let base = s.vsp as usize - argc as usize;
+                setup_func_frame(s, fi, argc, base, 0, RET_HALT, WANT_ALL, ci)?;
                 let entry = s.funcs[fi as usize].entry;
                 result = run(s, entry);
             }

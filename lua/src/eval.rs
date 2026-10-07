@@ -717,10 +717,11 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             ls_run(s)?;
             ExecResult::Normal
         }
-        Value::Func(_) => {
-            // User functions are executed by the VM (a nested run, used by
-            // `pcall`; the VM's own Call instruction runs them inline). Fall
-            // through so the result's stack layout is normalized below.
+        Value::Func(_) | Value::Closure(_) => {
+            // User functions (and closures) are executed by the VM (a nested
+            // run, used by `pcall`; the VM's own Call instruction runs them
+            // inline). Fall through so the result's stack layout is
+            // normalized below.
             crate::vm::call_value(s, fv, argc)?
         }
         Value::Wrapped(id) => {
@@ -1035,6 +1036,7 @@ pub(crate) fn val_eq(a: Value, b: Value) -> bool {
         // Unit builtins compare equal to themselves.
         (Value::Co(x), Value::Co(y)) => x == y,
         (Value::Wrapped(x), Value::Wrapped(y)) => x == y,
+        (Value::Closure(x), Value::Closure(y)) => x == y,
         // Unit builtins compare equal to themselves.
         (Value::Shell, Value::Shell)
         | (Value::Dhcp, Value::Dhcp)
@@ -1207,6 +1209,7 @@ fn type_name(v: Value) -> &'static [u8] {
         Value::Str(_) => b"string",
         Value::Table(_) => b"table",
         Value::Func(_)
+        | Value::Closure(_)
         | Value::Native(_)
         | Value::Shell
         | Value::Dhcp
@@ -1307,7 +1310,7 @@ fn value_to_string(s: &mut LuaState, v: Value) -> Result<super::StrRef, LuaError
         Value::Bool(true) => Ok(s.intern(b"true")?),
         Value::Bool(false) => Ok(s.intern(b"false")?),
         Value::Table(_) => Ok(s.intern(b"table")?),
-        Value::Func(_) => Ok(s.intern(b"function")?),
+        Value::Func(_) | Value::Closure(_) => Ok(s.intern(b"function")?),
         Value::Native(_) => Ok(s.intern(b"native")?),
         Value::Shell => Ok(s.intern(b"shell")?),
         Value::Dhcp => Ok(s.intern(b"dhcp")?),
@@ -1357,7 +1360,7 @@ pub(crate) fn tostring(s: &mut LuaState, v: Value) -> Result<(), LuaError> {
         }
         Value::Str(r) => emit_bytes(s, s.str_bytes(r)),
         Value::Table(_) => emit_str(s, b"table"),
-        Value::Func(_) => emit_str(s, b"function"),
+        Value::Func(_) | Value::Closure(_) => emit_str(s, b"function"),
         Value::Native(_) => emit_str(s, b"native"),
         Value::Shell => emit_str(s, b"shell"),
         Value::Dhcp => emit_str(s, b"dhcp"),
