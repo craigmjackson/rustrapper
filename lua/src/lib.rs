@@ -61,7 +61,8 @@
 //!   emits `Lua warning: <msg>`; the control messages `"@on"`/`"@off"` toggle
 //!   warnings.
 //! - `pcall(f, ...)` builtin: protected call — `true` plus the results on
-//!   success, or `false` plus the error object on failure.
+//!   success, or `false` plus the error object on failure. A coroutine may
+//!   `yield` through `pcall` (the protected frame is kept across the yield).
 //! - `error(v [, level])` builtin: raises `v` as an error object (`level` is
 //!   validated but ignored; there are no source positions).
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
@@ -97,9 +98,9 @@
 //! helpers live in [`eval`].
 //!
 //! Not supported: string methods, right-hand-side expression lists
-//! (`a, b = 1, 2`), yielding across `pcall` (like Lua 5.1), and generic `for`
-//! iterators that are not the `next`/table pair (`__pairs` must return a table
-//! or `pairs(t)`).
+//! (`a, b = 1, 2`), yielding across a metamethod or `dofile`, and generic
+//! `for` iterators that are not the `next`/table pair (`__pairs` must return a
+//! table or `pairs(t)`).
 //!
 //! All interpreter state lives in a fixed-size [`LuaState`] with no dynamic
 //! allocation. `LuaState` is passed by `&mut` everywhere (no global mutable
@@ -608,6 +609,8 @@ impl Thread {
                 base: 0,
                 ctrl: [Value::Nil; 4],
                 closure: NO_CLOSURE,
+                protected: false,
+                mark_sp: 0,
             }; MAX_FRAMES],
             fsp: 0,
             call_marks: [0; MAX_FRAMES],
@@ -644,6 +647,12 @@ pub struct Frame {
     /// Closure running in this frame ([`NO_CLOSURE`] for plain functions and
     /// block scopes); its upvalues are visible to name lookup.
     pub closure: u16,
+    /// This frame is a VM-level `pcall` boundary: errors raised inside it are
+    /// caught and turned into `false, error` (and a coroutine may yield
+    /// through it).
+    pub protected: bool,
+    /// Operand-stack marks in effect when the protected frame was pushed.
+    pub mark_sp: u8,
 }
 
 /// A global variable slot.
@@ -817,6 +826,8 @@ impl LuaState {
                 base: 0,
                 ctrl: [Value::Nil; 4],
                 closure: NO_CLOSURE,
+                protected: false,
+                mark_sp: 0,
             }; MAX_FRAMES],
             fsp: 0,
             funcs: [FuncDef {
@@ -1318,6 +1329,8 @@ impl LuaState {
             base: 0,
             ctrl: [Value::Nil; 4],
             closure: NO_CLOSURE,
+            protected: false,
+            mark_sp: 0,
         };
         self.fsp += 1;
         Ok(())
@@ -2225,6 +2238,47 @@ mod tests {
         assert!(exec("select(\"x\", 1)").is_err());
         assert!(exec("select(1.5, 1)").is_err());
         assert!(exec("select()").is_err());
+    }
+
+    #[test]
+    fn yield_across_pcall() {
+        // Yielding through a protected call suspends and resumes correctly.
+        assert_eq!(
+            exec("function body()\nlocal x, y = coroutine.yield(1, 2)\nreturn x .. y\nend\nco = coroutine.create(function()\nlocal ok, v = pcall(body)\nprint(\"pcall:\", ok, v)\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co, \"a\", \"b\"))\nprint(coroutine.status(co))").unwrap(),
+            "true\t1\t2\npcall:\ttrue\tab\ntrue\ndead\n"
+        );
+        // An error after the yield is caught by the protected call.
+        assert_eq!(
+            exec("function body()\ncoroutine.yield(\"a\")\nerror(\"late\")\nend\nco = coroutine.create(function()\nprint(\"inner:\", pcall(body))\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co))").unwrap(),
+            "true\ta\ninner:\tfalse\tlate\ntrue\n"
+        );
+        // Nested protected calls with a yield in the middle.
+        assert_eq!(
+            exec("function deep()\nlocal a = coroutine.yield(1)\nreturn a + 1\nend\nco = coroutine.create(function()\nlocal ok1, ok2, v = pcall(function() return pcall(deep) end)\nprint(\"nested:\", ok1, ok2, v)\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co, 41))").unwrap(),
+            "true\t1\nnested:\ttrue\ttrue\t42\ntrue\n"
+        );
+        // A closure body can yield through pcall and keeps its upvalues.
+        assert_eq!(
+            exec("function make()\nlocal n = 0\nreturn function()\nn = n + 1\ncoroutine.yield(n)\nreturn n\nend\nend\nco = coroutine.create(function()\nlocal ok, a = pcall(make())\nprint(\"done:\", ok, a)\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co))\nprint(coroutine.resume(co))").unwrap(),
+            "true\t1\ndone:\ttrue\t1\ntrue\nfalse\tcannot resume dead coroutine\n"
+        );
+        // Plain errors are still caught, including error objects.
+        assert_eq!(exec("print(pcall(function() error(\"boom\") end))").unwrap(), "false\tboom\n");
+        assert_eq!(
+            exec("print(pcall(function() error({code = 5}) end))").unwrap(),
+            "false\ttable\n"
+        );
+        // pcall as a first-class value and callable tables.
+        assert_eq!(exec("p = pcall\nprint(p(function() return 5 end))").unwrap(), "true\t5\n");
+        assert_eq!(
+            exec("print(pcall(setmetatable({}, {__call = function(self) return 9 end})))").unwrap(),
+            "true\t9\n"
+        );
+        // Errors raised in metamethods called inside pcall are caught.
+        assert_eq!(
+            exec("function f() return setmetatable({}, {__index = function() error(\"mm\") end}).x end\nprint(pcall(f))").unwrap(),
+            "false\tmm\n"
+        );
     }
 
     #[test]

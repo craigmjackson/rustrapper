@@ -17,6 +17,8 @@ use super::{
 
 /// Sentinel return address marking the root frame of a `run()` invocation.
 const RET_HALT: u16 = 0xFFFE;
+/// Sentinel return address marking the callee of a VM-level `pcall`.
+const RET_PCALL: u16 = 0xFFFD;
 /// Maximum pending forward jumps (gotos and loop ends) per function.
 const MAX_FIXUPS: usize = 256;
 /// Maximum labels per function.
@@ -677,6 +679,16 @@ pub fn call_value(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, L
 
 /// Execute bytecode starting at `entry` until the root frame returns.
 pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
+    let floor = s.fsp as usize;
+    run_at(s, entry, floor)
+}
+
+/// Like [`run`], but only protected (`pcall`) frames at or above `floor` are
+/// catchable. A nested invocation (a metamethod or the old native `pcall`
+/// path) passes the frame count at entry so it can never unwind a protected
+/// frame belonging to an outer invocation; a resumed coroutine passes 0
+/// because its frame stack contains only its own frames.
+pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, LuaError> {
     let mut ip = entry;
     loop {
         if ip as usize >= s.ncode as usize {
@@ -684,8 +696,11 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
         }
         let ins = s.code[ip as usize];
         ip += 1;
+        // Run one instruction with `?` error propagation inside a closure so
+        // the loop can intercept errors at `pcall` frames.
+        let step_res: Result<Option<ExecResult>, LuaError> = (|| {
         match ins.op {
-            InstrOp::Halt => return Ok(ExecResult::Normal),
+            InstrOp::Halt => return Ok(Some(ExecResult::Normal)),
             InstrOp::PushConst => {
                 let v = match s.nodes[ins.a as usize] {
                     Node::Num(n) => Value::Num(n),
@@ -906,6 +921,82 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
                         setup_func_frame(s, fi, argc as u8, base, 1, ret, ins.b, ci)?;
                         ip = s.funcs[fi as usize].entry;
                     }
+                    Value::Native(15) => {
+                        // VM-level `pcall`: run the callee under a protected
+                        // frame so errors are caught and coroutine yields can
+                        // suspend through the call.
+                        if argc < 1 {
+                            return Err("pcall expects at least 1 argument".into());
+                        }
+                        // Drop the pcall callee: [pcall, f, args...] -> [f, args...].
+                        for i in 0..argc {
+                            s.vstack[base + i] = s.vstack[base + 1 + i];
+                        }
+                        s.vsp = (base + argc) as u32;
+                        let fv = s.vstack[base];
+                        s.push_frame()?;
+                        let pf = (s.fsp - 1) as usize;
+                        s.frames[pf].ret_ip = ip;
+                        s.frames[pf].want = ins.b;
+                        s.frames[pf].base = base as u32;
+                        s.frames[pf].protected = true;
+                        s.frames[pf].mark_sp = s.mark_sp;
+                        match fv {
+                            Value::Func(fi) => {
+                                setup_func_frame(
+                                    s,
+                                    fi,
+                                    (argc - 1) as u8,
+                                    base + 1,
+                                    0,
+                                    RET_PCALL,
+                                    WANT_ALL,
+                                    NO_CLOSURE,
+                                )?;
+                                ip = s.funcs[fi as usize].entry;
+                            }
+                            Value::Closure(ci) => {
+                                let fi = s.closures[ci as usize].func;
+                                setup_func_frame(
+                                    s,
+                                    fi,
+                                    (argc - 1) as u8,
+                                    base + 1,
+                                    0,
+                                    RET_PCALL,
+                                    WANT_ALL,
+                                    ci,
+                                )?;
+                                ip = s.funcs[fi as usize].entry;
+                            }
+                            _ => {
+                                // Native (or callable-table) callee: invoke it
+                                // now and finish the protected call immediately.
+                                let r = eval::call(s, fv, (argc - 1) as u8)?;
+                                match r {
+                                    ExecResult::Shell => {
+                                        s.pop_frame();
+                                        return Ok(Some(ExecResult::Shell));
+                                    }
+                                    ExecResult::Exit => {
+                                        s.pop_frame();
+                                        return Ok(Some(ExecResult::Exit));
+                                    }
+                                    ExecResult::Yield(_) => {
+                                        return Err(
+                                            "attempt to yield across a protected call".into()
+                                        );
+                                    }
+                                    ExecResult::Break | ExecResult::Goto(_) => {
+                                        return Err(
+                                            "internal error: control flow from call".into()
+                                        );
+                                    }
+                                    r => finish_pcall(s, base, ins.b, r)?,
+                                }
+                            }
+                        }
+                    }
                     _ => {
                         for i in 0..argc {
                             s.vstack[base + i] = s.vstack[base + 1 + i];
@@ -925,10 +1016,10 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
                                 // the VM right after this call.
                                 s.yield_ip = ip;
                                 s.yield_want = ins.b;
-                                return Ok(r);
+                                return Ok(Some(r));
                             }
                             ExecResult::Shell | ExecResult::Exit => {
-                                return Ok(r);
+                                return Ok(Some(r));
                             }
                             ExecResult::Break | ExecResult::Goto(_) => {
                                 return Err("internal error: control flow from call".into());
@@ -964,9 +1055,33 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
                 s.vsp = (base + out_n) as u32;
                 s.pop_frame();
                 if frame.ret_ip == RET_HALT {
-                    return Ok(result_from_stack(s, base, out_n));
+                    return Ok(Some(result_from_stack(s, base, out_n)));
                 }
-                ip = frame.ret_ip;
+                if frame.ret_ip == RET_PCALL {
+                    // The callee of a VM-level `pcall` returned: prepend
+                    // `true` and finish at the protected frame.
+                    let pf = (s.fsp - 1) as usize;
+                    let pframe = s.frames[pf];
+                    let pbase = pframe.base as usize;
+                    let n = s.vsp as usize - (pbase + 1);
+                    s.vstack[pbase] = Value::Bool(true);
+                    let m = n + 1;
+                    let out_n = if pframe.want == WANT_ALL {
+                        m
+                    } else {
+                        pframe.want as usize
+                    };
+                    if out_n > m {
+                        for j in m..out_n {
+                            s.vstack[pbase + j] = Value::Nil;
+                        }
+                    }
+                    s.vsp = (pbase + out_n) as u32;
+                    s.pop_frame();
+                    ip = pframe.ret_ip;
+                } else {
+                    ip = frame.ret_ip;
+                }
             }
             InstrOp::Print => {
                 let v = pop(s);
@@ -976,8 +1091,8 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
             InstrOp::StmtCheck => {
                 let v = pop(s);
                 match v {
-                    Value::Exit => return Ok(ExecResult::Exit),
-                    Value::Shell => return Ok(ExecResult::Shell),
+                    Value::Exit => return Ok(Some(ExecResult::Exit)),
+                    Value::Shell => return Ok(Some(ExecResult::Shell)),
                     Value::Dhcp => {
                         if s.run_dhcp()? {
                             s.emit_dhcp_info();
@@ -1133,7 +1248,90 @@ pub fn run(s: &mut LuaState, entry: u16) -> Result<ExecResult, LuaError> {
         if s.steps > super::MAX_STEPS {
             return Err("step limit exceeded".into());
         }
+        Ok(None)
+        })();
+        match step_res {
+            Ok(None) => {}
+            Ok(Some(r)) => return Ok(r),
+            Err(e) => match unwind_protected(s, floor, e)? {
+                Some(new_ip) => ip = new_ip,
+                None => return Err(e),
+            },
+        }
     }
+}
+
+/// Catch `e` at the innermost protected (`pcall`) frame at or above `floor`.
+/// On success, unwinds the frame/operand/mark stacks to that frame, pushes
+/// `false` plus the error value at its base, and returns the instruction
+/// pointer to resume at.
+fn unwind_protected(
+    s: &mut LuaState,
+    floor: usize,
+    e: LuaError,
+) -> Result<Option<u16>, LuaError> {
+    let mut i = s.fsp as usize;
+    while i > floor {
+        i -= 1;
+        if s.frames[i].protected {
+            let pframe = s.frames[i];
+            s.fsp = i as u32;
+            s.vsp = pframe.base;
+            s.mark_sp = pframe.mark_sp;
+            let v = match e {
+                LuaError::Obj(v) => v,
+                LuaError::Msg(m) => Value::Str(s.intern(m.as_bytes())?),
+            };
+            s.push_val(Value::Bool(false))?;
+            s.push_val(v)?;
+            let m = 2usize;
+            let out_n = if pframe.want == WANT_ALL {
+                m
+            } else {
+                pframe.want as usize
+            };
+            if out_n < m {
+                s.vsp = pframe.base + out_n as u32;
+            } else {
+                for _ in m..out_n {
+                    s.push_val(Value::Nil)?;
+                }
+            }
+            return Ok(Some(pframe.ret_ip));
+        }
+    }
+    Ok(None)
+}
+
+/// Finish a VM-level `pcall` whose callee was a native (or callable table):
+/// materialize its results at `base + 1`, prepend `true`, normalize to `want`,
+/// and pop the protected frame.
+fn finish_pcall(s: &mut LuaState, base: usize, want: u16, r: ExecResult) -> Result<(), LuaError> {
+    let n = match r {
+        ExecResult::Normal => 0usize,
+        ExecResult::Ret(v) => {
+            s.push_val(v)?;
+            1
+        }
+        ExecResult::Ret2(a, b) => {
+            s.push_val(a)?;
+            s.push_val(b)?;
+            2
+        }
+        ExecResult::RetN(k) => k as usize,
+        _ => 0,
+    };
+    s.vstack[base] = Value::Bool(true);
+    let m = n + 1;
+    let out_n = if want == WANT_ALL { m } else { want as usize };
+    if out_n > m {
+        for j in m..out_n {
+            s.vstack[base + j] = Value::Nil;
+        }
+    }
+    s.vsp = (base + out_n) as u32;
+    s.pop_frame();
+    Ok(())
 }
 
 // ── Coroutines ──────────────────────────────────────────────────────────────
@@ -1257,7 +1455,9 @@ pub fn co_resume_value(s: &mut LuaState, id: u8, argc: u8) -> Result<ExecResult,
         let base = s.vsp as usize - argc as usize;
         normalize(s, base, want)?;
         let ip = s.cos[id as usize].ip;
-        result = run(s, ip);
+        // Floor 0: the coroutine's frame stack contains only its own frames,
+        // including protected (`pcall`) frames created before a yield.
+        result = run_at(s, ip, 0);
     }
 
     // Collect the results (or the error) before switching back.

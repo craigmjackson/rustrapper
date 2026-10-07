@@ -837,7 +837,9 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "pcall(f, ...)\n\
                   Calls f with the given arguments. Returns true plus the\n\
                   results on success, or false plus the error object on\n\
-                  failure. Example: pcall(next, {5}) -> true 1 5\n",
+                  failure. Example: pcall(next, {5}) -> true 1 5\n\
+                  A coroutine may yield through pcall; the protected call\n\
+                  resumes and finishes when the coroutine is resumed.\n",
     },
     HelpEntry {
         name: "error",

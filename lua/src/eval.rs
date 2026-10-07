@@ -554,9 +554,9 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 }
                 Ok(ExecResult::Shell) => ExecResult::Shell,
                 Ok(ExecResult::Exit) => ExecResult::Exit,
-                // Yielding across `pcall` is not supported (Lua 5.1 also
-                // rejects it): the protected call unwinds, so the resume
-                // continuation would be lost.
+                // Only reached on fallback paths (a metamethod or coroutine
+                // body that *is* `pcall`); normal calls use the VM-level
+                // protected frame, which supports yielding.
                 Ok(ExecResult::Yield(_)) => {
                     return Err("attempt to yield across a protected call".into())
                 }

@@ -140,7 +140,7 @@ Builtins:
 - `tostring(v)` — the human-readable string form of any value (same rendering as `print`)
 - `type(v)` — the Lua type name of a value: `"nil"`, `"boolean"`, `"number"`, `"string"`, `"table"`, or `"function"` (native builtins count as functions)
 - `warn(msg, ...)` — concatenate string/number arguments and print `Lua warning: <msg>`; the control messages `"@off"`/`"@on"` toggle warnings
-- `pcall(f, ...)` — protected call: `true` plus the results on success, or `false` plus the error object on failure
+- `pcall(f, ...)` — protected call: `true` plus the results on success, or `false` plus the error object on failure (a coroutine can `yield` through it)
 - `error(v [, level])` — raise `v` as an error object; `level` is validated but ignored (no source positions)
 - `coroutine.create(f)` / `coroutine.resume(co, ...)` / `coroutine.yield(...)` / `coroutine.status(co)` / `coroutine.wrap(co)` / `coroutine.isyieldable()` / `coroutine.running()` / `coroutine.close(co)` — real coroutines on the bytecode VM (a pool of 3; `type(co)` is `"thread"`)
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
@@ -264,13 +264,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 296 tests across all crates
+cargo test --workspace   # 297 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 111   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
+| `lua`        | 112   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |
