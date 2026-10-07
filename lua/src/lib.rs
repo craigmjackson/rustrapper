@@ -29,29 +29,36 @@
 //!   after that position (-1 is the last); with `"#"`, returns the number of
 //!   extra arguments.
 //! - `setmetatable(table, mt|nil)` builtin: stores/removes a table's
-//!   metatable (returning the table). Metamethods are *not* dispatched in
-//!   this subset; the stored metatable is only observable through the
-//!   `__metatable` protection rule (changing an already-protected metatable
+//!   metatable (returning the table). Dispatched metamethods: `__index`,
+//!   `__newindex`, `__eq`, `__lt`, `__le`, `__concat`, `__add`, `__sub`,
+//!   `__mul`, `__div`, `__mod`, `__unm`, `__call`, `__tostring`, `__pairs`.
+//!   A non-nil `__metatable` field protects the metatable (changing it
 //!   errors).
 //! - `tonumber(e [, base])` builtin: converts a number or a decimal numeric
 //!   string to an integer/float (or `nil`); with a `base` (2..36) the first
 //!   argument must be a string and the result is an integer in that base.
 //! - `tostring(v)` builtin: the human-readable string form of any value (the
-//!   same rendering `print` uses). Metamethods are not dispatched, so
-//!   `__tostring` is not consulted.
+//!   same rendering `print` uses). A table's `__tostring` metamethod is
+//!   dispatched (it must return a string).
 //! - `pairs(t)` builtin: returns the `next` function and the table, so
-//!   `for k, v in pairs(t) do ... end` iterates every key/value pair.
-//!   Metamethods are not dispatched in this subset, so `__pairs` is never
-//!   consulted.
-//! - `rawequal(v1, v2)` builtin: primitive equality without metamethods
-//!   (not dispatched, so it agrees with `==`).
-//! - `rawget(table, index)` builtin: the real `table[index]` without the
-//!   `__index` metavalue (not dispatched, so it agrees with `table[index]`).
+//!   `for k, v in pairs(t) do ... end` iterates every key/value pair. A
+//!   `__pairs` metamethod is dispatched when present.
+//! - `rawequal(v1, v2)` builtin: primitive equality, never `__eq`.
+//! - `rawget(table, index)` builtin: the real `table[index]`, never `__index`.
 //! - `rawlen(v)` builtin: length of a table or string without `__len`. A
 //!   table's length is the run of consecutive integer keys starting at 1.
 //! - `rawset(table, index, value)` builtin: the real `table[index] = value`
 //!   without `__newindex`, returning the table. The index may not be nil or
 //!   NaN (plain assignment enforces the same rule).
+//! - `type(v)` builtin: the Lua type name of a value (native builtins count
+//!   as functions). `_VERSION` is the string `"Lua 5.5"`.
+//! - `warn(msg, ...)` builtin: concatenates its string/number arguments and
+//!   emits `Lua warning: <msg>`; the control messages `"@on"`/`"@off"` toggle
+//!   warnings.
+//! - `pcall(f, ...)` builtin: protected call — `true` plus the results on
+//!   success, or `false` plus the error object on failure.
+//! - `error(v [, level])` builtin: raises `v` as an error object (`level` is
+//!   validated but ignored; there are no source positions).
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
@@ -75,9 +82,19 @@
 //!   them as the `mac` / `ip` / `subnet` / `gateway` / `server` / `bootfile`
 //!   globals (strings) plus a numeric `tftp_port` (default 69) from the host
 //!   `dhcp_values` callback.
+//! - `coroutine.create/resume/yield/status/wrap/isyieldable/running/close`:
+//!   real coroutines (a pool of [`MAX_COS`] plus the main thread). Each
+//!   coroutine owns a thread state swapped in on resume, so `yield` works at
+//!   any call depth; `type(co)` is `"thread"`.
 //!
-//! Not supported: closures/upvalues, `local function`, anonymous function
-//! literals, string methods, right-hand-side expression lists (`a, b = 1, 2`).
+//! The parser produces an AST which [`vm`] compiles to bytecode and runs on a
+//! stack machine (no execution state on the Rust stack). Builtins and runtime
+//! helpers live in [`eval`].
+//!
+//! Not supported: closures/upvalues, `local function`, string methods,
+//! right-hand-side expression lists (`a, b = 1, 2`), yielding across `pcall`
+//! (like Lua 5.1), and generic `for` iterators that are not the `next`/table
+//! pair (`__pairs` must return a table or `pairs(t)`).
 //!
 //! All interpreter state lives in a fixed-size [`LuaState`] with no dynamic
 //! allocation. `LuaState` is passed by `&mut` everywhere (no global mutable
@@ -93,6 +110,7 @@ pub mod eval;
 pub mod lex;
 pub mod parse;
 pub mod repl;
+pub mod vm;
 
 // ── Sizing constants (all memory is fixed static buffers) ──────────────────
 
@@ -124,9 +142,26 @@ pub const DOFILE_CAP: usize = 4096;
 /// Maximum number of distinct files recorded by successful `fetch()` calls
 /// (for the `ls` builtin).
 pub const MAX_FETCHED: usize = 16;
+/// Maximum number of live coroutines (plus the main thread).
+pub const MAX_COS: usize = 3;
+/// Thread slots: the main thread plus [`MAX_COS`] coroutines.
+pub const MAX_THREADS: usize = MAX_COS + 1;
+
+/// Number of dispatched metamethod names (see `MM_NAMES` in [`crate::eval`]).
+pub const MM_COUNT: usize = 15;
+
+/// Coroutine status values (stored in [`CoState::status`]).
+pub const CO_DEAD: u8 = 0;
+pub const CO_SUSPENDED: u8 = 1;
+pub const CO_RUNNING: u8 = 2;
+pub const CO_NORMAL: u8 = 3;
 /// Scratch buffer used by `dhcp()` to hold the formatted network details
 /// (MAC / IP / subnet / gateway / TFTP server / bootfile) from the host.
 pub const DHCP_INFO_CAP: usize = 384;
+/// Capacity of the compiled bytecode instruction array.
+pub const MAX_CODE: usize = 4096;
+/// "All results" sentinel for `Call`/`Return` instruction result counts.
+pub const WANT_ALL: u16 = u16::MAX;
 
 /// Sentinel for "no node" / end-of-chain. Node indices are well below this.
 pub const NO_NODE: u16 = u16::MAX;
@@ -207,7 +242,9 @@ pub enum Value {
     /// `Native(7)`, `rawset` is `Native(8)`, `select` is `Native(9)`,
     /// `setmetatable` is `Native(10)`, `tonumber` is `Native(11)`,
     /// `tostring` is `Native(12)`, `type` is `Native(13)`, `warn` is
-    /// `Native(14)`.
+    /// `Native(14)`, `pcall` is `Native(15)`, `error` is `Native(16)`, and
+    /// 17..=24 are the `coroutine` library (create, resume, yield, status,
+    /// wrap, isyieldable, running, close).
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -217,6 +254,45 @@ pub enum Value {
     Exit,
     /// Builtin: `ls` / `ls()` — lists the files downloaded with `fetch()`.
     Ls,
+    /// A coroutine thread value (index into `LuaState::cos`); `type()` is
+    /// "thread".
+    Co(u8),
+    /// A wrapped coroutine (`coroutine.wrap`) — callable, resumes the
+    /// coroutine and propagates errors; `type()` is "function".
+    Wrapped(u8),
+}
+
+/// A runtime error. Internal errors carry a static message; the `error()`
+/// builtin can raise any Lua value ([`LuaError::Obj`]), which `pcall` returns
+/// unchanged. The `?` operator converts `&'static str` errors automatically.
+#[derive(Clone, Copy)]
+pub enum LuaError {
+    /// An internal/runtime error with a static message.
+    Msg(&'static str),
+    /// An error object raised by `error(v)` — any Lua value.
+    Obj(Value),
+}
+
+impl From<&'static str> for LuaError {
+    fn from(msg: &'static str) -> Self {
+        LuaError::Msg(msg)
+    }
+}
+
+impl core::fmt::Debug for LuaError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LuaError::Msg(m) => f.write_str(m),
+            LuaError::Obj(Value::Str(_)) => f.write_str("error object is a string value"),
+            LuaError::Obj(Value::Nil) => f.write_str("error object is a nil value"),
+            LuaError::Obj(Value::Bool(_)) => f.write_str("error object is a boolean value"),
+            LuaError::Obj(Value::Num(_)) | LuaError::Obj(Value::Float(_)) => {
+                f.write_str("error object is a number value")
+            }
+            LuaError::Obj(Value::Table(_)) => f.write_str("error object is a table value"),
+            LuaError::Obj(_) => f.write_str("error object is a function value"),
+        }
+    }
 }
 
 /// Structured DHCP result, filled by the host `dhcp_values` callback after a
@@ -251,6 +327,7 @@ impl Default for DhcpValues {
 
 /// Binary and unary operators. `And`/`Or` are handled with short-circuiting.
 #[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
 pub enum Op {
     Add,
     Sub,
@@ -335,12 +412,151 @@ pub enum Node {
 }
 
 /// A defined function: parameters are `nparams` contiguous [`Node::Var`]
-/// nodes starting at `params`; `body` is the first statement of its block.
+/// nodes starting at `params`; `body` is the first statement of its block and
+/// `entry` is the bytecode offset the compiler assigned to the body.
 #[derive(Clone, Copy)]
 pub struct FuncDef {
     pub params: u16,
     pub nparams: u8,
     pub body: u16,
+    pub entry: u16,
+}
+
+/// One bytecode instruction. `a`/`b` are operands whose meaning depends on the
+/// opcode (node indices, jump targets, counts).
+#[derive(Clone, Copy)]
+pub struct Instr {
+    pub op: InstrOp,
+    pub a: u16,
+    pub b: u16,
+}
+
+/// Bytecode opcodes for the stack-machine interpreter in [`crate::vm`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum InstrOp {
+    /// No operation / safety terminator (used to initialize the code array).
+    Halt,
+    /// Push the constant stored in `nodes[a]` (Num/Float/Str/Nil/True/False).
+    PushConst,
+    /// Push `nil`.
+    PushNil,
+    /// Push the small integer `a` (sign-extended); used for `for` step defaults.
+    PushInt,
+    /// Push the value of the variable named by `Var` node `a`.
+    GetVar,
+    /// Pop a value and assign it (local if it exists, else global).
+    SetVar,
+    /// Pop a value and assign it to the global named by `Var` node `a`.
+    SetGlobal,
+    /// Pop a value and set/declare the local named by `Var` node `a`.
+    SetLocalTop,
+    /// Declare the names chained from node `a` (b values on the stack).
+    DeclareLocal,
+    /// Pop key then base, push `base[key]`.
+    GetIndex,
+    /// Pop value, key, base; set `base[key] = value`.
+    SetIndex,
+    /// Assign a target list: `a` = first target node, `b` = number of values.
+    /// Index targets' base/key pairs are on the stack below the values.
+    AssignMulti,
+    /// Push a fresh empty table.
+    NewTable,
+    /// Duplicate the top of the stack.
+    Dup,
+    /// Pop and discard the top of the stack.
+    Pop,
+    /// Binary operator (`a` = AST op); pops right then left, pushes result.
+    BinOp,
+    /// Unary operator (`a` = AST op); pops, pushes result.
+    UnOp,
+    /// Jump to `a`.
+    Jump,
+    /// Pop `b` frames, then jump to `a` (break/goto out of scopes).
+    JumpScopes,
+    /// Pop a value; jump to `a` when it is falsy.
+    JumpIfFalse,
+    /// Peek: jump to `a` (keeping the value) when falsy, else pop.
+    JumpIfFalseKeep,
+    /// Peek: jump to `a` (keeping the value) when truthy, else pop.
+    JumpIfTrueKeep,
+    /// Push `Value::Func(a)`.
+    LoadFunc,
+    /// Record the current operand-stack position for a dynamic call.
+    Mark,
+    /// Call: `a` arguments plus callee on the stack; leave `b` results
+    /// (`WANT_ALL` = every result). `a == WANT_ALL` means the argument count is
+    /// dynamic (a final call argument expanded): it is the values between the
+    /// last `Mark` and the top.
+    Call,
+    /// Return: `a` results on the stack (`WANT_ALL` = all values above the
+    /// function's stack base).
+    Return,
+    /// Pop a value and print it (bare expression statement).
+    Print,
+    /// Pop a value; handle the `exit`/`shell`/`dhcp`/`ls` statement forms.
+    StmtCheck,
+    /// Push a fresh local scope.
+    PushScope,
+    /// Pop the innermost local scope.
+    PopScope,
+    /// Numeric `for` setup: pops start/limit/step, sets the loop control in
+    /// the current frame, declares the loop variable (`b` = Var node), and
+    /// jumps to `a` when the loop body must be skipped.
+    ForPrep,
+    /// Numeric `for` step: increments the control, sets the loop variable
+    /// (`b`), and jumps to the body at `a` when it is still in range.
+    ForLoop,
+    /// Generic `for` setup: pops the two `pairs(t)`/table values and records
+    /// the table in the current frame.
+    ForInPrep,
+    /// Generic `for` next: jumps to `a` when the iteration is finished, else
+    /// pushes the current key and value.
+    ForInNext,
+    /// Generic `for` advance: moves to the next slot (removal-aware) and jumps
+    /// back to the `ForInNext` at `a`.
+    ForInAdvance,
+    /// Suspend the current coroutine, yielding `a` values (reserved for the
+    /// coroutine implementation).
+    Yield,
+}
+
+/// One execution context (the main script or a coroutine). The running
+/// thread's fields live in [`LuaState`] directly; suspended threads are kept
+/// in [`LuaState::threads`] and swapped in/out on resume/yield.
+#[derive(Clone, Copy)]
+pub struct Thread {
+    pub vstack: [Value; STACK_CAP],
+    pub vsp: u32,
+    pub frames: [Frame; MAX_FRAMES],
+    pub fsp: u32,
+    pub call_marks: [u32; MAX_FRAMES],
+    pub mark_sp: u8,
+    pub steps: u64,
+}
+
+impl Thread {
+    pub(crate) fn empty() -> Self {
+        Thread {
+            vstack: [Value::Nil; STACK_CAP],
+            vsp: 0,
+            frames: [Frame {
+                locals: [Local {
+                    name: 0,
+                    value: Value::Nil,
+                }; MAX_LOCALS],
+                count: 0,
+                ret_ip: 0,
+                want: 0,
+                base: 0,
+                ctrl: [Value::Nil; 4],
+            }; MAX_FRAMES],
+            fsp: 0,
+            call_marks: [0; MAX_FRAMES],
+            mark_sp: 0,
+            steps: 0,
+        }
+    }
 }
 
 /// A local variable slot within a frame.
@@ -350,11 +566,20 @@ pub struct Local {
     pub value: Value,
 }
 
-/// One call/block scope: a fixed array of locals.
+/// One call/block scope: a fixed array of locals, plus call bookkeeping
+/// (`ret_ip`/`want`/`base`) and the loop control slots used by `for`.
 #[derive(Clone, Copy)]
 pub struct Frame {
     pub locals: [Local; MAX_LOCALS],
     pub count: u8,
+    /// Return instruction pointer for a function frame.
+    pub ret_ip: u16,
+    /// Number of results the caller wants (`WANT_ALL` for all).
+    pub want: u16,
+    /// Operand-stack position where this function's results belong.
+    pub base: u32,
+    /// Loop control slots (numeric/generic `for`).
+    pub ctrl: [Value; 4],
 }
 
 /// A global variable slot.
@@ -369,9 +594,9 @@ pub struct Global {
 pub struct TableRec {
     pub slots: [TableSlot; TABLE_SLOTS],
     pub len: u8,
-    /// Metatable, set by `setmetatable`. Metamethods are not dispatched in
-    /// this subset, so the field is only observable via the `__metatable`
-    /// protection rule (and any future `getmetatable`).
+    /// Metatable, set by `setmetatable`; dispatched by `tget`/`tset`/`binop`
+    /// (`__index`, `__newindex`, `__eq`, `__lt`, `__le`, `__concat`,
+    /// arithmetic, `__call`, `__tostring`, `__pairs`).
     pub mt: Option<u16>,
 }
 
@@ -397,12 +622,19 @@ pub struct LuaState {
     /// nodes, the next field. `NO_NODE` terminates every chain.
     pub next: [u16; MAX_NODES],
     pub node_used: u32,
+    /// Compiled bytecode for the chunks parsed so far.
+    pub code: [Instr; MAX_CODE],
+    pub ncode: u16,
     pub strings: [u8; STR_CAP],
     pub strregs: [StrReg; MAX_STRINGS],
     pub nstrings: u32,
     pub str_next: u32,
     pub vstack: [Value; STACK_CAP],
     pub vsp: u32,
+    /// Operand-stack marks for dynamic calls (a final call argument that
+    /// expands to several values).
+    pub call_marks: [u32; MAX_FRAMES],
+    pub mark_sp: u8,
     pub frames: [Frame; MAX_FRAMES],
     pub fsp: u32,
     pub funcs: [FuncDef; MAX_FUNCS],
@@ -447,6 +679,37 @@ pub struct LuaState {
     /// Whether `warn()` emits messages; toggled by the `"@on"`/`"@off"`
     /// control messages. Persists across `run()` calls in the same state.
     pub warn_on: bool,
+    /// Saved execution contexts: index 0 is the main thread, 1.. are
+    /// coroutines.
+    pub threads: [Thread; MAX_THREADS],
+    /// Index of the currently running thread.
+    pub current: u8,
+    /// Coroutine records (one per thread slot 1..=MAX_COS).
+    pub cos: [CoState; MAX_COS],
+    /// Continuation saved by the VM when a coroutine yields (the instruction
+    /// after the `yield` call, and the number of results it expects).
+    pub yield_ip: u16,
+    pub yield_want: u16,
+    /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
+    pub mm_refs: [StrRef; MM_COUNT],
+    pub mm_ready: bool,
+    /// Nesting depth of metamethod dispatch, to catch `__index`/`__call`
+    /// loops.
+    pub mm_depth: u16,
+}
+
+/// A coroutine record. `func` is the body; `ip`/`want` are the resume point
+/// saved when the coroutine yielded.
+#[derive(Clone, Copy)]
+pub struct CoState {
+    pub status: u8,
+    pub func: Value,
+    pub ip: u16,
+    /// Number of results the suspended `yield` call expects on resume.
+    pub want: u16,
+    /// Thread index that resumed this coroutine.
+    pub parent: u8,
+    pub started: bool,
 }
 
 fn noop(_c: u8) {}
@@ -458,24 +721,37 @@ impl LuaState {
             nodes: [Node::Empty; MAX_NODES],
             next: [NO_NODE; MAX_NODES],
             node_used: 0,
+            code: [Instr {
+                op: InstrOp::Halt,
+                a: 0,
+                b: 0,
+            }; MAX_CODE],
+            ncode: 0,
             strings: [0u8; STR_CAP],
             strregs: [StrReg { off: 0, len: 0 }; MAX_STRINGS],
             nstrings: 0,
             str_next: 0,
             vstack: [Value::Nil; STACK_CAP],
             vsp: 0,
+            call_marks: [0; MAX_FRAMES],
+            mark_sp: 0,
             frames: [Frame {
                 locals: [Local {
                     name: 0,
                     value: Value::Nil,
                 }; MAX_LOCALS],
                 count: 0,
+                ret_ip: 0,
+                want: 0,
+                base: 0,
+                ctrl: [Value::Nil; 4],
             }; MAX_FRAMES],
             fsp: 0,
             funcs: [FuncDef {
                 params: 0,
                 nparams: 0,
                 body: 0,
+                entry: 0,
             }; MAX_FUNCS],
             funcs_used: 0,
             globals: [Global {
@@ -503,7 +779,44 @@ impl LuaState {
             dhcp_info: None,
             dhcp_values: None,
             warn_on: true,
+            threads: [Thread::empty(); MAX_THREADS],
+            current: 0,
+            cos: [CoState {
+                status: CO_DEAD,
+                func: Value::Nil,
+                ip: 0,
+                want: 0,
+                parent: 0,
+                started: false,
+            }; MAX_COS],
+            yield_ip: 0,
+            yield_want: 0,
+            mm_refs: [0; MM_COUNT],
+            mm_ready: false,
+            mm_depth: 0,
         }
+    }
+
+    /// Switch the flat execution fields from thread `from` to thread `to`,
+    /// saving `from`'s state and loading `to`'s.
+    pub fn swap_threads(&mut self, from: u8, to: u8) {
+        if from == to {
+            return;
+        }
+        {
+            let t = &mut self.threads[to as usize];
+            core::mem::swap(&mut self.vstack, &mut t.vstack);
+            core::mem::swap(&mut self.vsp, &mut t.vsp);
+            core::mem::swap(&mut self.frames, &mut t.frames);
+            core::mem::swap(&mut self.fsp, &mut t.fsp);
+            core::mem::swap(&mut self.call_marks, &mut t.call_marks);
+            core::mem::swap(&mut self.mark_sp, &mut t.mark_sp);
+            core::mem::swap(&mut self.steps, &mut t.steps);
+        }
+        let tmp = self.threads[to as usize];
+        self.threads[to as usize] = self.threads[from as usize];
+        self.threads[from as usize] = tmp;
+        self.current = to;
     }
 
     /// Register built-in globals (`print`, `fetch`, `shell`, `dhcp`, `dofile`,
@@ -573,12 +886,36 @@ impl LuaState {
         let _ = self.intern(b"warn");
         let warn_name = self.intern(b"warn").unwrap();
         self.set_global(warn_name, Value::Native(14));
+        let _ = self.intern(b"pcall");
+        let pcall_name = self.intern(b"pcall").unwrap();
+        self.set_global(pcall_name, Value::Native(15));
+        let _ = self.intern(b"error");
+        let error_name = self.intern(b"error").unwrap();
+        self.set_global(error_name, Value::Native(16));
+        // The `coroutine` library is a table of builtins.
+        let coroutine_name = self.intern(b"coroutine").unwrap();
+        let tid = crate::eval::new_table(self).unwrap();
+        let fields: [(&[u8], u8); 8] = [
+            (b"create", 17),
+            (b"resume", 18),
+            (b"yield", 19),
+            (b"status", 20),
+            (b"wrap", 21),
+            (b"isyieldable", 22),
+            (b"running", 23),
+            (b"close", 24),
+        ];
+        for &(name, id) in fields.iter() {
+            let n = self.intern(name).unwrap();
+            crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
+        }
+        self.set_global(coroutine_name, Value::Table(tid));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
     /// whole call (identifiers reference into it). Output from `print()`
     /// goes to `putc`.
-    pub fn run(&mut self, source: &[u8], putc: fn(u8)) -> Result<(), &'static str> {
+    pub fn run(&mut self, source: &[u8], putc: fn(u8)) -> Result<(), LuaError> {
         self.reset();
         self.putc = putc;
         self.register_builtins(putc);
@@ -586,7 +923,8 @@ impl LuaState {
             let mut p = parse::Parser::new(source, self);
             p.parse_script()?
         };
-        eval::exec_script(self, first)
+        let entry = vm::compile(self, first)?;
+        vm::exec_script(self, entry)
     }
 
     /// Install a host `fetch()` callback. Call `set_fetch(None)` to explicitly
@@ -732,7 +1070,7 @@ impl LuaState {
         source: &[u8],
         putc: fn(u8),
         fetch: fn(source: &str, save_as: &str) -> Option<usize>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), LuaError> {
         self.fetch = Some(fetch);
         self.run(source, putc)
     }
@@ -746,7 +1084,7 @@ impl LuaState {
         putc: fn(u8),
         fetch: fn(source: &str, save_as: &str) -> Option<usize>,
         load: fn(&str, &mut [u8]) -> Option<usize>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), LuaError> {
         self.fetch = Some(fetch);
         self.load = Some(load);
         self.run(source, putc)
@@ -755,17 +1093,25 @@ impl LuaState {
     fn reset(&mut self) {
         self.node_used = 0;
         self.next = [NO_NODE; MAX_NODES];
+        self.ncode = 0;
         self.nstrings = 0;
         self.str_next = 0;
         self.strings = [0u8; STR_CAP];
         self.strregs = [StrReg { off: 0, len: 0 }; MAX_STRINGS];
         self.vsp = 0;
+        self.mark_sp = 0;
         self.fsp = 0;
         self.funcs_used = 0;
         self.nglobals = 0;
         self.ntables = 0;
         self.steps = 0;
         self.fetched_n = 0;
+        self.current = 0;
+        self.mm_ready = false;
+        self.mm_depth = 0;
+        for c in self.cos.iter_mut() {
+            c.status = CO_DEAD;
+        }
     }
 
     // ── String arena ────────────────────────────────────────────────────────
@@ -837,6 +1183,7 @@ impl LuaState {
             params,
             nparams,
             body,
+            entry: 0,
         };
         self.funcs_used += 1;
         Ok(idx as u16)
@@ -865,6 +1212,10 @@ impl LuaState {
                 value: Value::Nil,
             }; MAX_LOCALS],
             count: 0,
+            ret_ip: 0,
+            want: 0,
+            base: 0,
+            ctrl: [Value::Nil; 4],
         };
         self.fsp += 1;
         Ok(())
@@ -953,7 +1304,7 @@ impl LuaState {
 }
 
 /// Convenience wrapper: run a script with a fresh [`LuaState`].
-pub fn run(source: &[u8], putc: fn(u8)) -> Result<(), &'static str> {
+pub fn run(source: &[u8], putc: fn(u8)) -> Result<(), LuaError> {
     let mut state = LuaState::new();
     state.run(source, putc)
 }
@@ -964,7 +1315,7 @@ pub fn run_with_fetch(
     source: &[u8],
     putc: fn(u8),
     fetch: fn(source: &str, save_as: &str) -> Option<usize>,
-) -> Result<(), &'static str> {
+) -> Result<(), LuaError> {
     let mut state = LuaState::new();
     state.run_with_fetch(source, putc, fetch)
 }
@@ -976,7 +1327,7 @@ pub fn run_with_fetch_load(
     putc: fn(u8),
     fetch: fn(source: &str, save_as: &str) -> Option<usize>,
     load: fn(&str, &mut [u8]) -> Option<usize>,
-) -> Result<(), &'static str> {
+) -> Result<(), LuaError> {
     let mut state = LuaState::new();
     state.run_with_fetch_load(source, putc, fetch, load)
 }
@@ -987,7 +1338,7 @@ pub fn run_with_fetch_load(
 pub fn run_repl(
     mut read_line: impl FnMut(&mut [u8]) -> Option<usize>,
     putc: fn(u8),
-) -> Result<(), &'static str> {
+) -> Result<(), LuaError> {
     let mut state = LuaState::new();
     // Register builtins (print, fetch, shell, dhcp, exit) by running an empty script.
     state.run(&[], putc)?;
@@ -999,7 +1350,7 @@ pub fn run_repl(
             Some(l) if l > 0 => l,
             _ => break, // EOF or empty input
         };
-        match eval::run_repl_once(&mut state, &buf[..len], putc) {
+        match vm::run_repl_once(&mut state, &buf[..len]) {
             Ok(eval::ExecResult::Normal) => {}
             Ok(eval::ExecResult::Break) => {}
             Ok(eval::ExecResult::Goto(_)) => {}
@@ -1007,6 +1358,7 @@ pub fn run_repl(
             Ok(eval::ExecResult::Ret2(..)) => {}
             Ok(eval::ExecResult::RetN(_)) => {}
             Ok(eval::ExecResult::Exit) => break,
+            Ok(eval::ExecResult::Yield(_)) => {}
             Ok(eval::ExecResult::Shell) => {
                 // Nested shell — not supported in this simple REPL.
                 putc(b'\n');
@@ -1014,9 +1366,7 @@ pub fn run_repl(
             }
             Err(e) => {
                 putc(b'\n');
-                for &b in e.as_bytes() {
-                    putc(b);
-                }
+                eval::emit_error(&state, e, putc);
                 putc(b'\n');
             }
         }
@@ -1026,6 +1376,7 @@ pub fn run_repl(
 
 #[cfg(test)]
 mod tests {
+    use super::LuaError;
     use std::cell::RefCell;
     use std::format;
     use std::string::String;
@@ -1042,7 +1393,7 @@ mod tests {
         OUT.with(|o| o.borrow_mut().push(c));
     }
 
-    fn exec(src: &str) -> Result<String, &'static str> {
+    fn exec(src: &str) -> Result<String, LuaError> {
         OUT.with(|o| o.borrow_mut().clear());
         super::run(src.as_bytes(), putc_test)?;
         Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
@@ -1469,7 +1820,6 @@ mod tests {
             "true\tfalse\n"
         );
         assert_eq!(exec("print(rawequal(dhcp, dhcp), rawequal(dhcp, ls))").unwrap(), "true\tfalse\n");
-        // Metamethods are not dispatched, so `==` and `rawequal` agree.
         assert_eq!(
             exec("print((1 == 1.0) == rawequal(1, 1.0))").unwrap(),
             "true\n"
@@ -1492,7 +1842,6 @@ mod tests {
         // Any index value is accepted.
         assert_eq!(exec("t = {}\nprint(rawget(t, nil))").unwrap(), "nil\n");
         assert_eq!(exec("print(rawget({7}, 1.0))").unwrap(), "7\n");
-        // Metamethods are not dispatched, so rawget agrees with t[k].
         assert_eq!(exec("t = {5}\nprint(rawget(t, 1) == t[1])").unwrap(), "true\n");
         // Values compare by identity (a table-valued field).
         assert_eq!(
@@ -1596,6 +1945,98 @@ mod tests {
         assert!(exec("select(\"x\", 1)").is_err());
         assert!(exec("select(1.5, 1)").is_err());
         assert!(exec("select()").is_err());
+    }
+
+    #[test]
+    fn metamethods() {
+        // __index: table chain and function form.
+        assert_eq!(
+            exec("base = {x = 1}\nt = setmetatable({y = 2}, {__index = base})\nprint(t.x, t.y, t.z)").unwrap(),
+            "1\t2\tnil\n"
+        );
+        assert_eq!(
+            exec("t = setmetatable({}, {__index = function(t, k) return k .. \"!\" end})\nprint(t.hi, t.ho)").unwrap(),
+            "hi!\tho!\n"
+        );
+        // __index chains through multiple metatables.
+        assert_eq!(
+            exec("a = {x = 1}\nb = setmetatable({}, {__index = a})\nc = setmetatable({}, {__index = b})\nprint(c.x)").unwrap(),
+            "1\n"
+        );
+        // __index loops are caught.
+        assert!(exec("a = {}\nb = {}\nsetmetatable(a, {__index = b})\nsetmetatable(b, {__index = a})\nprint(a.x)").is_err());
+        // rawget ignores __index.
+        assert_eq!(
+            exec("t = setmetatable({}, {__index = {x = 1}})\nprint(rawget(t, \"x\"), t.x)").unwrap(),
+            "nil\t1\n"
+        );
+        // __newindex: table and function forms.
+        assert_eq!(
+            exec("store = {}\nt = setmetatable({}, {__newindex = store})\nt.x = 5\nprint(t.x, store.x)").unwrap(),
+            "nil\t5\n"
+        );
+        assert_eq!(
+            exec("log = \"\"\nt = setmetatable({}, {__newindex = function(t, k, v) log = k .. \"=\" .. v end})\nt.a = 1\nt.b = 2\nprint(log)").unwrap(),
+            "b=2\n"
+        );
+        // rawset ignores __newindex; existing keys bypass it.
+        assert_eq!(
+            exec("store = {}\nt = setmetatable({}, {__newindex = store})\nrawset(t, \"x\", 9)\nprint(t.x, store.x)").unwrap(),
+            "9\tnil\n"
+        );
+        assert_eq!(
+            exec("t = setmetatable({x = 1}, {__newindex = function() print(\"no\") end})\nt.x = 2\nprint(t.x)").unwrap(),
+            "2\n"
+        );
+        // __eq / __lt / __le (and > / >= swapping).
+        assert_eq!(
+            exec("mt = {__eq = function(a, b) return a.id == b.id end}\na = setmetatable({id = 1}, mt)\nb = setmetatable({id = 1}, mt)\nc = setmetatable({id = 2}, mt)\nprint(a == b, a == c, a ~= c)").unwrap(),
+            "true\tfalse\ttrue\n"
+        );
+        assert_eq!(
+            exec("mt = {__lt = function(a, b) return a.id < b.id end}\na = setmetatable({id = 1}, mt)\nb = setmetatable({id = 2}, mt)\nprint(a < b, b < a, a > b, b > a)").unwrap(),
+            "true\tfalse\tfalse\ttrue\n"
+        );
+        assert_eq!(
+            exec("mt = {__le = function(a, b) return a.id <= b.id end}\na = setmetatable({id = 1}, mt)\nb = setmetatable({id = 2}, mt)\nprint(a <= b, b <= a, a >= b, b >= a)").unwrap(),
+            "true\tfalse\tfalse\ttrue\n"
+        );
+        // Lua 5.1 fallback: `a <= b` from `not (b < a)` when __le is absent.
+        assert_eq!(
+            exec("mt = {__lt = function(a, b) return a.id < b.id end}\na = setmetatable({id = 1}, mt)\nb = setmetatable({id = 2}, mt)\nprint(a <= b, b <= a)").unwrap(),
+            "true\tfalse\n"
+        );
+        // rawequal ignores __eq.
+        assert_eq!(
+            exec("mt = {__eq = function() return true end}\na = setmetatable({}, mt)\nb = setmetatable({}, mt)\nprint(rawequal(a, b), a == b)").unwrap(),
+            "false\ttrue\n"
+        );
+        // __concat and the arithmetic metamethods (either operand).
+        assert_eq!(
+            exec("mt = {__concat = function(a, b) return \"C\" end}\nt = setmetatable({}, mt)\nprint(t .. \"x\", \"x\" .. t, t .. t)").unwrap(),
+            "C\tC\tC\n"
+        );
+        assert_eq!(
+            exec("mt = {__add = function() return 10 end, __sub = function() return 20 end, __mul = function() return 30 end, __div = function() return 40 end, __mod = function() return 50 end, __unm = function() return 60 end}\nt = setmetatable({}, mt)\nprint(t + 1, 1 - t, t * 2, 2 / t, t % 3, -t)").unwrap(),
+            "10\t20\t30\t40\t50\t60\n"
+        );
+        // __call receives the table as its first argument.
+        assert_eq!(
+            exec("t = setmetatable({}, {__call = function(self, a, b) return a + b end})\nprint(t(3, 4))").unwrap(),
+            "7\n"
+        );
+        // __tostring (print and tostring).
+        assert_eq!(
+            exec("t = setmetatable({}, {__tostring = function() return \"custom\" end})\nprint(t)\nprint(tostring(t), tostring(t) .. \"!\")").unwrap(),
+            "custom\ncustom\tcustom!\n"
+        );
+        // __pairs supplies the generic-for iterator.
+        assert_eq!(
+            exec("t = setmetatable({}, {__pairs = function(t) return pairs({10, 20}) end})\nfor k, v in pairs(t) do print(k, v) end").unwrap(),
+            "1\t10\n2\t20\n"
+        );
+        // Metatable protection still applies.
+        assert!(exec("t = {}\nsetmetatable(t, {__metatable = true})\nsetmetatable(t, {})").is_err());
     }
 
     #[test]
@@ -1744,6 +2185,173 @@ mod tests {
     }
 
     #[test]
+    fn pcall_builtin() {
+        // Success: true plus every result (none, one, two, or many).
+        assert_eq!(exec("function f0() end\nprint(pcall(f0))").unwrap(), "true\n");
+        assert_eq!(exec("function f1() return 1 end\nprint(pcall(f1))").unwrap(), "true\t1\n");
+        assert_eq!(
+            exec("function f2() return next({7}) end\nprint(pcall(f2))").unwrap(),
+            "true\t1\t7\n"
+        );
+        assert_eq!(
+            exec("function f3() return select(2, \"a\", \"b\", \"c\") end\nprint(pcall(f3))").unwrap(),
+            "true\tb\tc\n"
+        );
+        // Arguments are forwarded.
+        assert_eq!(
+            exec("function add(a, b) return a + b end\nprint(pcall(add, 3, 4))").unwrap(),
+            "true\t7\n"
+        );
+        // Native builtins returning two values work through pcall.
+        assert_eq!(exec("print(pcall(next, {5}))").unwrap(), "true\t1\t5\n");
+        // Runtime errors become false plus the message string.
+        assert_eq!(
+            exec("function bad() return nil + 1 end\nlocal ok, err = pcall(bad)\nprint(ok, type(err))").unwrap(),
+            "false\tstring\n"
+        );
+        // error(v) raises v, which pcall returns unchanged.
+        assert_eq!(
+            exec("function boom() error(\"boom\") end\nprint(pcall(boom))").unwrap(),
+            "false\tboom\n"
+        );
+        assert_eq!(exec("print(pcall(error, 42))").unwrap(), "false\t42\n");
+        assert_eq!(exec("print(pcall(error))").unwrap(), "false\tnil\n");
+        assert_eq!(
+            exec("function enil() error(nil) end\nprint(pcall(enil))").unwrap(),
+            "false\tnil\n"
+        );
+        assert_eq!(
+            exec("t = {code = 7}\nfunction etab() error(t) end\nlocal ok, e = pcall(etab)\nprint(ok, e == t, e.code)").unwrap(),
+            "false\ttrue\t7\n"
+        );
+        // error's level is validated but ignored.
+        assert_eq!(
+            exec("function ex() error(\"x\", 2) end\nprint(pcall(ex))").unwrap(),
+            "false\tx\n"
+        );
+        assert_eq!(
+            exec("function exbad() error(\"x\", \"bad\") end\nprint(pcall(exbad))").unwrap(),
+            "false\terror level must be an integer\n"
+        );
+        // Calling a non-function is caught as well.
+        assert_eq!(
+            exec("print(pcall(nil))").unwrap(),
+            "false\tattempt to call a non-function value\n"
+        );
+        // Nested pcall: the inner catch does not disturb the outer.
+        assert_eq!(
+            exec("function inner() error(\"x\") end\nfunction outer() return pcall(inner) end\nlocal ok, ok2, err = pcall(outer)\nprint(ok, ok2, err)").unwrap(),
+            "true\tfalse\tx\n"
+        );
+        // The stack/frames are intact after a catch.
+        assert_eq!(
+            exec("function bad2() local a = 1 error(\"e\") end\nlocal ok = pcall(bad2)\nprint(ok, 2 + 2)").unwrap(),
+            "false\t4\n"
+        );
+        assert_eq!(
+            exec("n = 0\nfunction bad3() error(\"e\") end\nfor i = 1, 3 do if not pcall(bad3) then n = n + 1 end end\nprint(n)").unwrap(),
+            "3\n"
+        );
+        // A runtime error from a global lookup is catchable too.
+        assert_eq!(
+            exec("function ug() return undefined_global end\nprint(pcall(ug))").unwrap(),
+            "false\tundefined variable\n"
+        );
+        // pcall itself requires a function argument.
+        assert!(exec("pcall()").is_err());
+        // error() propagates when not protected.
+        assert!(exec("error(\"boom\")").is_err());
+        assert!(exec("error(1, 2, 3)").is_err());
+    }
+
+    #[test]
+    fn lua_state_size_budget() {
+        let n = core::mem::size_of::<super::LuaState>();
+        std::println!("LuaState size: {} bytes", n);
+        // The state lives on the caller's stack; keep it within the stack
+        // budgets of the firmware targets (ARM64 bare has a 512 KB stack).
+        assert!(n < 128 * 1024, "LuaState grew to {} bytes", n);
+    }
+
+    #[test]
+    fn coroutine_builtin() {
+        // status / type / tostring of a thread value.
+        assert_eq!(
+            exec("co = coroutine.create(print)\nprint(coroutine.status(co), type(co), tostring(co))")
+                .unwrap(),
+            "suspended\tthread\tthread\n"
+        );
+        // A native body runs once with the resume arguments.
+        assert_eq!(
+            exec("co = coroutine.create(print)\nprint(coroutine.resume(co, \"hi\"))\nprint(coroutine.status(co))")
+                .unwrap(),
+            "hi\ntrue\ndead\n"
+        );
+        // yield/resume passes values both ways.
+        assert_eq!(
+            exec("function f(a)\nlocal x, y = coroutine.yield(a + 1, a + 2)\nreturn x .. y\nend\nco = coroutine.create(f)\nprint(coroutine.resume(co, 10))\nprint(coroutine.resume(co, \"a\", \"b\"))\nprint(coroutine.status(co))")
+                .unwrap(),
+            "true\t11\t12\ntrue\tab\ndead\n"
+        );
+        // wrap resumes without the leading boolean.
+        assert_eq!(
+            exec("function gen()\nfor i = 1, 3 do coroutine.yield(i) end\nend\ng = coroutine.wrap(coroutine.create(gen))\nprint(g())\nprint(g())\nprint(g())")
+                .unwrap(),
+            "1\n2\n3\n"
+        );
+        // isyieldable / running inside and outside a coroutine.
+        assert_eq!(exec("print(coroutine.isyieldable())").unwrap(), "false\n");
+        assert_eq!(
+            exec("function f()\nlocal c, main = coroutine.running()\nprint(type(c), main, coroutine.isyieldable())\nend\ncoroutine.resume(coroutine.create(f))")
+                .unwrap(),
+            "thread\tfalse\ttrue\n"
+        );
+        // Nested resume: a coroutine resumes another coroutine.
+        assert_eq!(
+            exec("function inner() coroutine.yield(\"i\") end\nfunction outer()\nlocal ci = coroutine.create(inner)\nprint(coroutine.resume(ci))\nend\nco = coroutine.create(outer)\nprint(coroutine.resume(co))")
+                .unwrap(),
+            "true\ti\ntrue\n"
+        );
+        // Errors inside a coroutine become false + the error value.
+        assert_eq!(
+            exec("function f() error(\"boom\") end\nco = coroutine.create(f)\nprint(coroutine.resume(co))\nprint(coroutine.status(co))")
+                .unwrap(),
+            "false\tboom\ndead\n"
+        );
+        // Resuming a dead coroutine returns false + a message.
+        assert_eq!(
+            exec("co = coroutine.create(print)\ncoroutine.resume(co, \"x\")\nprint(coroutine.resume(co))")
+                .unwrap(),
+            "x\nfalse\tcannot resume dead coroutine\n"
+        );
+        // close marks a suspended coroutine dead.
+        assert_eq!(
+            exec("co = coroutine.create(print)\nprint(coroutine.close(co), coroutine.status(co))")
+                .unwrap(),
+            "true\tdead\n"
+        );
+        // Yielding from the main thread is an error, and create needs a function.
+        assert!(exec("coroutine.yield(1)").is_err());
+        assert!(exec("coroutine.create(1)").is_err());
+        assert!(exec("coroutine.resume(1)").is_err());
+        // The coroutine pool is bounded.
+        assert!(exec("a = coroutine.create(print)\nb = coroutine.create(print)\nc = coroutine.create(print)\nd = coroutine.create(print)").is_err());
+    }
+
+    #[test]
+    fn error_rendering() {
+        let mut state = super::LuaState::new();
+        let mut buf = [0u8; 64];
+        let n = super::eval::error_bytes(&state, LuaError::Msg("boom"), &mut buf);
+        assert_eq!(&buf[..n], b"boom");
+        let n = super::eval::error_bytes(&state, LuaError::Obj(super::Value::Table(0)), &mut buf);
+        assert_eq!(&buf[..n], b"error object is a table value");
+        let r = state.intern(b"custom").unwrap();
+        let n = super::eval::error_bytes(&state, LuaError::Obj(super::Value::Str(r)), &mut buf);
+        assert_eq!(&buf[..n], b"custom");
+    }
+
+    #[test]
     fn nil_removes_table_fields() {
         // `t[k] = nil` removes the key (Lua), it does not store a nil value.
         assert_eq!(exec("t = {a = 1}\nt.a = nil\nprint(t.a)").unwrap(), "nil\n");
@@ -1758,6 +2366,7 @@ mod tests {
         );
     }
 
+    #[test]
     #[test]
     fn multiple_assignment() {
         // A right-hand-side list is not supported (only a call expands).
@@ -1790,6 +2399,13 @@ mod tests {
         assert_eq!(
             exec("function is_even(n) if n % 2 == 0 then return true end return false end\nprint(is_even(4), is_even(5))").unwrap(),
             "true\tfalse\n"
+        );
+        // Anonymous function literals are expressions (no upvalues/closures).
+        assert_eq!(exec("f = function(a) return a * 2 end\nprint(f(21))").unwrap(), "42\n");
+        assert_eq!(exec("print((function() return 5 end)())").unwrap(), "5\n");
+        assert_eq!(
+            exec("apply = function(g, x) return g(x) end\nprint(apply(function(n) return n + 1 end, 41))").unwrap(),
+            "42\n"
         );
     }
 
@@ -1898,7 +2514,7 @@ mod tests {
         }
     }
 
-    fn exec_fetch(src: &str) -> Result<String, &'static str> {
+    fn exec_fetch(src: &str) -> Result<String, LuaError> {
         OUT.with(|o| o.borrow_mut().clear());
         super::run_with_fetch(src.as_bytes(), putc_test, fetch_count)?;
         Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
@@ -1979,7 +2595,7 @@ mod tests {
         Some(src.len())
     }
 
-    fn exec_dofile(src: &str) -> Result<String, &'static str> {
+    fn exec_dofile(src: &str) -> Result<String, LuaError> {
         OUT.with(|o| o.borrow_mut().clear());
         super::run_with_fetch_load(src.as_bytes(), putc_test, fetch_count, load_demo)?;
         Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
@@ -2065,7 +2681,7 @@ mod tests {
     }
 
     /// Run a script with a mock `dhcp` callback installed (fetch disabled).
-    fn exec_dhcp(src: &str, dhcp: fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>) -> Result<String, &'static str> {
+    fn exec_dhcp(src: &str, dhcp: fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>) -> Result<String, LuaError> {
         OUT.with(|o| o.borrow_mut().clear());
         let mut state = super::LuaState::new();
         state.register_builtins(putc_test);
@@ -2075,7 +2691,8 @@ mod tests {
             let mut p = super::parse::Parser::new(src.as_bytes(), &mut state);
             p.parse_script()?
         };
-        super::eval::exec_script(&mut state, first)?;
+        let entry = super::vm::compile(&mut state, first)?;
+        super::vm::exec_script(&mut state, entry)?;
         Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
     }
 
@@ -2092,7 +2709,7 @@ mod tests {
     fn exec_dhcp_info(
         src: &str,
         dhcp: fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>,
-    ) -> Result<String, &'static str> {
+    ) -> Result<String, LuaError> {
         OUT.with(|o| o.borrow_mut().clear());
         let mut state = super::LuaState::new();
         state.register_builtins(putc_test);
@@ -2103,7 +2720,8 @@ mod tests {
             let mut p = super::parse::Parser::new(src.as_bytes(), &mut state);
             p.parse_script()?
         };
-        super::eval::exec_script(&mut state, first)?;
+        let entry = super::vm::compile(&mut state, first)?;
+        super::vm::exec_script(&mut state, entry)?;
         Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
     }
 
@@ -2140,7 +2758,7 @@ mod tests {
     fn exec_dhcp_vars(
         src: &str,
         dhcp: fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>>,
-    ) -> Result<String, &'static str> {
+    ) -> Result<String, LuaError> {
         OUT.with(|o| o.borrow_mut().clear());
         let mut state = super::LuaState::new();
         state.register_builtins(putc_test);
@@ -2151,7 +2769,8 @@ mod tests {
             let mut p = super::parse::Parser::new(src.as_bytes(), &mut state);
             p.parse_script()?
         };
-        super::eval::exec_script(&mut state, first)?;
+        let entry = super::vm::compile(&mut state, first)?;
+        super::vm::exec_script(&mut state, entry)?;
         Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
     }
 

@@ -226,7 +226,7 @@ pub fn repl_loop(
                         let content = &acc[..clen];
                         if !content.is_empty() {
                             if !handle_repl_cmd(content, putc, puts) {
-                                match eval::run_repl_once(state, content, putc) {
+                                match super::vm::run_repl_once(state, content) {
                                     Ok(eval::ExecResult::Normal) => {}
                                     Ok(eval::ExecResult::Break) => {}
                                     Ok(eval::ExecResult::Goto(_)) => {}
@@ -237,9 +237,10 @@ pub fn repl_loop(
                                         puts("\n(nested shell not supported)\n\n");
                                     }
                                     Ok(eval::ExecResult::Ret(_)) => {}
+                                    Ok(eval::ExecResult::Yield(_)) => {}
                                     Err(e) => {
                                         puts("Lua error: ");
-                                        puts(e);
+                                        eval::emit_error(state, e, putc);
                                         putc(b'\n');
                                     }
                                 }
@@ -745,23 +746,23 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         short: "Iterator for all key/value pairs of a table",
         detail: "pairs(t)\n\
                   Returns the next function and the table, so that\n\
-                  'for k, v in pairs(t) do ... end' iterates every pair. This\n\
-                  subset does not dispatch metamethods, so __pairs is never consulted.\n",
+                  'for k, v in pairs(t) do ... end' iterates every pair. A\n\
+                  __pairs metamethod is dispatched when present.\n",
     },
     HelpEntry {
         name: "rawequal",
         short: "Compare two values without metamethods",
         detail: "rawequal(v1, v2)\n\
-                  Returns whether v1 equals v2 using primitive equality. This\n\
-                  subset does not dispatch metamethods, so it agrees with `v1 == v2`.\n",
+                  Returns whether v1 equals v2 using primitive equality, never\n\
+                  the __eq metamethod (unlike `v1 == v2`).\n",
     },
     HelpEntry {
         name: "rawget",
         short: "Get table[index] without the __index metavalue",
         detail: "rawget(table, index)\n\
-                  Returns the real value of table[index]. This subset has no\n\
-                  metamethods, so it agrees with 'table[index]'. The index may\n\
-                  be any value; the table must be a table.\n",
+                  Returns the real value of table[index], never consulting the\n\
+                  __index metamethod. The index may be any value; the table\n\
+                  must be a table.\n",
     },
     HelpEntry {
         name: "rawlen",
@@ -769,16 +770,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "rawlen(v)\n\
                   Returns the length of v, which must be a table or a string.\n\
                   A table's length is the run of consecutive integer keys\n\
-                  starting at 1. Metamethods are not dispatched, so it agrees\n\
-                  with the plain length.\n",
+                  starting at 1 (no __len is consulted).\n",
     },
     HelpEntry {
         name: "rawset",
         short: "Set table[index] without the __newindex metavalue",
         detail: "rawset(table, index, value)\n\
-                  Sets the real value of table[index] and returns the table.\n\
-                  Metamethods are not dispatched, so it agrees with\n\
-                  'table[index] = value'. The index may not be nil or NaN.\n",
+                  Sets the real value of table[index] and returns the table,\n\
+                  never consulting the __newindex metamethod. The index may\n\
+                  not be nil or NaN.\n",
     },
     HelpEntry {
         name: "select",
@@ -794,9 +794,10 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         short: "Set (or remove) a table's metatable",
         detail: "setmetatable(table, metatable)\n\
                   Stores the metatable for the table (nil removes it) and\n\
-                  returns the table. Metamethods are not dispatched in this\n\
-                  subset. A metatable with a non-nil __metatable field is\n\
-                  protected: trying to change it raises an error.\n",
+                  returns the table. Dispatched metamethods: __index,\n\
+                  __newindex, __eq, __lt, __le, __concat, __add, __sub, __mul,\n\
+                  __div, __mod, __unm, __call, __tostring, __pairs. A metatable\n\
+                  with a non-nil __metatable field is protected.\n",
     },
     HelpEntry {
         name: "tonumber",
@@ -812,8 +813,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         short: "Convert a value to its string form",
         detail: "tostring(v)\n\
                   Returns the human-readable string form of any value, using\n\
-                  the same rendering as print. Metamethods are not dispatched,\n\
-                  so a __tostring field is not consulted.\n",
+                  the same rendering as print. A table's __tostring metamethod\n\
+                  is dispatched (it must return a string).\n",
     },
     HelpEntry {
         name: "type",
@@ -829,6 +830,22 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Concatenates its string (or number) arguments and prints\n\
                   'Lua warning: <msg>'. The control messages \"@off\" and \"@on\"\n\
                   turn warnings off and on again.\n",
+    },
+    HelpEntry {
+        name: "pcall",
+        short: "Call a function in protected mode",
+        detail: "pcall(f, ...)\n\
+                  Calls f with the given arguments. Returns true plus the\n\
+                  results on success, or false plus the error object on\n\
+                  failure. Example: pcall(next, {5}) -> true 1 5\n",
+    },
+    HelpEntry {
+        name: "error",
+        short: "Raise an error",
+        detail: "error(v [, level])\n\
+                  Raises v as an error object. pcall catches it and returns\n\
+                  the value unchanged. level is validated but ignored (this\n\
+                  interpreter has no source positions).\n",
     },
     HelpEntry {
         name: "fetch",
@@ -1195,6 +1212,16 @@ mod tests {
     }
 
     #[test]
+    fn error_objects_rendered_in_repl() {
+        // A string error object prints its contents...
+        let out = run_session(b"error(\"custom message\")\rexit\r");
+        assert!(out.contains("Lua error: custom message"), "{}", out);
+        // ...and any other error object prints its type, like standalone Lua.
+        let out = run_session(b"error({})\rexit\r");
+        assert!(out.contains("Lua error: error object is a table value"), "{}", out);
+    }
+
+    #[test]
     fn shell_message() {
         let out = run_session(b"shell\rprint(1)\rexit\r");
         assert!(out.contains("(nested shell not supported)"));
@@ -1218,7 +1245,7 @@ mod tests {
     #[test]
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
-        for cmd in ["help", "exit", "clear", "print", "fetch", "dofile", "ls", "shell", "dhcp", "type", "warn"] {
+        for cmd in ["help", "exit", "clear", "print", "fetch", "dofile", "ls", "shell", "dhcp", "type", "warn", "pcall", "error"] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
         }
         assert!(out.contains("Type 'help <cmd>'"));

@@ -35,7 +35,10 @@ fn run_script(path: &str) -> ! {
     match state.run_with_fetch_load(&src, term::raw_putc, fetch::fetch_file, fetch::load_file) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
-            eprintln!("lua: {}: {}", path, e);
+            let mut buf = [0u8; 256];
+            let n = lua::eval::error_bytes(&state, e, &mut buf);
+            let msg = std::str::from_utf8(&buf[..n]).unwrap_or("error");
+            eprintln!("lua: {}: {}", path, msg);
             std::process::exit(1);
         }
     }

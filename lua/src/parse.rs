@@ -610,6 +610,22 @@ impl<'s, 'l> Parser<'s, 'l> {
                 e
             }
             Tok::LBrace => self.parse_table_lit()?,
+            Tok::Function => {
+                // Anonymous function literal: `function (params) ... end`.
+                self.advance()?;
+                self.expect(Tok::LParen, "expected '(' after 'function'")?;
+                let (params, nparams) = self.parse_params()?;
+                let saved_loop = self.loop_depth;
+                self.loop_depth = 0;
+                let saved_scopes = self.n_scopes;
+                self.n_scopes = 0;
+                let body = self.parse_block()?;
+                self.n_scopes = saved_scopes;
+                self.loop_depth = saved_loop;
+                self.expect(Tok::End, "expected 'end' to close function")?;
+                let fi = self.state.alloc_func(params, nparams, body)?;
+                self.alloc(Node::FuncLit(fi))?
+            }
             _ => return Err("unexpected token in expression"),
         };
 

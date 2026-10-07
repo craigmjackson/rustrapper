@@ -4,7 +4,7 @@
 [org 0x7C00]
 [bits 16]
 
-TOTAL_SECTORS equ 256
+TOTAL_SECTORS equ 384
 MAX_CHUNK     equ 127
 
 ; Offset 0x00: "MZ" signature for PE compatibility
@@ -116,7 +116,7 @@ drive_num: db 0
 msg_err: db 'Boot error', 0x0D, 0x0A, 0
 
 ; Disk Address Packet for extended reads. count/segment/LBA are filled in per
-; chunk. Buffer runs 0x8000..0x28000 (256 sectors), above the MBR at 0x7C00
+; chunk. Buffer runs 0x8000..0x38000 (384 sectors), above the MBR at 0x7C00
 ; and below the EBDA at ~0x9FC00.
 dap:
     db 0x10        ; size

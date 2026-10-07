@@ -29,7 +29,6 @@ use crate::efi::*;
 pub static mut SYSTEM_TABLE: Option<&'static EFI_SYSTEM_TABLE> = None;
 
 #[cfg(not(test))]
-#[cfg(target_arch = "aarch64")]
 fn read_boot_svc_fn<T>(gbs: *const core::ffi::c_void, offset: usize) -> T {
     let ptr = (gbs as usize + offset) as *const *const core::ffi::c_void;
     unsafe { core::mem::transmute_copy(&*ptr) }
@@ -136,10 +135,10 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
     let con_out = unsafe { &*system_table.con_out };
     net::w16(con_out, "Rustrapper UEFI\r\n");
 
-    // ARM64 UEFI gives loaded images a small firmware stack (the `LuaState`
-    // alone is ~38 KB and overflows it with a synchronous exception). Run the
-    // whole menu loop on a large custom stack allocated from Boot Services.
-    #[cfg(target_arch = "aarch64")]
+    // UEFI loaded images get a small firmware stack (the `LuaState` alone is
+    // now ~100 KB: bytecode, per-thread stacks, and the coroutine pool). Run
+    // the whole menu loop on a large custom stack allocated from Boot Services
+    // on both architectures.
     {
         const BOOT_SVC_ALLOCATE_PAGES: usize = 0x28;
         const EFI_LOADER_DATA: u32 = 2;
@@ -158,6 +157,7 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
         let status = unsafe { allocate_pages(0, EFI_LOADER_DATA, STACK_PAGES, &mut base) };
         if status == EFI_SUCCESS && base != 0 {
             let top = (base as usize + STACK_PAGES as usize * 4096) & !15;
+            #[cfg(target_arch = "aarch64")]
             unsafe {
                 core::arch::asm!(
                     "mov sp, {top}",
@@ -171,12 +171,26 @@ pub extern "efiapi" fn efi_main(image_handle: EFI_HANDLE, system_table: &'static
                     options(noreturn),
                 );
             }
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                // Windows x64 ABI (EFIAPI): args in rcx/rdx plus 32 bytes of
+                // shadow space, 16-byte stack alignment.
+                core::arch::asm!(
+                    "mov rsp, {top}",
+                    "sub rsp, 32",
+                    "mov rcx, {ih}",
+                    "mov rdx, {st}",
+                    "jmp {func}",
+                    top = in(reg) top,
+                    ih = in(reg) image_handle as usize,
+                    st = in(reg) system_table as *const _ as usize,
+                    func = sym boot_loop,
+                    options(noreturn),
+                );
+            }
         }
         boot_loop(image_handle, system_table);
     }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    boot_loop(image_handle, system_table);
 }
 
 /// The main menu/action loop. Kept separate so `efi_main` can switch to a

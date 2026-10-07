@@ -100,7 +100,8 @@ pub fn network_boot() {
             puts(" bytes\r\n");
             if bootfile.ends_with(".lua") {
                 puts("PXE: executing Lua script\r\n");
-                match lua::run_with_fetch_load(
+                let mut state = lua::LuaState::new();
+                match state.run_with_fetch_load(
                     &data,
                     putc,
                     crate::fetch::fetch_file,
@@ -109,7 +110,7 @@ pub fn network_boot() {
                     Ok(()) => puts("PXE: Lua script done\r\n"),
                     Err(e) => {
                         puts("Lua error: ");
-                        puts(e);
+                        lua::eval::emit_error(&state, e, putc);
                         putc(b'\r');
                         putc(b'\n');
                     }

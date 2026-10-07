@@ -1,6 +1,7 @@
-//! Tree-walking evaluator.
+//! Runtime helpers (values, tables, operators, formatting) and the native
+//! builtin dispatch used by the bytecode VM in [`crate::vm`].
 
-use super::{LuaState, Node, Op, Value, NO_NODE};
+use super::{LuaError, LuaState, Node, Op, Value};
 
 /// Result of executing a statement chain.
 #[derive(Clone, Copy)]
@@ -21,18 +22,13 @@ pub enum ExecResult {
     Goto(u16),
     Shell,
     Exit,
-}
-
-/// Numeric `for` loop iterator state: exact integers when all bounds are
-/// integers, floating point when any bound is a float.
-#[derive(Clone, Copy)]
-enum NumIter {
-    Int(i64, i64, i64),
-    Float(f64, f64, f64),
+    /// A coroutine `yield`: the top `n` values of the value stack are the
+    /// yielded results. Propagates out of the VM loop to the resume driver.
+    Yield(u8),
 }
 
 /// Numeric view of a value, accepting both integers and floats.
-fn float_of(v: Value) -> Option<f64> {
+pub(crate) fn float_of(v: Value) -> Option<f64> {
     match v {
         Value::Num(n) => Some(n as f64),
         Value::Float(f) => Some(f),
@@ -154,586 +150,17 @@ fn str_to_base(b: &[u8], base: i64) -> Option<i64> {
     Some(if neg { -n } else { n })
 }
 
-/// Execute the top-level script (its own scope frame).
-pub fn exec_script(s: &mut LuaState, first: u16) -> Result<(), &'static str> {
-    s.push_frame()?;
-    let r = run_chain(s, first);
-    s.pop_frame();
-    match r {
-        Ok(ExecResult::Normal) => Ok(()),
-        Ok(ExecResult::Ret(_)) | Ok(ExecResult::Ret2(..)) | Ok(ExecResult::RetN(_)) => Ok(()),
-        Ok(ExecResult::Break) => Err("break outside loop"),
-        Ok(ExecResult::Goto(_)) => Err("unknown label"),
-        Ok(ExecResult::Shell) | Ok(ExecResult::Exit) => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Run a block's statement chain, resolving `goto` targets that land inside
-/// this chain (forward/backward jumps within the block). A `goto` whose target
-/// lies in an enclosing block's chain propagates upward as [`ExecResult::Goto`]
-/// after this block's frame has been popped.
-fn run_chain(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> {
-    let mut n = first;
-    loop {
-        match exec_chain(s, n)? {
-            ExecResult::Goto(t) if chain_contains(s, first, t) => n = t,
-            r => return Ok(r),
-        }
-    }
-}
-
-/// Whether `target` is a node in the chain that starts at `first`.
-fn chain_contains(s: &LuaState, first: u16, target: u16) -> bool {
-    let mut n = first;
-    while n != NO_NODE {
-        if n == target {
-            return true;
-        }
-        n = s.next[n as usize];
-    }
-    false
-}
-
-/// Run a statement chain in the current frame.
-fn exec_chain(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> {
-    let mut n = first;
-    while n != NO_NODE {
-        s.steps += 1;
-        if s.steps > super::MAX_STEPS {
-            return Err("step limit exceeded");
-        }
-        match exec_stmt(s, n)? {
-            ExecResult::Normal => {
-                n = match s.nodes[n as usize] {
-                    Node::Goto(t) => return Ok(ExecResult::Goto(t)),
-                    _ => s.next[n as usize],
-                }
-            }
-            r => return Ok(r),
-        }
-    }
-    Ok(ExecResult::Normal)
-}
-
-/// Execute a single line of input in the REPL (resets step counter only).
-/// Returns `Ok(ExecResult::Shell)` to continue the REPL, or `Ok(ExecResult::Exit)`
-/// if the line was `exit()`.
-pub fn run_repl_once(s: &mut LuaState, line: &[u8], _putc: fn(u8)) -> Result<ExecResult, &'static str> {
-    // Reset step counter so each line gets a fresh budget.
-    s.steps = 0;
-    // Reset the value stack and frame (but preserve globals, strings, tables).
-    s.vsp = 0;
-    s.fsp = 0;
-    // Check if the first token is a bare expression (not a keyword).
-    // If so, parse it as an expression and print the result (Lua REPL behavior).
-    // But skip if it's an assignment (name = ...).
-    let mut lex = super::lex::Lexer::new(line);
-    let tok = lex.next_token();
-    let is_expr_start = matches!(tok, Ok(super::lex::Tok::Name(_, _) | super::lex::Tok::Num(_) | super::lex::Tok::Float(_) | super::lex::Tok::Str(_) | super::lex::Tok::LParen | super::lex::Tok::True | super::lex::Tok::False | super::lex::Tok::Nil | super::lex::Tok::Dot | super::lex::Tok::Minus | super::lex::Tok::Not));
-    if is_expr_start {
-        let mut p = super::parse::Parser::new(line, s);
-        let e = p.parse_expr()?;
-        let after = p.current();
-        if after == super::lex::Tok::Equals || after == super::lex::Tok::Comma {
-            // `x = ...` / `k, v = ...`: an assignment statement, not a bare
-            // expression, so it should not print a result.
-            let stmt = p.parse_assignment_from(e)?;
-            return exec_script(s, stmt).map(|_| ExecResult::Normal);
-        }
-        let n = eval_values(s, e)? as usize;
-        let base = s.vsp as usize - n;
-        let v = if n >= 1 { s.vstack[base] } else { Value::Nil };
-        match v {
-            Value::Exit => {
-                pop_values(s, n);
-                return Ok(ExecResult::Exit);
-            }
-            Value::Shell => {
-                pop_values(s, n);
-                return Ok(ExecResult::Shell);
-            }
-            Value::Dhcp => {
-                let ok = s.run_dhcp()?;
-                if ok {
-                    s.emit_dhcp_info();
-                }
-                tostring(s, Value::Bool(ok))?;
-                emit(s, b'\n');
-                pop_values(s, n);
-                return Ok(ExecResult::Normal);
-            }
-            Value::Ls => {
-                ls_run(s)?;
-                pop_values(s, n);
-                return Ok(ExecResult::Normal);
-            }
-            _ => {
-                if n == 0 {
-                    // A call that returns nothing prints as nil (existing
-                    // behavior; Lua's REPL prints nothing).
-                    tostring(s, Value::Nil)?;
-                } else {
-                    for i in 0..n {
-                        if i > 0 {
-                            emit(s, b'\t');
-                        }
-                        tostring(s, s.vstack[base + i])?;
-                    }
-                }
-                emit(s, b'\n');
-            }
-        }
-        pop_values(s, n);
-        return Ok(ExecResult::Normal);
-    }
-    let first = {
-        let mut p = super::parse::Parser::new(line, s);
-        p.parse_script()?
-    };
-    exec_script(s, first).map(|_| ExecResult::Normal)
-}
-
-/// Run a block with its own fresh scope frame.
-fn exec_block(s: &mut LuaState, first: u16) -> Result<ExecResult, &'static str> {
-    s.push_frame()?;
-    let r = run_chain(s, first);
-    s.pop_frame();
-    r
-}
-
-fn exec_stmt(s: &mut LuaState, n: u16) -> Result<ExecResult, &'static str> {
-    match s.nodes[n as usize] {
-        Node::LocalDecl(first_name, val_node) => {
-            // Name nodes are chained through `next[]`; a call in the value
-            // position can supply any number of values (`local k, v = next(t)`,
-            // `local a, b, c = select(1, x, y, z)`); extra names get nil.
-            let n = eval_values(s, val_node)? as usize;
-            let base = s.vsp as usize - n;
-            let mut name_node = first_name;
-            let mut idx = 0usize;
-            while name_node != NO_NODE {
-                let name = node_name(s, name_node);
-                let v = if idx < n {
-                    s.vstack[base + idx]
-                } else {
-                    Value::Nil
-                };
-                s.declare_local(name, v)?;
-                name_node = s.next[name_node as usize];
-                idx += 1;
-            }
-            pop_values(s, n);
-            Ok(ExecResult::Normal)
-        }
-        Node::GlobalDecl(name_node, val_node) => {
-            let v = if val_node != NO_NODE {
-                eval(s, val_node)?
-            } else {
-                Value::Nil
-            };
-            let name = node_name(s, name_node);
-            s.set_global(name, v);
-            Ok(ExecResult::Normal)
-        }
-        Node::AssignStmt(first_target, v) => {
-            // Targets are chained through `next[]`; all values are computed
-            // before any assignment (`k, v = next(t)`).
-            let n = eval_values(s, v)? as usize;
-            let base = s.vsp as usize - n;
-            let mut target = first_target;
-            let mut idx = 0usize;
-            while target != NO_NODE {
-                let vv = if idx < n {
-                    s.vstack[base + idx]
-                } else {
-                    Value::Nil
-                };
-                assign(s, target, vv)?;
-                target = s.next[target as usize];
-                idx += 1;
-            }
-            pop_values(s, n);
-            Ok(ExecResult::Normal)
-        }
-        Node::CallStmt(e) => {
-            let v = eval(s, e)?;
-            match v {
-                Value::Exit => return Ok(ExecResult::Exit),
-                Value::Shell => return Ok(ExecResult::Shell),
-                Value::Dhcp => {
-                    if s.run_dhcp()? {
-                        s.emit_dhcp_info();
-                    }
-                    return Ok(ExecResult::Normal);
-                }
-                Value::Ls => {
-                    ls_run(s)?;
-                    return Ok(ExecResult::Normal);
-                }
-                _ => {}
-            }
-            Ok(ExecResult::Normal)
-        }
-        Node::ExprStmt(e) => {
-            let v = eval(s, e)?;
-            tostring(s, v)?;
-            emit(s, b'\n');
-            Ok(ExecResult::Normal)
-        }
-        Node::IfStmt(cond, then_b, els) => {
-            let c = eval(s, cond)?;
-            if truthy(c) {
-                exec_block(s, then_b)
-            } else if els != NO_NODE {
-                exec_block(s, els)
-            } else {
-                Ok(ExecResult::Normal)
-            }
-        }
-        Node::WhileStmt(cond, body) => {
-            loop {
-                s.steps += 1;
-                if s.steps > super::MAX_STEPS {
-                    return Err("step limit exceeded");
-                }
-                let c = eval(s, cond)?;
-                if !truthy(c) {
-                    break;
-                }
-                match exec_block(s, body)? {
-                    ExecResult::Normal => {}
-                    ExecResult::Break => break,
-                    r => return Ok(r),
-                }
-            }
-            Ok(ExecResult::Normal)
-        }
-        Node::RepeatStmt(body, cond) => {
-            let mut result = ExecResult::Normal;
-            loop {
-                s.steps += 1;
-                if s.steps > super::MAX_STEPS {
-                    return Err("step limit exceeded");
-                }
-                s.push_frame()?;
-                let r = run_chain(s, body);
-                match r {
-                    Ok(ExecResult::Normal) => {
-                        // Evaluate the condition in the body's scope, so locals
-                        // declared in the body are visible in `until` (Lua).
-                        let c = eval(s, cond);
-                        s.pop_frame();
-                        if truthy(c?) {
-                            break;
-                        }
-                    }
-                    Ok(ExecResult::Break) => {
-                        s.pop_frame();
-                        break;
-                    }
-                    Ok(r2) => {
-                        s.pop_frame();
-                        result = r2;
-                        break;
-                    }
-                    Err(e) => {
-                        s.pop_frame();
-                        return Err(e);
-                    }
-                }
-            }
-            Ok(result)
-        }
-        Node::ForStmt(var, start, limit, step, body) => {
-            let sv = eval(s, start)?;
-            let lv = eval(s, limit)?;
-            let stv = if step != NO_NODE {
-                eval(s, step)?
-            } else {
-                Value::Num(1)
-            };
-            // All-integer bounds keep exact integer iteration; if any bound is
-            // a float the loop runs in floating point (Lua-like).
-            let mut iter = match (sv, lv, stv) {
-                (Value::Num(a), Value::Num(b), Value::Num(c)) => NumIter::Int(a, b, c),
-                (a, b, c) => NumIter::Float(
-                    float_of(a).ok_or("for loop bound must be a number")?,
-                    float_of(b).ok_or("for loop bound must be a number")?,
-                    float_of(c).ok_or("for loop bound must be a number")?,
-                ),
-            };
-            let name = node_name(s, var);
-            s.push_frame()?;
-            let mut result = ExecResult::Normal;
-            loop {
-                s.steps += 1;
-                if s.steps > super::MAX_STEPS {
-                    let e = Err("step limit exceeded");
-                    s.pop_frame();
-                    return e;
-                }
-                let value = match iter {
-                    NumIter::Int(cur, lim, stp) => {
-                        if if stp >= 0 { cur > lim } else { cur < lim } {
-                            break;
-                        }
-                        iter = NumIter::Int(cur.wrapping_add(stp), lim, stp);
-                        Value::Num(cur)
-                    }
-                    NumIter::Float(cur, lim, stp) => {
-                        if if stp >= 0.0 { cur > lim } else { cur < lim } {
-                            break;
-                        }
-                        iter = NumIter::Float(cur + stp, lim, stp);
-                        Value::Float(cur)
-                    }
-                };
-                s.set_local_top(name, value)?;
-                match exec_block(s, body)? {
-                    ExecResult::Normal => {}
-                    ExecResult::Break => break,
-                    r => {
-                        result = r;
-                        break;
-                    }
-                }
-            }
-            s.pop_frame();
-            Ok(result)
-        }
-        Node::ForInStmt(kvar, vvar, table, body) => {
-            // Accepts the bare table form (`for k, v in t`) and the Lua
-            // iterator form (`for k, v in pairs(t)`), where the call yields
-            // `next, t`.
-            let n = eval_values(s, table)? as usize;
-            let base = s.vsp as usize - n;
-            let first = if n >= 1 { s.vstack[base] } else { Value::Nil };
-            let second = if n >= 2 { s.vstack[base + 1] } else { Value::Nil };
-            pop_values(s, n);
-            let tid = match (first, second) {
-                (Value::Table(i), _) => i,
-                (Value::Native(3), Value::Table(i)) => i,
-                _ => return Err("'for in' requires a table or pairs(t)"),
-            };
-            let kname = node_name(s, kvar);
-            let vname = if vvar != NO_NODE {
-                Some(node_name(s, vvar))
-            } else {
-                None
-            };
-            s.push_frame()?;
-            let mut result = ExecResult::Normal;
-            // The length is re-read each iteration and `i` only advances when
-            // the current key is still at `i`, so the body may remove the
-            // current field (`t[k] = nil`) without skipping or re-visiting
-            // entries (Lua allows nil-assigning existing fields while
-            // traversing).
-            let mut i = 0usize;
-            while i < s.tbls[tid as usize].len as usize {
-                s.steps += 1;
-                if s.steps > super::MAX_STEPS {
-                    let e = Err("step limit exceeded");
-                    s.pop_frame();
-                    return e;
-                }
-                let slot = s.tbls[tid as usize].slots[i];
-                s.set_local_top(kname, slot.key)?;
-                if let Some(vn) = vname {
-                    s.set_local_top(vn, slot.value)?;
-                }
-                match exec_block(s, body)? {
-                    ExecResult::Normal => {}
-                    ExecResult::Break => break,
-                    r => {
-                        result = r;
-                        break;
-                    }
-                }
-                if i >= s.tbls[tid as usize].len as usize
-                    || !val_eq(s.tbls[tid as usize].slots[i].key, slot.key)
-                {
-                    // The current key was removed; the next entry shifted in.
-                    continue;
-                }
-                i += 1;
-            }
-            s.pop_frame();
-            Ok(result)
-        }
-        Node::BreakStmt => Ok(ExecResult::Break),
-        Node::Label(_) => Ok(ExecResult::Normal),
-        Node::Goto(t) => Ok(ExecResult::Goto(t)),
-        Node::ReturnStmt(v) => {
-            if v == NO_NODE {
-                return Ok(ExecResult::Ret(Value::Nil));
-            }
-            // `return next(t)` / `return select(...)` forwards every result to
-            // the caller.
-            Ok(ExecResult::RetN(eval_values(s, v)?))
-        }
-        _ => Err("internal error: statement expected"),
-    }
-}
-
-fn node_name(s: &LuaState, node: u16) -> super::StrRef {
+pub(crate) fn node_name(s: &LuaState, node: u16) -> super::StrRef {
     match s.nodes[node as usize] {
         Node::Var(name) => name,
         _ => 0,
     }
 }
 
-/// Evaluate a call node: evaluate the callee and the args (a *final* call
-/// argument expands to its multiple results, matching Lua), then invoke the
-/// function. Returns [`ExecResult::Ret`] / [`ExecResult::Ret2`] for the
-/// results, or [`ExecResult::Normal`] when the function returns nothing.
-fn eval_call(s: &mut LuaState, f: u16, first_arg: u16) -> Result<ExecResult, &'static str> {
-    let fv = eval(s, f)?;
-    let mut argc: u8 = 0;
-    let mut n = first_arg;
-    while n != NO_NODE {
-        let is_last = s.next[n as usize] == NO_NODE;
-        let vnode = match s.nodes[n as usize] {
-            Node::Arg(v) => v,
-            _ => return Err("internal error: expected argument"),
-        };
-        if is_last {
-            // A final call argument expands; `eval_values` pushes its results
-            // directly onto our argument stack.
-            argc += eval_values(s, vnode)?;
-        } else {
-            let v = eval(s, vnode)?;
-            s.push_val(v)?;
-            argc += 1;
-        }
-        if argc >= 32 {
-            return Err("too many arguments");
-        }
-        n = s.next[n as usize];
-    }
-    call(s, fv, argc)
-}
-
-/// Evaluate an expression in a multiple-value context: push its results onto
-/// the value stack and return the count. A call may yield any number of values
-/// (`select`, `next`, `pairs`); anything else yields one.
-fn eval_values(s: &mut LuaState, n: u16) -> Result<u8, &'static str> {
-    if let Node::Call(f, first_arg) = s.nodes[n as usize] {
-        return match eval_call(s, f, first_arg)? {
-            ExecResult::Normal => Ok(0),
-            ExecResult::Ret(v) => {
-                s.push_val(v)?;
-                Ok(1)
-            }
-            ExecResult::Ret2(a, b) => {
-                s.push_val(a)?;
-                s.push_val(b)?;
-                Ok(2)
-            }
-            // The results are already on the stack.
-            ExecResult::RetN(cnt) => Ok(cnt),
-            ExecResult::Break => Err("break outside loop"),
-            ExecResult::Goto(_) => Err("goto outside function"),
-            ExecResult::Shell => {
-                s.push_val(Value::Shell)?;
-                Ok(1)
-            }
-            ExecResult::Exit => {
-                s.push_val(Value::Exit)?;
-                Ok(1)
-            }
-        };
-    }
-    let v = eval(s, n)?;
-    s.push_val(v)?;
-    Ok(1)
-}
-
-/// Pop `count` values that [`eval_values`] left on the stack.
-fn pop_values(s: &mut LuaState, count: usize) {
-    s.vsp -= count as u32;
-}
-
-/// Evaluate an expression node.
-fn eval(s: &mut LuaState, n: u16) -> Result<Value, &'static str> {
-    match s.nodes[n as usize] {
-        Node::Empty | Node::Nil => Ok(Value::Nil),
-        Node::True => Ok(Value::Bool(true)),
-        Node::False => Ok(Value::Bool(false)),
-        Node::Num(v) => Ok(Value::Num(v)),
-        Node::Float(v) => Ok(Value::Float(v)),
-        Node::Str(r) => Ok(Value::Str(r)),
-        Node::Var(name) => s.lookup(name).ok_or("undefined variable"),
-        Node::Bin(op, l, r) => {
-            if op == Op::And {
-                let lv = eval(s, l)?;
-                return if truthy(lv) { eval(s, r) } else { Ok(lv) };
-            }
-            if op == Op::Or {
-                let lv = eval(s, l)?;
-                return if truthy(lv) { Ok(lv) } else { eval(s, r) };
-            }
-            let lv = eval(s, l)?;
-            let rv = eval(s, r)?;
-            binop(s, op, lv, rv)
-        }
-        Node::Un(Op::Not, x) => {
-            let v = eval(s, x)?;
-            Ok(Value::Bool(!truthy(v)))
-        }
-        Node::Un(Op::Neg, x) => match eval(s, x)? {
-            Value::Num(v) => Ok(Value::Num(v.wrapping_neg())),
-            Value::Float(v) => Ok(Value::Float(-v)),
-            _ => Err("attempt to perform arithmetic on a non-number value"),
-        },
-        Node::Index(base, key) => {
-            let b = eval(s, base)?;
-            let k = eval(s, key)?;
-            tget(s, b, k)
-        }
-        Node::Call(f, first_arg) => match eval_call(s, f, first_arg)? {
-            ExecResult::Normal => Ok(Value::Nil),
-            ExecResult::Ret(v) => Ok(v),
-            // Single-value context: keep the first result.
-            ExecResult::Ret2(a, _) => Ok(a),
-            ExecResult::RetN(n) => {
-                let v = if n == 0 {
-                    Value::Nil
-                } else {
-                    s.vstack[s.vsp as usize - n as usize]
-                };
-                s.vsp -= n as u32;
-                Ok(v)
-            }
-            ExecResult::Break => Err("break outside loop"),
-            ExecResult::Goto(_) => Err("goto outside function"),
-            ExecResult::Shell => Ok(Value::Shell),
-            ExecResult::Exit => Ok(Value::Exit),
-        },
-        Node::FuncLit(i) => Ok(Value::Func(i)),
-        Node::TableLit(first_field) => {
-            let tid = new_table(s)?;
-            let mut n = first_field;
-            while n != NO_NODE {
-                let (k, v) = match s.nodes[n as usize] {
-                    Node::Field(k, v) => (k, v),
-                    _ => return Err("internal error: expected field"),
-                };
-                let kv = eval(s, k)?;
-                let vv = eval(s, v)?;
-                tset(s, Value::Table(tid), kv, vv)?;
-                n = s.next[n as usize];
-            }
-            Ok(Value::Table(tid))
-        }
-        _ => Err("internal error: expression expected"),
-    }
-}
-
 /// Call a function value with `argc` args on the value stack.
-fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static str> {
+pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, LuaError> {
     if argc as usize > s.vsp as usize {
-        return Err("internal error: arg stack underflow");
+        return Err("internal error: arg stack underflow".into());
     }
     let base = s.vsp as usize - argc as usize;
 
@@ -759,14 +186,14 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             // failed. `dest` is the local name the file is saved/recorded under
             // (shown by `ls`); it defaults to the source name.
             if argc != 1 && argc != 2 {
-                return Err("fetch expects 1 or 2 arguments");
+                return Err("fetch expects 1 or 2 arguments".into());
             }
             match argbuf[0] {
                 Value::Str(r) => {
                     let mut nbuf = [0u8; 128];
                     let bytes = s.str_bytes(r);
                     if bytes.len() >= 128 {
-                        return Err("fetch filename too long");
+                        return Err("fetch filename too long".into());
                     }
                     nbuf[..bytes.len()].copy_from_slice(bytes);
                     let name = core::str::from_utf8(&nbuf[..bytes.len()])
@@ -778,14 +205,14 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                             Value::Str(dr) => {
                                 let dbytes = s.str_bytes(dr);
                                 if dbytes.len() >= 128 {
-                                    return Err("fetch dest too long");
+                                    return Err("fetch dest too long".into());
                                 }
                                 dbuf[..dbytes.len()].copy_from_slice(dbytes);
                                 let n = core::str::from_utf8(&dbuf[..dbytes.len()])
                                     .map_err(|_| "fetch dest must be ASCII")?;
                                 (dr, n)
                             }
-                            _ => return Err("fetch dest must be a string"),
+                            _ => return Err("fetch dest must be a string".into()),
                         }
                     } else {
                         (r, name)
@@ -800,31 +227,31 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                             }
                             None => ExecResult::Ret(Value::Nil),
                         },
-                        None => return Err("fetch not available (no TFTP server)"),
+                        None => return Err("fetch not available (no TFTP server)".into()),
                     }
                 }
-                _ => return Err("fetch expects a string filename"),
+                _ => return Err("fetch expects a string filename".into()),
             }
         }
         Value::Native(2) => {
             // dofile(filename): load, parse, and execute a Lua chunk, returning
             // the chunk's return value (or nil). Errors propagate to the caller.
             if argc != 1 {
-                return Err("dofile expects 1 argument");
+                return Err("dofile expects 1 argument".into());
             }
             match argbuf[0] {
                 Value::Str(r) => {
                     let bytes = s.str_bytes(r);
                     if bytes.len() >= 128 {
-                        return Err("dofile filename too long");
+                        return Err("dofile filename too long".into());
                     }
                     let mut nbuf = [0u8; 128];
                     nbuf[..bytes.len()].copy_from_slice(bytes);
                     let name = core::str::from_utf8(&nbuf[..bytes.len()])
                         .map_err(|_| "dofile filename must be ASCII")?;
-                    ExecResult::Ret(dofile_exec(s, name)?)
+                    ExecResult::Ret(crate::vm::exec_chunk(s, name)?)
                 }
-                _ => return Err("dofile expects a string filename"),
+                _ => return Err("dofile expects a string filename".into()),
             }
         }
         Value::Native(3) => {
@@ -832,11 +259,11 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             // Absent/nil index starts the traversal. An index that is not a
             // key of the table is an error (Lua: "invalid key to 'next'").
             if argc != 1 && argc != 2 {
-                return Err("next expects 1 or 2 arguments");
+                return Err("next expects 1 or 2 arguments".into());
             }
             let tid = match argbuf[0] {
                 Value::Table(i) => i,
-                _ => return Err("next expects a table"),
+                _ => return Err("next expects a table".into()),
             };
             let len = s.tbls[tid as usize].len as usize;
             let start = if argc == 1 || matches!(argbuf[1], Value::Nil) {
@@ -852,7 +279,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 }
                 match found {
                     Some(i) => i,
-                    None => return Err("invalid key to 'next'"),
+                    None => return Err("invalid key to 'next'".into()),
                 }
             };
             if start >= len {
@@ -863,51 +290,56 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
         }
         Value::Native(4) => {
-            // pairs(t) -> next, t. Metamethods are not dispatched in this
-            // subset (no __pairs), and Lua's third result is nil, so two values
-            // suffice:
-            // `for k, v in pairs(t)` iterates t and `local f, s, c = pairs(t)`
-            // still leaves c == nil.
+            // pairs(t) -> next, t (Lua's third result is nil, so two values
+            // suffice). A `__pairs` metamethod is dispatched: it is called
+            // with `t` and all of its results are returned.
             if argc != 1 {
-                return Err("pairs expects 1 argument");
+                return Err("pairs expects 1 argument".into());
             }
-            match argbuf[0] {
-                Value::Table(i) => ExecResult::Ret2(Value::Native(3), Value::Table(i)),
-                _ => return Err("pairs expects a table"),
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("pairs expects a table".into()),
+            };
+            let h = mt_lookup(s, tid, MM_PAIRS)?;
+            if !matches!(h, Value::Nil) {
+                s.push_val(argbuf[0])?;
+                enter_mm(s)?;
+                let r = crate::vm::call_value(s, h, 1);
+                leave_mm(s);
+                r?
+            } else {
+                ExecResult::Ret2(Value::Native(3), Value::Table(tid))
             }
         }
         Value::Native(5) => {
-            // rawequal(v1, v2): primitive equality, without metamethods. This
-            // subset does not dispatch metamethods, so `==` and `rawequal` agree.
+            // rawequal(v1, v2): primitive equality, never the __eq metamethod.
             if argc != 2 {
-                return Err("rawequal expects 2 arguments");
+                return Err("rawequal expects 2 arguments".into());
             }
             ExecResult::Ret(Value::Bool(val_eq(argbuf[0], argbuf[1])))
         }
         Value::Native(6) => {
-            // rawget(table, index): the real `table[index]`, without `__index`.
-            // This subset does not dispatch metamethods, so it agrees with `table[index]`.
+            // rawget(table, index): the real `table[index]`, never `__index`.
             if argc != 2 {
-                return Err("rawget expects 2 arguments");
+                return Err("rawget expects 2 arguments".into());
             }
             match argbuf[0] {
-                Value::Table(_) => ExecResult::Ret(tget(s, argbuf[0], argbuf[1])?),
-                _ => return Err("rawget expects a table"),
+                Value::Table(tid) => ExecResult::Ret(raw_get(s, tid, argbuf[1])),
+                _ => return Err("rawget expects a table".into()),
             }
         }
         Value::Native(7) => {
-            // rawlen(v): length of a table or string, without `__len`. Metamethods
-            // are not dispatched, so this is the plain length. A table's length
+            // rawlen(v): length of a table or string, never `__len`. A table's length
             // is the run of consecutive integer keys starting at 1.
             if argc != 1 {
-                return Err("rawlen expects 1 argument");
+                return Err("rawlen expects 1 argument".into());
             }
             let len = match argbuf[0] {
                 Value::Str(r) => s.str_bytes(r).len(),
-                Value::Table(_) => {
+                Value::Table(tid) => {
                     let mut n = 0usize;
                     loop {
-                        let next = tget(s, argbuf[0], Value::Num((n + 1) as i64))?;
+                        let next = raw_get(s, tid, Value::Num((n + 1) as i64));
                         if matches!(next, Value::Nil) {
                             break;
                         }
@@ -918,22 +350,21 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                     }
                     n
                 }
-                _ => return Err("rawlen expects a table or a string"),
+                _ => return Err("rawlen expects a table or a string".into()),
             };
             ExecResult::Ret(Value::Num(len as i64))
         }
         Value::Native(8) => {
-            // rawset(table, index, value): the real assignment without
-            // `__newindex` (metamethods are not dispatched, so it agrees with
-            // `t[k] = v`).
+            // rawset(table, index, value): the real assignment, never `__newindex`.
             // Returns the table.
             if argc != 3 {
-                return Err("rawset expects 3 arguments");
+                return Err("rawset expects 3 arguments".into());
             }
-            if !matches!(argbuf[0], Value::Table(_)) {
-                return Err("rawset expects a table");
-            }
-            tset(s, argbuf[0], argbuf[1], argbuf[2])?;
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("rawset expects a table".into()),
+            };
+            raw_set(s, tid, argbuf[1], argbuf[2])?;
             ExecResult::Ret(argbuf[0])
         }
         Value::Native(9) => {
@@ -941,7 +372,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             // a number returns the arguments after position `index` (-1 is the
             // last argument).
             if argc < 1 {
-                return Err("select expects at least 1 argument");
+                return Err("select expects at least 1 argument".into());
             }
             let extras = argc as usize - 1;
             match argbuf[0] {
@@ -950,7 +381,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                     let mut i = match k {
                         Value::Num(n) => n,
                         Value::Float(f) if f.is_finite() && f == float_floor(f) => f as i64,
-                        _ => return Err("select index must be an integer"),
+                        _ => return Err("select index must be an integer".into()),
                     };
                     let total = argc as i64;
                     if i < 0 {
@@ -959,7 +390,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                         i = total;
                     }
                     if i < 1 {
-                        return Err("select index out of range");
+                        return Err("select index out of range".into());
                     }
                     let start = i as usize;
                     for j in start..argc as usize {
@@ -972,25 +403,24 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
         Value::Native(10) => {
             // setmetatable(table, metatable|nil): stores (`nil` removes) the
             // metatable and returns the table. A metatable whose `__metatable`
-            // field is not nil is protected and cannot be changed. This subset
-            // stores metatables but does not dispatch metamethods.
+            // field is not nil is protected and cannot be changed.
             if argc != 2 {
-                return Err("setmetatable expects 2 arguments");
+                return Err("setmetatable expects 2 arguments".into());
             }
             let tid = match argbuf[0] {
                 Value::Table(i) => i,
-                _ => return Err("setmetatable expects a table"),
+                _ => return Err("setmetatable expects a table".into()),
             };
             let new_mt = match argbuf[1] {
                 Value::Nil => None,
                 Value::Table(i) => Some(i),
-                _ => return Err("setmetatable expects a table or nil"),
+                _ => return Err("setmetatable expects a table or nil".into()),
             };
             if let Some(cur) = s.tbls[tid as usize].mt {
                 let protected_name = s.intern(b"__metatable")?;
-                let protected = tget(s, Value::Table(cur), Value::Str(protected_name))?;
+                let protected = raw_get(s, cur, Value::Str(protected_name));
                 if !matches!(protected, Value::Nil) {
-                    return Err("cannot change a protected metatable");
+                    return Err("cannot change a protected metatable".into());
                 }
             }
             s.tbls[tid as usize].mt = new_mt;
@@ -1001,7 +431,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             // a base (2..36) the first argument must be a string and the
             // result is an integer (or nil).
             if argc < 1 || argc > 2 {
-                return Err("tonumber expects 1 or 2 arguments");
+                return Err("tonumber expects 1 or 2 arguments".into());
             }
             if argc == 1 || matches!(argbuf[1], Value::Nil) {
                 let v = match argbuf[0] {
@@ -1014,14 +444,14 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
                 let base = match argbuf[1] {
                     Value::Num(n) => n,
                     Value::Float(f) if f.is_finite() && f == float_floor(f) => f as i64,
-                    _ => return Err("tonumber base must be an integer"),
+                    _ => return Err("tonumber base must be an integer".into()),
                 };
                 if !(2..=36).contains(&base) {
-                    return Err("tonumber base out of range");
+                    return Err("tonumber base out of range".into());
                 }
                 let r = match argbuf[0] {
                     Value::Str(r) => r,
-                    _ => return Err("tonumber expects a string with a base"),
+                    _ => return Err("tonumber expects a string with a base".into()),
                 };
                 ExecResult::Ret(match str_to_base(s.str_bytes(r), base) {
                     Some(n) => Value::Num(n),
@@ -1031,10 +461,9 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
         }
         Value::Native(12) => {
             // tostring(v): the human-readable string form (the same rendering
-            // `print` uses). Metamethods are not dispatched, so a `__tostring`
-            // field is not consulted.
+            // `print` uses). A table's `__tostring` metamethod is dispatched.
             if argc != 1 {
-                return Err("tostring expects 1 argument");
+                return Err("tostring expects 1 argument".into());
             }
             ExecResult::Ret(Value::Str(value_to_string(s, argbuf[0])?))
         }
@@ -1042,7 +471,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             // type(v): the Lua type name of a value. Every callable value
             // (including native builtins) reports "function".
             if argc != 1 {
-                return Err("type expects 1 argument");
+                return Err("type expects 1 argument".into());
             }
             ExecResult::Ret(Value::Str(s.intern(type_name(argbuf[0]))?))
         }
@@ -1053,7 +482,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             // form can be a control message (Lua concatenates first, but the
             // multi-argument spelling of a control message is pathological).
             if argc == 0 {
-                return Err("warn expects at least 1 argument");
+                return Err("warn expects at least 1 argument".into());
             }
             let mut control = false;
             if argc == 1 {
@@ -1071,7 +500,7 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             for i in 0..argc as usize {
                 match argbuf[i] {
                     Value::Str(_) | Value::Num(_) | Value::Float(_) => {}
-                    _ => return Err("warn expects string arguments"),
+                    _ => return Err("warn expects string arguments".into()),
                 }
             }
             if !control && s.warn_on {
@@ -1083,21 +512,197 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
             }
             ExecResult::Normal
         }
+        Value::Native(15) => {
+            // pcall(f, ...): protected call. Returns true plus the results on
+            // success, or false plus the error object (or the interned error
+            // message) on failure. `Shell`/`Exit` are control flow, not
+            // errors, so they propagate to the REPL.
+            if argc < 1 {
+                return Err("pcall expects at least 1 argument".into());
+            }
+            let saved_vsp = base;
+            let saved_fsp = s.fsp;
+            let saved_marks = s.mark_sp;
+            match call(s, argbuf[0], argc - 1) {
+                Ok(ExecResult::Normal) => ExecResult::Ret(Value::Bool(true)),
+                Ok(ExecResult::Ret(v)) => ExecResult::Ret2(Value::Bool(true), v),
+                Ok(ExecResult::Ret2(a, b)) => {
+                    // Three results: push true,a,b then rotate it to the front.
+                    s.push_val(a)?;
+                    s.push_val(b)?;
+                    s.push_val(Value::Bool(true))?;
+                    let top = s.vsp as usize;
+                    let start = top - 3;
+                    let t = s.vstack[top - 1];
+                    for j in (start + 1..top).rev() {
+                        s.vstack[j] = s.vstack[j - 1];
+                    }
+                    s.vstack[start] = t;
+                    ExecResult::RetN(3)
+                }
+                Ok(ExecResult::RetN(n)) => {
+                    // Results are on the stack; insert `true` before them.
+                    s.push_val(Value::Bool(true))?;
+                    let top = s.vsp as usize;
+                    let start = top - (n as usize + 1);
+                    let t = s.vstack[top - 1];
+                    for j in (start + 1..top).rev() {
+                        s.vstack[j] = s.vstack[j - 1];
+                    }
+                    s.vstack[start] = t;
+                    ExecResult::RetN(n + 1)
+                }
+                Ok(ExecResult::Shell) => ExecResult::Shell,
+                Ok(ExecResult::Exit) => ExecResult::Exit,
+                // Yielding across `pcall` is not supported (Lua 5.1 also
+                // rejects it): the protected call unwinds, so the resume
+                // continuation would be lost.
+                Ok(ExecResult::Yield(_)) => {
+                    return Err("attempt to yield across a protected call".into())
+                }
+                Ok(ExecResult::Break) => return Err("break outside loop".into()),
+                Ok(ExecResult::Goto(_)) => return Err("goto outside function".into()),
+                Err(e) => {
+                    // Unwind to the marks saved before the call: the failed
+                    // call may have left frames/values behind.
+                    s.vsp = saved_vsp as u32;
+                    s.fsp = saved_fsp;
+                    s.mark_sp = saved_marks;
+                    let msg = match e {
+                        LuaError::Obj(v) => v,
+                        LuaError::Msg(m) => Value::Str(s.intern(m.as_bytes())?),
+                    };
+                    ExecResult::Ret2(Value::Bool(false), msg)
+                }
+            }
+        }
+        Value::Native(16) => {
+            // error(v [, level]): raise `v` as an error object. `level` is
+            // validated but ignored — this interpreter has no source
+            // positions to attach. With no arguments the error object is nil
+            // (matching Lua).
+            if argc > 2 {
+                return Err("error expects at most 2 arguments".into());
+            }
+            if argc == 2 {
+                match argbuf[1] {
+                    Value::Num(_) => {}
+                    Value::Float(f) if f.is_finite() && f == float_floor(f) => {}
+                    _ => return Err("error level must be an integer".into()),
+                }
+            }
+            let obj = if argc >= 1 { argbuf[0] } else { Value::Nil };
+            return Err(LuaError::Obj(obj));
+        }
+        Value::Native(17) => {
+            // coroutine.create(f) -> thread.
+            if argc != 1 {
+                return Err("coroutine.create expects 1 argument".into());
+            }
+            ExecResult::Ret(crate::vm::co_create(s, argbuf[0])?)
+        }
+        Value::Native(18) => {
+            // coroutine.resume(co, ...) -> true + results / false + error.
+            if argc < 1 {
+                return Err("coroutine.resume expects at least 1 argument".into());
+            }
+            let id = match argbuf[0] {
+                Value::Co(i) => i,
+                _ => return Err("coroutine.resume expects a coroutine".into()),
+            };
+            crate::vm::co_resume_value(s, id, argc - 1)?
+        }
+        Value::Native(19) => {
+            // coroutine.yield(...): suspend the running coroutine.
+            if s.current == 0 {
+                return Err("attempt to yield from outside a coroutine".into());
+            }
+            for i in 0..argc as usize {
+                s.push_val(argbuf[i])?;
+            }
+            ExecResult::Yield(argc)
+        }
+        Value::Native(20) => {
+            // coroutine.status(co) -> "suspended" | "running" | "normal" | "dead".
+            if argc != 1 {
+                return Err("coroutine.status expects 1 argument".into());
+            }
+            let id = match argbuf[0] {
+                Value::Co(i) => i,
+                _ => return Err("coroutine.status expects a coroutine".into()),
+            };
+            let name: &[u8] = match s.cos[id as usize].status {
+                crate::CO_SUSPENDED => b"suspended",
+                crate::CO_RUNNING => b"running",
+                crate::CO_NORMAL => b"normal",
+                _ => b"dead",
+            };
+            ExecResult::Ret(Value::Str(s.intern(name)?))
+        }
+        Value::Native(21) => {
+            // coroutine.wrap(co) -> a function that resumes it and re-raises
+            // errors.
+            if argc != 1 {
+                return Err("coroutine.wrap expects 1 argument".into());
+            }
+            match argbuf[0] {
+                Value::Co(i) => ExecResult::Ret(Value::Wrapped(i)),
+                _ => return Err("coroutine.wrap expects a coroutine".into()),
+            }
+        }
+        Value::Native(22) => {
+            // coroutine.isyieldable() -> whether the running thread is a
+            // coroutine.
+            if argc != 0 {
+                return Err("coroutine.isyieldable expects no arguments".into());
+            }
+            ExecResult::Ret(Value::Bool(s.current != 0))
+        }
+        Value::Native(23) => {
+            // coroutine.running() -> thread [, is_main]; main has no thread
+            // value in this subset, so it reports nil, true.
+            if argc != 0 {
+                return Err("coroutine.running expects no arguments".into());
+            }
+            if s.current == 0 {
+                ExecResult::Ret2(Value::Nil, Value::Bool(true))
+            } else {
+                ExecResult::Ret2(Value::Co(s.current - 1), Value::Bool(false))
+            }
+        }
+        Value::Native(24) => {
+            // coroutine.close(co): mark a suspended/dead coroutine dead.
+            if argc != 1 {
+                return Err("coroutine.close expects 1 argument".into());
+            }
+            let id = match argbuf[0] {
+                Value::Co(i) => i,
+                _ => return Err("coroutine.close expects a coroutine".into()),
+            };
+            match s.cos[id as usize].status {
+                crate::CO_DEAD => ExecResult::Ret(Value::Bool(true)),
+                crate::CO_SUSPENDED => {
+                    s.cos[id as usize].status = crate::CO_DEAD;
+                    ExecResult::Ret(Value::Bool(true))
+                }
+                _ => return Err("cannot close a running coroutine".into()),
+            }
+        }
         Value::Shell => {
             if argc != 0 {
-                return Err("shell expects no arguments");
+                return Err("shell expects no arguments".into());
             }
             ExecResult::Shell
         }
         Value::Exit => {
             if argc != 0 {
-                return Err("exit expects no arguments");
+                return Err("exit expects no arguments".into());
             }
             ExecResult::Exit
         }
         Value::Dhcp => {
             if argc != 0 {
-                return Err("dhcp expects no arguments");
+                return Err("dhcp expects no arguments".into());
             }
             let ok = s.run_dhcp()?;
             if ok {
@@ -1107,38 +712,48 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
         }
         Value::Ls => {
             if argc != 0 {
-                return Err("ls expects no arguments");
+                return Err("ls expects no arguments".into());
             }
             ls_run(s)?;
             ExecResult::Normal
         }
-        Value::Func(idx) => {
-            let fd = s.funcs[idx as usize];
-            s.push_frame()?;
-            for p in 0..fd.nparams as usize {
-                let name = node_name(s, fd.params + p as u16);
-                let val = if p < argc as usize { argbuf[p] } else { Value::Nil };
-                s.declare_local(name, val)?;
-            }
-            let r = run_chain(s, fd.body);
-            s.pop_frame();
-            match r {
-                Ok(ExecResult::Normal) => ExecResult::Normal,
-                Ok(ExecResult::Ret(v)) => ExecResult::Ret(v),
-                Ok(ExecResult::Ret2(a, b)) => ExecResult::Ret2(a, b),
-                Ok(ExecResult::RetN(n)) => ExecResult::RetN(n),
-                Ok(ExecResult::Break) => return Err("break outside loop"),
-                Ok(ExecResult::Goto(_)) => return Err("goto outside function"),
-                Ok(ExecResult::Shell) => ExecResult::Shell,
-                Ok(ExecResult::Exit) => ExecResult::Exit,
-                Err(e) => return Err(e),
-            }
+        Value::Func(_) => {
+            // User functions are executed by the VM (a nested run, used by
+            // `pcall`; the VM's own Call instruction runs them inline). Fall
+            // through so the result's stack layout is normalized below.
+            crate::vm::call_value(s, fv, argc)?
         }
-        _ => return Err("attempt to call a non-function value"),
+        Value::Wrapped(id) => {
+            // Calling a wrapped coroutine resumes it and re-raises errors.
+            crate::vm::co_wrap_call(s, id, argc)?
+        }
+        Value::Co(_) => return Err("attempt to call a thread value".into()),
+        _ => {
+            // Callable tables: `__call` receives the table as its first
+            // argument.
+            let h = mm_of(s, fv, MM_CALL)?;
+            if matches!(h, Value::Nil) {
+                return Err("attempt to call a non-function value".into());
+            }
+            if argc >= 32 {
+                return Err("too many arguments".into());
+            }
+            // [args...] -> [table, args...].
+            for i in (0..argc as usize).rev() {
+                s.vstack[base + 1 + i] = s.vstack[base + i];
+            }
+            s.vstack[base] = fv;
+            s.vsp += 1;
+            enter_mm(s)?;
+            let r = call(s, h, argc + 1);
+            leave_mm(s);
+            return r;
+        }
     };
 
     match result {
-        ExecResult::RetN(n) => {
+        // `Yield(n)` carries its n values on the stack, like `RetN`.
+        ExecResult::RetN(n) | ExecResult::Yield(n) => {
             // Move the n results down over the call's arguments; they stay on
             // the stack for the caller to consume.
             let src = s.vsp as usize - n as usize;
@@ -1152,54 +767,9 @@ fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, &'static st
     Ok(result)
 }
 
-/// `dofile(name)`: load a Lua chunk via the host `load` callback, parse it in
-/// the current state, and run it in a fresh frame. Returns the chunk's return
-/// value (`nil` if it doesn't return). The chunk shares globals with its
-/// caller but has its own locals; errors propagate to the caller.
-fn dofile_exec(s: &mut LuaState, name: &str) -> Result<Value, &'static str> {
-    let load = s.load;
-    let mut buf = [0u8; super::DOFILE_CAP];
-    let n = match load {
-        Some(f) => f(name, &mut buf),
-        None => return Err("dofile not available (no file loader)"),
-    };
-    let n = n.ok_or("cannot open file")?;
-    if n > buf.len() {
-        return Err("file too large");
-    }
-    let src = &buf[..n];
-    let first = {
-        let mut p = super::parse::Parser::new(src, s);
-        p.parse_script()?
-    };
-    s.push_frame()?;
-    let r = run_chain(s, first);
-    s.pop_frame();
-    match r {
-        Ok(ExecResult::Normal) => Ok(Value::Nil),
-        Ok(ExecResult::Ret(v)) => Ok(v),
-        // Single-value context: keep the first result.
-        Ok(ExecResult::Ret2(a, _)) => Ok(a),
-        Ok(ExecResult::RetN(n)) => {
-            let v = if n == 0 {
-                Value::Nil
-            } else {
-                s.vstack[s.vsp as usize - n as usize]
-            };
-            s.vsp -= n as u32;
-            Ok(v)
-        }
-        Ok(ExecResult::Break) => Err("break outside loop"),
-        Ok(ExecResult::Goto(_)) => Err("unknown label"),
-        Ok(ExecResult::Shell) => Ok(Value::Shell),
-        Ok(ExecResult::Exit) => Ok(Value::Exit),
-        Err(e) => Err(e),
-    }
-}
-
 /// `ls`: print every file downloaded with `fetch()` this run/session, one per
 /// line as `name (N bytes)`. Prints nothing when no files have been fetched.
-fn ls_run(s: &mut LuaState) -> Result<(), &'static str> {
+pub(crate) fn ls_run(s: &mut LuaState) -> Result<(), LuaError> {
     for i in 0..s.fetched_n as usize {
         emit_bytes(s, s.str_bytes(s.fetched_names[i]));
         emit(s, b' ');
@@ -1211,28 +781,245 @@ fn ls_run(s: &mut LuaState) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn assign(s: &mut LuaState, target: u16, v: Value) -> Result<(), &'static str> {
-    match s.nodes[target as usize] {
-        Node::Var(name) => {
-            if !s.assign_local(name, v) {
-                s.set_global(name, v);
-            }
-            Ok(())
-        }
-        Node::Index(base, key) => {
-            let b = eval(s, base)?;
-            let k = eval(s, key)?;
-            tset(s, b, k, v)
-        }
-        _ => Err("invalid assignment target"),
-    }
-}
-
-fn truthy(v: Value) -> bool {
+pub(crate) fn truthy(v: Value) -> bool {
     !matches!(v, Value::Nil | Value::Bool(false))
 }
 
-fn val_eq(a: Value, b: Value) -> bool {
+// ── Metamethods ─────────────────────────────────────────────────────────────
+
+/// Metamethod name indices, parallel to `MM_NAMES`.
+pub(crate) const MM_INDEX: usize = 0;
+pub(crate) const MM_NEWINDEX: usize = 1;
+pub(crate) const MM_EQ: usize = 2;
+pub(crate) const MM_LT: usize = 3;
+pub(crate) const MM_LE: usize = 4;
+pub(crate) const MM_CONCAT: usize = 5;
+pub(crate) const MM_ADD: usize = 6;
+pub(crate) const MM_SUB: usize = 7;
+pub(crate) const MM_MUL: usize = 8;
+pub(crate) const MM_DIV: usize = 9;
+pub(crate) const MM_MOD: usize = 10;
+pub(crate) const MM_UNM: usize = 11;
+pub(crate) const MM_CALL: usize = 12;
+pub(crate) const MM_TOSTRING: usize = 13;
+pub(crate) const MM_PAIRS: usize = 14;
+
+const MM_NAMES: [&[u8]; super::MM_COUNT] = [
+    b"__index",
+    b"__newindex",
+    b"__eq",
+    b"__lt",
+    b"__le",
+    b"__concat",
+    b"__add",
+    b"__sub",
+    b"__mul",
+    b"__div",
+    b"__mod",
+    b"__unm",
+    b"__call",
+    b"__tostring",
+    b"__pairs",
+];
+
+/// Maximum metamethod dispatch nesting before a loop error is raised.
+const MAX_MM_DEPTH: u16 = 100;
+
+/// Intern the metamethod names (once per `reset`) and return the `i`-th.
+fn mm_name(s: &mut LuaState, i: usize) -> Result<super::StrRef, LuaError> {
+    if !s.mm_ready {
+        for (j, n) in MM_NAMES.iter().enumerate() {
+            let r = s.intern(n)?;
+            s.mm_refs[j] = r;
+        }
+        s.mm_ready = true;
+    }
+    Ok(s.mm_refs[i])
+}
+
+/// Raw slot lookup: no metamethods.
+pub(crate) fn raw_get(s: &LuaState, tid: u16, k: Value) -> Value {
+    let rec = &s.tbls[tid as usize];
+    for i in 0..rec.len as usize {
+        if val_eq(rec.slots[i].key, k) {
+            return rec.slots[i].value;
+        }
+    }
+    Value::Nil
+}
+
+/// Whether the key is present in the table (raw).
+fn raw_has(s: &LuaState, tid: u16, k: Value) -> bool {
+    let rec = &s.tbls[tid as usize];
+    for i in 0..rec.len as usize {
+        if val_eq(rec.slots[i].key, k) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Raw slot write (update, remove-on-nil, or append): no metamethods.
+pub(crate) fn raw_set(s: &mut LuaState, tid: u16, k: Value, v: Value) -> Result<(), LuaError> {
+    // Lua: a nil or NaN key can never be assigned (reading is fine).
+    if matches!(k, Value::Nil) {
+        return Err("table index is nil".into());
+    }
+    if matches!(k, Value::Float(f) if f.is_nan()) {
+        return Err("table index is NaN".into());
+    }
+    let nil = matches!(v, Value::Nil);
+    let len = s.tbls[tid as usize].len as usize;
+    for i in 0..len {
+        if val_eq(s.tbls[tid as usize].slots[i].key, k) {
+            if nil {
+                // Lua: assigning nil removes the field (so `next` never sees
+                // it again). Shift the remaining slots down to keep them
+                // contiguous for iteration.
+                for j in i..len - 1 {
+                    s.tbls[tid as usize].slots[j] = s.tbls[tid as usize].slots[j + 1];
+                }
+                s.tbls[tid as usize].len -= 1;
+            } else {
+                s.tbls[tid as usize].slots[i].value = v;
+            }
+            return Ok(());
+        }
+    }
+    if nil {
+        // Assigning nil to a non-existent field is a no-op.
+        return Ok(());
+    }
+    if len >= super::TABLE_SLOTS {
+        return Err("table full".into());
+    }
+    s.tbls[tid as usize].slots[len] = super::TableSlot { key: k, value: v };
+    s.tbls[tid as usize].len += 1;
+    Ok(())
+}
+
+/// The value of the `i`-th metamethod in `tid`'s metatable, or `nil`.
+pub(crate) fn mt_lookup(s: &mut LuaState, tid: u16, i: usize) -> Result<Value, LuaError> {
+    let mt = match s.tbls[tid as usize].mt {
+        Some(m) => m,
+        None => return Ok(Value::Nil),
+    };
+    let name = mm_name(s, i)?;
+    Ok(raw_get(s, mt, Value::Str(name)))
+}
+
+/// The `i`-th metamethod of `v` (only tables can have metatables here).
+pub(crate) fn mm_of(s: &mut LuaState, v: Value, i: usize) -> Result<Value, LuaError> {
+    match v {
+        Value::Table(tid) => mt_lookup(s, tid, i),
+        _ => Ok(Value::Nil),
+    }
+}
+
+/// Call a metamethod with `args`, returning its first result.
+pub(crate) fn call_mm(s: &mut LuaState, f: Value, args: &[Value]) -> Result<Value, LuaError> {
+    if args.len() > 32 {
+        return Err("too many arguments".into());
+    }
+    let base = s.vsp as usize;
+    for a in args {
+        s.push_val(*a)?;
+    }
+    let r = crate::vm::call_value(s, f, args.len() as u8)?;
+    match r {
+        ExecResult::Normal => {
+            s.vsp = base as u32;
+            Ok(Value::Nil)
+        }
+        ExecResult::Ret(v) => {
+            s.vsp = base as u32;
+            Ok(v)
+        }
+        ExecResult::Ret2(a, _) => {
+            s.vsp = base as u32;
+            Ok(a)
+        }
+        ExecResult::RetN(n) => {
+            let v = if n == 0 {
+                Value::Nil
+            } else {
+                s.vstack[s.vsp as usize - n as usize]
+            };
+            s.vsp = base as u32;
+            Ok(v)
+        }
+        ExecResult::Shell | ExecResult::Exit => {
+            s.vsp = base as u32;
+            Ok(Value::Nil)
+        }
+        ExecResult::Yield(_) => Err("attempt to yield across a metamethod".into()),
+        ExecResult::Break | ExecResult::Goto(_) => {
+            Err("internal error: control flow from metamethod".into())
+        }
+    }
+}
+
+/// Enter metamethod dispatch, failing on a (likely) loop.
+fn enter_mm(s: &mut LuaState) -> Result<(), LuaError> {
+    if s.mm_depth >= MAX_MM_DEPTH {
+        return Err("metamethod chain too long (possible loop)".into());
+    }
+    s.mm_depth += 1;
+    Ok(())
+}
+
+fn leave_mm(s: &mut LuaState) {
+    s.mm_depth -= 1;
+}
+
+/// Equality with `__eq` dispatch (used by `==`/`~=`).
+pub(crate) fn eq_values(s: &mut LuaState, a: Value, b: Value) -> Result<bool, LuaError> {
+    if val_eq(a, b) {
+        return Ok(true);
+    }
+    if matches!((a, b), (Value::Table(_), Value::Table(_))) {
+        let h = binop_mm(s, a, b, MM_EQ)?;
+        if let Some(f) = h {
+            enter_mm(s)?;
+            let r = call_mm(s, f, &[a, b]);
+            leave_mm(s);
+            return Ok(truthy(r?));
+        }
+    }
+    Ok(false)
+}
+
+/// The first operand's metamethod, else the second's.
+fn binop_mm(s: &mut LuaState, a: Value, b: Value, i: usize) -> Result<Option<Value>, LuaError> {
+    let h = mm_of(s, a, i)?;
+    if !matches!(h, Value::Nil) {
+        return Ok(Some(h));
+    }
+    let h = mm_of(s, b, i)?;
+    if !matches!(h, Value::Nil) {
+        return Ok(Some(h));
+    }
+    Ok(None)
+}
+
+/// Unary minus with `__unm` dispatch.
+pub(crate) fn unm(s: &mut LuaState, v: Value) -> Result<Value, LuaError> {
+    match v {
+        Value::Num(n) => Ok(Value::Num(n.wrapping_neg())),
+        Value::Float(f) => Ok(Value::Float(-f)),
+        _ => match mm_of(s, v, MM_UNM)? {
+            Value::Nil => Err("attempt to perform arithmetic on a non-number value".into()),
+            f => {
+                enter_mm(s)?;
+                let r = call_mm(s, f, &[v]);
+                leave_mm(s);
+                r
+            }
+        },
+    }
+}
+
+pub(crate) fn val_eq(a: Value, b: Value) -> bool {
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -1246,6 +1033,9 @@ fn val_eq(a: Value, b: Value) -> bool {
         (Value::Func(x), Value::Func(y)) => x == y,
         (Value::Native(x), Value::Native(y)) => x == y,
         // Unit builtins compare equal to themselves.
+        (Value::Co(x), Value::Co(y)) => x == y,
+        (Value::Wrapped(x), Value::Wrapped(y)) => x == y,
+        // Unit builtins compare equal to themselves.
         (Value::Shell, Value::Shell)
         | (Value::Dhcp, Value::Dhcp)
         | (Value::Exit, Value::Exit)
@@ -1254,7 +1044,7 @@ fn val_eq(a: Value, b: Value) -> bool {
     }
 }
 
-fn binop(s: &mut LuaState, op: Op, a: Value, b: Value) -> Result<Value, &'static str> {
+pub(crate) fn binop(s: &mut LuaState, op: Op, a: Value, b: Value) -> Result<Value, LuaError> {
     use Op::*;
     match op {
         Add | Sub | Mul | Div | Mod => {
@@ -1267,13 +1057,13 @@ fn binop(s: &mut LuaState, op: Op, a: Value, b: Value) -> Result<Value, &'static
                     Mul => x.wrapping_mul(y),
                     Div => {
                         if y == 0 {
-                            return Err("division by zero");
+                            return Err("division by zero".into());
                         }
                         x / y
                     }
                     Mod => {
                         if y == 0 {
-                            return Err("division by zero");
+                            return Err("division by zero".into());
                         }
                         x.rem_euclid(y)
                     }
@@ -1281,58 +1071,110 @@ fn binop(s: &mut LuaState, op: Op, a: Value, b: Value) -> Result<Value, &'static
                 };
                 return Ok(Value::Num(r));
             }
-            let x = float_of(a).ok_or("attempt to perform arithmetic on a non-number value")?;
-            let y = float_of(b).ok_or("attempt to perform arithmetic on a non-number value")?;
-            let r = match op {
-                Add => x + y,
-                Sub => x - y,
-                Mul => x * y,
-                // Float division by zero yields inf/nan (Lua), unlike integers.
-                Div => x / y,
-                // Lua float modulo: a - floor(a/b) * b.
-                Mod => x - float_floor(x / y) * y,
-                _ => 0.0,
+            if let (Some(x), Some(y)) = (float_of(a), float_of(b)) {
+                let r = match op {
+                    Add => x + y,
+                    Sub => x - y,
+                    Mul => x * y,
+                    // Float division by zero yields inf/nan (Lua), unlike integers.
+                    Div => x / y,
+                    // Lua float modulo: a - floor(a/b) * b.
+                    Mod => x - float_floor(x / y) * y,
+                    _ => 0.0,
+                };
+                return Ok(Value::Float(r));
+            }
+            // Non-numbers: dispatch `__add`/`__sub`/... from either operand.
+            let idx = match op {
+                Add => MM_ADD,
+                Sub => MM_SUB,
+                Mul => MM_MUL,
+                Div => MM_DIV,
+                _ => MM_MOD,
             };
-            Ok(Value::Float(r))
+            match binop_mm(s, a, b, idx)? {
+                Some(f) => {
+                    enter_mm(s)?;
+                    let r = call_mm(s, f, &[a, b]);
+                    leave_mm(s);
+                    r
+                }
+                None => Err("attempt to perform arithmetic on a non-number value".into()),
+            }
         }
-        Eq => Ok(Value::Bool(val_eq(a, b))),
-        Ne => Ok(Value::Bool(!val_eq(a, b))),
+        Eq => Ok(Value::Bool(eq_values(s, a, b)?)),
+        Ne => Ok(Value::Bool(!eq_values(s, a, b)?)),
         Lt | Le | Gt | Ge => {
-            let r = if let (Value::Num(x), Value::Num(y)) = (a, b) {
-                match op {
-                    Lt => x < y,
-                    Le => x <= y,
-                    Gt => x > y,
-                    Ge => x >= y,
-                    _ => false,
+            // `a > b` is `b < a`; `a >= b` is `b <= a` (Lua).
+            let (op2, x, y) = match op {
+                Gt => (Lt, b, a),
+                Ge => (Le, b, a),
+                _ => (op, a, b),
+            };
+            let r = if let (Value::Num(x1), Value::Num(y1)) = (x, y) {
+                if op2 == Lt {
+                    x1 < y1
+                } else {
+                    x1 <= y1
+                }
+            } else if let (Some(x1), Some(y1)) = (float_of(x), float_of(y)) {
+                if op2 == Lt {
+                    x1 < y1
+                } else {
+                    x1 <= y1
                 }
             } else {
-                let x = float_of(a).ok_or("attempt to compare non-number values")?;
-                let y = float_of(b).ok_or("attempt to compare non-number values")?;
-                match op {
-                    Lt => x < y,
-                    Le => x <= y,
-                    Gt => x > y,
-                    Ge => x >= y,
-                    _ => false,
+                // Non-numbers: dispatch `__lt`/`__le`.
+                let idx = if op2 == Lt { MM_LT } else { MM_LE };
+                let h = binop_mm(s, x, y, idx)?;
+                if h.is_none() && op2 == Le {
+                    // Lua 5.1 fallback: `a <= b` is `not (b < a)`.
+                    if let Some(f) = binop_mm(s, y, x, MM_LT)? {
+                        enter_mm(s)?;
+                        let r = call_mm(s, f, &[y, x]);
+                        leave_mm(s);
+                        return Ok(Value::Bool(!truthy(r?)));
+                    }
+                }
+                match h {
+                    Some(f) => {
+                        enter_mm(s)?;
+                        let r = call_mm(s, f, &[x, y]);
+                        leave_mm(s);
+                        truthy(r?)
+                    }
+                    None => return Err("attempt to compare non-number values".into()),
                 }
             };
             Ok(Value::Bool(r))
         }
         Concat => {
-            let sa = string_of(s, a)?;
-            let sb = string_of(s, b)?;
-            let ba = s.str_bytes(sa);
-            let bb = s.str_bytes(sb);
-            let mut tmp = [0u8; 512];
-            if ba.len() + bb.len() > tmp.len() {
-                return Err("string too long");
+            if matches!(a, Value::Str(_) | Value::Num(_) | Value::Float(_))
+                && matches!(b, Value::Str(_) | Value::Num(_) | Value::Float(_))
+            {
+                let sa = string_of(s, a)?;
+                let sb = string_of(s, b)?;
+                let ba = s.str_bytes(sa);
+                let bb = s.str_bytes(sb);
+                let mut tmp = [0u8; 512];
+                if ba.len() + bb.len() > tmp.len() {
+                    return Err("string too long".into());
+                }
+                tmp[..ba.len()].copy_from_slice(ba);
+                tmp[ba.len()..ba.len() + bb.len()].copy_from_slice(bb);
+                return Ok(Value::Str(s.intern(&tmp[..ba.len() + bb.len()])?));
             }
-            tmp[..ba.len()].copy_from_slice(ba);
-            tmp[ba.len()..ba.len() + bb.len()].copy_from_slice(bb);
-            Ok(Value::Str(s.intern(&tmp[..ba.len() + bb.len()])?))
+            match binop_mm(s, a, b, MM_CONCAT)? {
+                Some(f) => {
+                    enter_mm(s)?;
+                    let r = call_mm(s, f, &[a, b]);
+                    leave_mm(s);
+                    r
+                }
+                None => Err("attempt to concatenate a non-string value".into()),
+            }
         }
-        And | Or | Not | Neg => Err("internal error: operator handled elsewhere"),
+        And | Or | Not | Neg => Err("internal error: operator handled elsewhere".into()),
     }
 }
 
@@ -1350,7 +1192,7 @@ fn string_of(s: &mut LuaState, v: Value) -> Result<super::StrRef, &'static str> 
             let len = fmt_float(f, &mut buf);
             s.intern(&buf[..len])
         }
-        _ => Err("attempt to concatenate a non-string value"),
+        _ => Err("attempt to concatenate a non-string value".into()),
     }
 }
 
@@ -1364,42 +1206,142 @@ fn type_name(v: Value) -> &'static [u8] {
         Value::Num(_) | Value::Float(_) => b"number",
         Value::Str(_) => b"string",
         Value::Table(_) => b"table",
-        Value::Func(_) | Value::Native(_) | Value::Shell | Value::Dhcp | Value::Exit | Value::Ls => {
-            b"function"
+        Value::Func(_)
+        | Value::Native(_)
+        | Value::Shell
+        | Value::Dhcp
+        | Value::Exit
+        | Value::Ls
+        | Value::Wrapped(_) => b"function",
+        Value::Co(_) => b"thread",
+    }
+}
+
+/// Render a runtime error into `out` without allocating: static messages and
+/// string error objects are copied verbatim; any other error object becomes
+/// `error object is a <type> value` (matching standalone Lua). Returns the
+/// number of bytes written (truncated to `out.len()`).
+pub fn error_bytes(s: &LuaState, e: LuaError, out: &mut [u8]) -> usize {
+    fn copy(out: &mut [u8], bytes: &[u8]) -> usize {
+        let n = bytes.len().min(out.len());
+        out[..n].copy_from_slice(&bytes[..n]);
+        n
+    }
+    match e {
+        LuaError::Msg(m) => copy(out, m.as_bytes()),
+        LuaError::Obj(Value::Str(r)) => copy(out, s.str_bytes(r)),
+        LuaError::Obj(v) => {
+            let mut n = copy(out, b"error object is a ");
+            n += copy(&mut out[n..], type_name(v));
+            n += copy(&mut out[n..], b" value");
+            n
+        }
+    }
+}
+
+/// Emit a runtime error through `putc` (no truncation; used by the REPL).
+pub fn emit_error(s: &LuaState, e: LuaError, putc: fn(u8)) {
+    match e {
+        LuaError::Msg(m) => {
+            for &b in m.as_bytes() {
+                putc(b);
+            }
+        }
+        LuaError::Obj(Value::Str(r)) => {
+            for &b in s.str_bytes(r) {
+                putc(b);
+            }
+        }
+        LuaError::Obj(v) => {
+            for &b in b"error object is a " {
+                putc(b);
+            }
+            for &b in type_name(v) {
+                putc(b);
+            }
+            for &b in b" value" {
+                putc(b);
+            }
         }
     }
 }
 
 /// Convert a value to an interned string — the `tostring` builtin. Strings are
-/// returned as-is (they are already interned); other values use the same
-/// rendering as the `tostring` emitter below.
-fn value_to_string(s: &mut LuaState, v: Value) -> Result<super::StrRef, &'static str> {
+/// returned as-is (they are already interned); a table's `__tostring`
+/// metamethod is dispatched; other values use the same rendering as the
+/// `tostring` emitter below.
+fn value_to_string(s: &mut LuaState, v: Value) -> Result<super::StrRef, LuaError> {
+    if let Value::Table(tid) = v {
+        let h = mt_lookup(s, tid, MM_TOSTRING)?;
+        if !matches!(h, Value::Nil) {
+            enter_mm(s)?;
+            let r = call_mm(s, h, &[v]);
+            leave_mm(s);
+            return match r? {
+                Value::Str(sr) => Ok(sr),
+                Value::Num(n) => {
+                    let (buf, len) = itoa(n);
+                    Ok(s.intern(&buf[..len])?)
+                }
+                Value::Float(f) => {
+                    let mut buf = [0u8; FLOAT_BUF];
+                    let len = fmt_float(f, &mut buf);
+                    Ok(s.intern(&buf[..len])?)
+                }
+                _ => Err("'__tostring' must return a string".into()),
+            };
+        }
+    }
     match v {
         Value::Str(r) => Ok(r),
         Value::Num(n) => {
             let (buf, len) = itoa(n);
-            s.intern(&buf[..len])
+            Ok(s.intern(&buf[..len])?)
         }
         Value::Float(f) => {
             let mut buf = [0u8; FLOAT_BUF];
             let len = fmt_float(f, &mut buf);
-            s.intern(&buf[..len])
+            Ok(s.intern(&buf[..len])?)
         }
-        Value::Nil => s.intern(b"nil"),
-        Value::Bool(true) => s.intern(b"true"),
-        Value::Bool(false) => s.intern(b"false"),
-        Value::Table(_) => s.intern(b"table"),
-        Value::Func(_) => s.intern(b"function"),
-        Value::Native(_) => s.intern(b"native"),
-        Value::Shell => s.intern(b"shell"),
-        Value::Dhcp => s.intern(b"dhcp"),
-        Value::Exit => s.intern(b"exit"),
-        Value::Ls => s.intern(b"ls"),
+        Value::Nil => Ok(s.intern(b"nil")?),
+        Value::Bool(true) => Ok(s.intern(b"true")?),
+        Value::Bool(false) => Ok(s.intern(b"false")?),
+        Value::Table(_) => Ok(s.intern(b"table")?),
+        Value::Func(_) => Ok(s.intern(b"function")?),
+        Value::Native(_) => Ok(s.intern(b"native")?),
+        Value::Shell => Ok(s.intern(b"shell")?),
+        Value::Dhcp => Ok(s.intern(b"dhcp")?),
+        Value::Exit => Ok(s.intern(b"exit")?),
+        Value::Ls => Ok(s.intern(b"ls")?),
+        Value::Co(_) => Ok(s.intern(b"thread")?),
+        Value::Wrapped(_) => Ok(s.intern(b"function")?),
     }
 }
 
-/// Emit the Lua `tostring` rendering of a value via `putc`.
-fn tostring(s: &LuaState, v: Value) -> Result<(), &'static str> {
+/// Emit the Lua `tostring` rendering of a value via `putc`. A table's
+/// `__tostring` metamethod is dispatched (it must return a string).
+pub(crate) fn tostring(s: &mut LuaState, v: Value) -> Result<(), LuaError> {
+    if let Value::Table(tid) = v {
+        let h = mt_lookup(s, tid, MM_TOSTRING)?;
+        if !matches!(h, Value::Nil) {
+            enter_mm(s)?;
+            let r = call_mm(s, h, &[v]);
+            leave_mm(s);
+            let rv = r?;
+            match rv {
+                Value::Str(sr) => {
+                    emit_bytes(s, s.str_bytes(sr));
+                    return Ok(());
+                }
+                Value::Num(_) | Value::Float(_) => {
+                    let sr = value_to_string(s, rv)?;
+                    emit_bytes(s, s.str_bytes(sr));
+                    return Ok(());
+                }
+                _ => return Err("'__tostring' must return a string".into()),
+            }
+        }
+    }
     match v {
         Value::Nil => emit_str(s, b"nil"),
         Value::Bool(true) => emit_str(s, b"true"),
@@ -1421,11 +1363,13 @@ fn tostring(s: &LuaState, v: Value) -> Result<(), &'static str> {
         Value::Dhcp => emit_str(s, b"dhcp"),
         Value::Exit => emit_str(s, b"exit"),
         Value::Ls => emit_str(s, b"ls"),
+        Value::Co(_) => emit_str(s, b"thread"),
+        Value::Wrapped(_) => emit_str(s, b"function"),
     }
     Ok(())
 }
 
-fn emit(s: &LuaState, b: u8) {
+pub(crate) fn emit(s: &LuaState, b: u8) {
     (s.putc)(b);
 }
 
@@ -1637,9 +1581,9 @@ fn itoa(n: i64) -> ([u8; 24], usize) {
 
 // ── Tables ──────────────────────────────────────────────────────────────────
 
-fn new_table(s: &mut LuaState) -> Result<u16, &'static str> {
+pub(crate) fn new_table(s: &mut LuaState) -> Result<u16, LuaError> {
     if s.ntables as usize >= super::MAX_TABLES {
-        return Err("too many tables");
+        return Err("too many tables".into());
     }
     let tid = s.ntables;
     s.tbls[tid as usize] = super::TableRec {
@@ -1654,58 +1598,61 @@ fn new_table(s: &mut LuaState) -> Result<u16, &'static str> {
     Ok(tid as u16)
 }
 
-fn tget(s: &LuaState, t: Value, k: Value) -> Result<Value, &'static str> {
+/// `t[k]` with `__index` dispatch: a missing key consults the metatable's
+/// `__index` (a table is looked up recursively, a function is called with
+/// `(t, k)`).
+pub(crate) fn tget(s: &mut LuaState, t: Value, k: Value) -> Result<Value, LuaError> {
     let tid = match t {
         Value::Table(i) => i,
-        _ => return Err("attempt to index a non-table value"),
+        _ => return Err("attempt to index a non-table value".into()),
     };
-    let rec = &s.tbls[tid as usize];
-    for i in 0..rec.len as usize {
-        if val_eq(rec.slots[i].key, k) {
-            return Ok(rec.slots[i].value);
+    let v = raw_get(s, tid, k);
+    if !matches!(v, Value::Nil) {
+        return Ok(v);
+    }
+    let h = mt_lookup(s, tid, MM_INDEX)?;
+    match h {
+        Value::Nil => Ok(Value::Nil),
+        Value::Table(_) => {
+            enter_mm(s)?;
+            let r = tget(s, h, k);
+            leave_mm(s);
+            r
+        }
+        _ => {
+            enter_mm(s)?;
+            let r = call_mm(s, h, &[t, k]);
+            leave_mm(s);
+            r
         }
     }
-    Ok(Value::Nil)
 }
 
-fn tset(s: &mut LuaState, t: Value, k: Value, v: Value) -> Result<(), &'static str> {
+/// `t[k] = v` with `__newindex` dispatch: assigning an absent key consults
+/// the metatable's `__newindex` (a table is assigned recursively, a function
+/// is called with `(t, k, v)`).
+pub(crate) fn tset(s: &mut LuaState, t: Value, k: Value, v: Value) -> Result<(), LuaError> {
     let tid = match t {
         Value::Table(i) => i,
-        _ => return Err("attempt to index a non-table value"),
+        _ => return Err("attempt to index a non-table value".into()),
     };
-    // Lua: a nil or NaN key can never be assigned (reading is fine).
-    if matches!(k, Value::Nil) {
-        return Err("table index is nil");
+    if raw_has(s, tid, k) {
+        return raw_set(s, tid, k, v);
     }
-    if matches!(k, Value::Float(f) if f.is_nan()) {
-        return Err("table index is NaN");
-    }
-    let nil = matches!(v, Value::Nil);
-    let len = s.tbls[tid as usize].len as usize;
-    for i in 0..len {
-        if val_eq(s.tbls[tid as usize].slots[i].key, k) {
-            if nil {
-                // Lua: assigning nil removes the field (so `next` never sees
-                // it again). Shift the remaining slots down to keep them
-                // contiguous for iteration.
-                for j in i..len - 1 {
-                    s.tbls[tid as usize].slots[j] = s.tbls[tid as usize].slots[j + 1];
-                }
-                s.tbls[tid as usize].len -= 1;
-            } else {
-                s.tbls[tid as usize].slots[i].value = v;
-            }
-            return Ok(());
+    let h = mt_lookup(s, tid, MM_NEWINDEX)?;
+    match h {
+        Value::Nil => raw_set(s, tid, k, v),
+        Value::Table(_) => {
+            enter_mm(s)?;
+            let r = tset(s, h, k, v);
+            leave_mm(s);
+            r
+        }
+        _ => {
+            enter_mm(s)?;
+            let r = call_mm(s, h, &[t, k, v]).map(|_| ());
+            leave_mm(s);
+            r
         }
     }
-    if nil {
-        // Assigning nil to a non-existent field is a no-op.
-        return Ok(());
-    }
-    if len >= super::TABLE_SLOTS {
-        return Err("table full");
-    }
-    s.tbls[tid as usize].slots[len] = super::TableSlot { key: k, value: v };
-    s.tbls[tid as usize].len += 1;
-    Ok(())
 }
