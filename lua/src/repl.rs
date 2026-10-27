@@ -865,6 +865,32 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   with message (default \"assertion failed!\") otherwise.\n",
     },
     HelpEntry {
+        name: "string.byte",
+        short: "Return numeric byte values of characters in a string",
+        detail: "string.byte(s [, i [, j]])\n\
+                  Returns the numeric codes of the characters s[i..j].\n\
+                  The default for i is 1 and the default for j is i.\n\
+                  Negative indices count from the end of the string.\n\
+                  Example: string.byte(\"ABC\", 1, 2) -> 65 66\n",
+    },
+    HelpEntry {
+        name: "string.char",
+        short: "Build a string from byte values",
+        detail: "string.char(b1, b2, ...)\n\
+                  Returns a string composed of the given byte values. Each\n\
+                  argument must be an integer in the range 0..255. With no\n\
+                  arguments returns the empty string.\n\
+                  Example: string.char(65, 66, 67) -> \"ABC\"\n",
+    },
+    HelpEntry {
+        name: "string.dump",
+        short: "Return a binary dump of a function",
+        detail: "string.dump(f)\n\
+                  Returns a binary string containing the function's bytecode\n\
+                  and metadata. The format is interpreter-specific and is not\n\
+                  loadable without a corresponding loader.\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1278,6 +1304,7 @@ mod tests {
             "rawequal", "rawget", "rawlen", "rawset", "select",
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
+            "string.byte", "string.char", "string.dump",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

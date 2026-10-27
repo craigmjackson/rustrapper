@@ -267,8 +267,9 @@ pub enum Value {
     /// `tostring` is `Native(12)`, `type` is `Native(13)`, `warn` is
     /// `Native(14)`, `pcall` is `Native(15)`, `error` is `Native(16)`, and
     /// 17..=24 are the `coroutine` library (create, resume, yield, status,
-    /// wrap, isyieldable, running, close). `assert` is `Native(25)` and
-    /// `xpcall` is `Native(26)`.
+    /// wrap, isyieldable, running, close). `assert` is `Native(25)`,
+    /// `xpcall` is `Native(26)`, `string.byte` is `Native(27)`,
+    /// `string.char` is `Native(28)`, and `string.dump` is `Native(29)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1025,6 +1026,34 @@ impl LuaState {
             crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
         }
         self.set_global(coroutine_name, Value::Table(tid));
+        // The `string` library is a table of builtins.
+        let string_name = self.intern(b"string").unwrap();
+        let tid = crate::eval::new_table(self).unwrap();
+        let byte_name = self.intern(b"byte").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(byte_name),
+            Value::Native(27),
+        )
+        .unwrap();
+        let char_name = self.intern(b"char").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(char_name),
+            Value::Native(28),
+        )
+        .unwrap();
+        let dump_name = self.intern(b"dump").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(dump_name),
+            Value::Native(29),
+        )
+        .unwrap();
+        self.set_global(string_name, Value::Table(tid));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -2955,6 +2984,81 @@ mod tests {
     fn string_escapes() {
         assert_eq!(exec("print(\"a\\tb\\n\")").unwrap(), "a\tb\n\n");
         assert_eq!(exec("print('it\\'s')").unwrap(), "it's\n");
+    }
+
+    #[test]
+    fn string_byte() {
+        // Default indices.
+        assert_eq!(exec("print(string.byte(\"ABC\"))").unwrap(), "65\n");
+        // Explicit range.
+        assert_eq!(exec("print(string.byte(\"ABC\", 1, 3))").unwrap(), "65\t66\t67\n");
+        // Single character.
+        assert_eq!(exec("print(string.byte(\"ABC\", 2))").unwrap(), "66\n");
+        // Negative indices count from the end.
+        assert_eq!(exec("print(string.byte(\"ABC\", -1))").unwrap(), "67\n");
+        assert_eq!(exec("print(string.byte(\"ABC\", -2, -1))").unwrap(), "66\t67\n");
+        // Range partly outside the string is clamped.
+        assert_eq!(exec("print(string.byte(\"ABC\", 1, 5))").unwrap(), "65\t66\t67\n");
+        assert_eq!(exec("print(string.byte(\"ABC\", -5, 2))").unwrap(), "65\t66\n");
+        // Empty range returns nothing.
+        assert_eq!(exec("print(string.byte(\"ABC\", 5, 6))").unwrap(), "\n");
+        assert_eq!(exec("print(string.byte(\"ABC\", 2, 1))").unwrap(), "\n");
+        // Assigned to a local.
+        assert_eq!(exec("local a, b = string.byte(\"XY\", 1, 2)\nprint(a, b)").unwrap(), "88\t89\n");
+        // Error: non-string.
+        assert!(exec("print(string.byte(123))").is_err());
+        // Error: non-integer index.
+        assert!(exec("print(string.byte(\"ABC\", \"x\"))").is_err());
+        // Error: too many arguments.
+        assert!(exec("print(string.byte(\"ABC\", 1, 2, 3))").is_err());
+    }
+
+    #[test]
+    fn string_char() {
+        // Build a string from byte values.
+        assert_eq!(exec("print(string.char(65, 66, 67))").unwrap(), "ABC\n");
+        // Single byte.
+        assert_eq!(exec("print(string.char(65))").unwrap(), "A\n");
+        // No arguments returns the empty string.
+        assert_eq!(exec("print(\"[\" .. string.char() .. \"]\")").unwrap(), "[]\n");
+        // Zero byte is allowed.
+        assert_eq!(exec("local s = string.char(0, 65)\nprint(string.byte(s, 1, 2))").unwrap(), "0\t65\n");
+        // Round-trip with string.byte.
+        assert_eq!(exec("print(string.char(string.byte(\"XYZ\", 1, 3)))").unwrap(), "XYZ\n");
+        // Error: out of range.
+        assert!(exec("print(string.char(256))").is_err());
+        assert!(exec("print(string.char(-1))").is_err());
+        // Error: non-integer.
+        assert!(exec("print(string.char(\"x\"))").is_err());
+        assert!(exec("print(string.char(1.5))").is_err());
+    }
+
+    #[test]
+    fn string_dump() {
+        // Returns a string for a function.
+        let out = exec("function f(x) return x + 1 end\nprint(type(string.dump(f)))").unwrap();
+        assert_eq!(out, "string\n");
+        // Works for closures too.
+        let out = exec("local function g() return 42 end\nprint(type(string.dump(g)))").unwrap();
+        assert_eq!(out, "string\n");
+        // Different functions produce different dumps.
+        let out = exec(
+            "function f1() return 1 end\nfunction f2() return 2 end\nprint(string.dump(f1) == string.dump(f2))"
+        )
+        .unwrap();
+        assert_eq!(out, "false\n");
+        // Same function produces the same dump within one run.
+        let out = exec(
+            "function f3() return 3 end\nprint(string.dump(f3) == string.dump(f3))"
+        )
+        .unwrap();
+        assert_eq!(out, "true\n");
+        // Error: non-function.
+        assert!(exec("print(string.dump(1))").is_err());
+        assert!(exec("print(string.dump(\"f\"))").is_err());
+        // Error: wrong argument count.
+        assert!(exec("print(string.dump())").is_err());
+        assert!(exec("print(string.dump(f, 1))").is_err());
     }
 
     #[test]

@@ -48,6 +48,77 @@ fn float_floor(x: f64) -> f64 {
     }
 }
 
+/// Convert a value to an integer index, accepting integers and finite floats
+/// that represent whole numbers (used by `string.byte`).
+fn integer_index(v: Value) -> Result<i64, LuaError> {
+    match v {
+        Value::Num(n) => Ok(n),
+        Value::Float(f) if f.is_finite() && f == float_floor(f) => Ok(f as i64),
+        _ => Err("string index must be an integer".into()),
+    }
+}
+
+/// Serialize a function's metadata and bytecode to an interned string for
+/// `string.dump`. The format is interpreter-specific and not loadable without
+/// a corresponding deserializer (which this interpreter does not implement).
+fn dump_function(s: &mut LuaState, fi: u16) -> Result<super::StrRef, LuaError> {
+    let fd = s.funcs[fi as usize];
+    let entry = fd.entry as usize;
+    // Find the end of this function's bytecode: the next function's entry or
+    // the end of the code array.
+    let mut end = s.ncode as usize;
+    for j in 0..s.funcs_used as usize {
+        let e = s.funcs[j].entry as usize;
+        if e > entry && e < end {
+            end = e;
+        }
+    }
+    if end < entry {
+        end = entry;
+    }
+    let count = end - entry;
+    // Build the dump in a temporary buffer: magic + version + index + nparams +
+    // nup + entry + upvalue names + bytecode count + instructions.
+    let mut buf = [0u8; 4096];
+    let mut pos = 0usize;
+    let push = |buf: &mut [u8], pos: &mut usize, b: u8| -> Result<(), LuaError> {
+        if *pos >= buf.len() {
+            return Err("string.dump result too large".into());
+        }
+        buf[*pos] = b;
+        *pos += 1;
+        Ok(())
+    };
+    let push_u16 = |buf: &mut [u8], pos: &mut usize, v: u16| -> Result<(), LuaError> {
+        push(buf, pos, (v & 0xFF) as u8)?;
+        push(buf, pos, ((v >> 8) & 0xFF) as u8)
+    };
+    for &b in b"RULD" {
+        push(&mut buf, &mut pos, b)?;
+    }
+    push(&mut buf, &mut pos, 1)?; // version
+    push_u16(&mut buf, &mut pos, fi)?;
+    push(&mut buf, &mut pos, fd.nparams)?;
+    push(&mut buf, &mut pos, fd.nup)?;
+    push_u16(&mut buf, &mut pos, fd.entry)?;
+    for u in 0..fd.nup as usize {
+        let name = fd.up_names[u];
+        let name_bytes = s.str_bytes(name);
+        push_u16(&mut buf, &mut pos, name_bytes.len() as u16)?;
+        for &b in name_bytes {
+            push(&mut buf, &mut pos, b)?;
+        }
+    }
+    push_u16(&mut buf, &mut pos, count as u16)?;
+    for i in 0..count {
+        let ins = s.code[entry + i];
+        push(&mut buf, &mut pos, ins.op as u8)?;
+        push_u16(&mut buf, &mut pos, ins.a)?;
+        push_u16(&mut buf, &mut pos, ins.b)?;
+    }
+    Ok(s.intern(&buf[..pos])?)
+}
+
 /// Trim leading/trailing ASCII whitespace.
 fn trim_ascii(b: &[u8]) -> &[u8] {
     let mut s = 0;
@@ -676,6 +747,97 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                     }
                 }
             }
+        }
+        Value::Native(27) => {
+            // string.byte(s [, i [, j]]): returns the numeric codes of the
+            // characters s[i..j]. The default for i is 1 and the default for
+            // j is i. Negative indices count from the end of the string.
+            // Returns nothing if the range is empty or lies outside the string.
+            if argc < 1 || argc > 3 {
+                return Err("string.byte expects 1 to 3 arguments".into());
+            }
+            let r = match argbuf[0] {
+                Value::Str(r) => r,
+                _ => return Err("string.byte expects a string".into()),
+            };
+            let (start, n) = {
+                let bytes = s.str_bytes(r);
+                let len = bytes.len() as i64;
+                let posi = if argc >= 2 {
+                    integer_index(argbuf[1])?
+                } else {
+                    1
+                };
+                let pose = if argc >= 3 {
+                    integer_index(argbuf[2])?
+                } else {
+                    posi
+                };
+                let mut posi = if posi >= 0 {
+                    posi
+                } else {
+                    len + posi + 1
+                };
+                let mut pose = if pose >= 0 {
+                    pose
+                } else {
+                    len + pose + 1
+                };
+                if posi < 1 {
+                    posi = 1;
+                }
+                if pose > len {
+                    pose = len;
+                }
+                if posi > pose {
+                    (0usize, 0usize)
+                } else {
+                    (((posi - 1) as usize), ((pose - posi + 1) as usize))
+                }
+            };
+            if n == 0 {
+                ExecResult::Normal
+            } else {
+                for k in 0..n {
+                    let b = s.str_bytes(r)[start + k];
+                    s.push_val(Value::Num(b as i64))?;
+                }
+                ExecResult::RetN(n as u8)
+            }
+        }
+        Value::Native(28) => {
+            // string.char(...): returns a string composed of the byte values
+            // given as arguments. Each argument must be an integer in 0..255.
+            // With no arguments returns the empty string.
+            let mut buf = [0u8; 256];
+            if argc as usize > buf.len() {
+                return Err("string.char expects at most 256 arguments".into());
+            }
+            for i in 0..argc as usize {
+                let n = integer_index(argbuf[i])?;
+                if n < 0 || n > 255 {
+                    return Err("string.char value out of range".into());
+                }
+                buf[i] = n as u8;
+            }
+            let r = s.intern(&buf[..argc as usize])?;
+            ExecResult::Ret(Value::Str(r))
+        }
+        Value::Native(29) => {
+            // string.dump(f): returns a binary string containing a dump of the
+            // function's bytecode and metadata. The format is interpreter-
+            // specific and is intended to match `string.dump` semantics at the
+            // API level; a corresponding `load` function is not implemented.
+            if argc != 1 {
+                return Err("string.dump expects 1 argument".into());
+            }
+            let fi = match argbuf[0] {
+                Value::Func(fi) => fi,
+                Value::Closure(ci) => s.closures[ci as usize].func,
+                _ => return Err("string.dump expects a function".into()),
+            };
+            let r = dump_function(s, fi)?;
+            ExecResult::Ret(Value::Str(r))
         }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
