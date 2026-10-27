@@ -63,6 +63,10 @@
 //! - `pcall(f, ...)` builtin: protected call — `true` plus the results on
 //!   success, or `false` plus the error object on failure. A coroutine may
 //!   `yield` through `pcall` (the protected frame is kept across the yield).
+//! - `xpcall(f, err, ...)` builtin: like `pcall`, but on failure calls
+//!   `err(error_object)` and returns `false` plus the handler's results. The
+//!   error handler itself runs unprotected; errors and yields inside it are
+//!   not caught by the same `xpcall`.
 //! - `error(v [, level])` builtin: raises `v` as an error object (`level` is
 //!   validated but ignored; there are no source positions).
 //! - `assert(v [, message, ...])` builtin: returns all its arguments when `v`
@@ -263,7 +267,8 @@ pub enum Value {
     /// `tostring` is `Native(12)`, `type` is `Native(13)`, `warn` is
     /// `Native(14)`, `pcall` is `Native(15)`, `error` is `Native(16)`, and
     /// 17..=24 are the `coroutine` library (create, resume, yield, status,
-    /// wrap, isyieldable, running, close). `assert` is `Native(25)`.
+    /// wrap, isyieldable, running, close). `assert` is `Native(25)` and
+    /// `xpcall` is `Native(26)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -613,6 +618,7 @@ impl Thread {
                 ctrl: [Value::Nil; 4],
                 closure: NO_CLOSURE,
                 protected: false,
+                err_handler: None,
                 mark_sp: 0,
             }; MAX_FRAMES],
             fsp: 0,
@@ -650,10 +656,13 @@ pub struct Frame {
     /// Closure running in this frame ([`NO_CLOSURE`] for plain functions and
     /// block scopes); its upvalues are visible to name lookup.
     pub closure: u16,
-    /// This frame is a VM-level `pcall` boundary: errors raised inside it are
-    /// caught and turned into `false, error` (and a coroutine may yield
-    /// through it).
+    /// This frame is a VM-level `pcall`/`xpcall` boundary: errors raised
+    /// inside it are caught. For `pcall` they become `false, error`; for
+    /// `xpcall` they are passed to the error handler recorded here.
     pub protected: bool,
+    /// `xpcall` error handler, called with the error object when this frame
+    /// catches an error. `None` means this is a `pcall` frame.
+    pub err_handler: Option<Value>,
     /// Operand-stack marks in effect when the protected frame was pushed.
     pub mark_sp: u8,
 }
@@ -830,6 +839,7 @@ impl LuaState {
                 ctrl: [Value::Nil; 4],
                 closure: NO_CLOSURE,
                 protected: false,
+                err_handler: None,
                 mark_sp: 0,
             }; MAX_FRAMES],
             fsp: 0,
@@ -994,6 +1004,9 @@ impl LuaState {
         let _ = self.intern(b"assert");
         let assert_name = self.intern(b"assert").unwrap();
         self.set_global(assert_name, Value::Native(25));
+        let _ = self.intern(b"xpcall");
+        let xpcall_name = self.intern(b"xpcall").unwrap();
+        self.set_global(xpcall_name, Value::Native(26));
         // The `coroutine` library is a table of builtins.
         let coroutine_name = self.intern(b"coroutine").unwrap();
         let tid = crate::eval::new_table(self).unwrap();
@@ -1336,6 +1349,7 @@ impl LuaState {
             ctrl: [Value::Nil; 4],
             closure: NO_CLOSURE,
             protected: false,
+            err_handler: None,
             mark_sp: 0,
         };
         self.fsp += 1;
@@ -2677,6 +2691,65 @@ mod tests {
         // error() propagates when not protected.
         assert!(exec("error(\"boom\")").is_err());
         assert!(exec("error(1, 2, 3)").is_err());
+    }
+
+    #[test]
+    fn xpcall_builtin() {
+        // Success: true plus f's results; error handler is not called.
+        assert_eq!(
+            exec("function f(a, b) return a + b end\nprint(xpcall(f, print, 3, 4))").unwrap(),
+            "true\t7\n"
+        );
+        assert_eq!(
+            exec("function f() return next({8}) end\nprint(xpcall(f, print))").unwrap(),
+            "true\t1\t8\n"
+        );
+        // Native error handler.
+        assert_eq!(
+            exec("function bad() return nil + 1 end\nlocal ok, err = xpcall(bad, tostring)\nprint(ok, type(err))").unwrap(),
+            "false\tstring\n"
+        );
+        // Failure: false plus the handler's results.
+        assert_eq!(
+            exec("function bad() return nil + 1 end\nfunction h(e) return \"caught: \" .. e end\nprint(xpcall(bad, h))").unwrap(),
+            "false\tcaught: attempt to perform arithmetic on a non-number value\n"
+        );
+        // Handler receives the error object raised by error().
+        assert_eq!(
+            exec("function boom() error(42) end\nfunction h(e) return e * 2 end\nprint(xpcall(boom, h))").unwrap(),
+            "false\t84\n"
+        );
+        // Handler returning multiple values.
+        assert_eq!(
+            exec("function boom() error(\"x\") end\nfunction h(e) return \"a\" end\nlocal ok, a = xpcall(boom, h)\nprint(ok, a)").unwrap(),
+            "false\ta\n"
+        );
+        assert_eq!(
+            exec("function h(e) return next({\"a\", \"b\"}) end\nlocal ok, a, b = xpcall(error, h, \"x\")\nprint(ok, a, b)").unwrap(),
+            "false\t1\ta\n"
+        );
+        // Handler returning a single value consumed by a multi-name local.
+        assert_eq!(
+            exec("function h(e) return \"handled \" .. e end\nlocal ok, msg = xpcall(error, h, \"x\")\nprint(ok, msg)").unwrap(),
+            "false\thandled x\n"
+        );
+        assert_eq!(
+            exec("function h(e) return \"handled \" .. e end\nfunction f()\nlocal ok, msg = xpcall(error, h, \"x\")\nreturn msg\nend\nprint(f())").unwrap(),
+            "handled x\n"
+        );
+        // Nested xpcall: the inner handler catches the inner error.
+        assert_eq!(
+            exec("function inner() error(\"inner\") end\nfunction h(e) return \"handled \" .. e end\nfunction outer()\nlocal a, b = xpcall(inner, h)\nreturn b\nend\nlocal ok, msg = xpcall(outer, h)\nprint(ok, msg)").unwrap(),
+            "true\thandled inner\n"
+        );
+        // Handler error propagates (not caught by the same xpcall).
+        assert_eq!(
+            exec("function bad() error(\"x\") end\nfunction h(e) error(\"handler fail\") end\nfunction wrapper()\nreturn xpcall(bad, h)\nend\nlocal ok, err = pcall(wrapper)\nprint(ok, err)").unwrap(),
+            "false\thandler fail\n"
+        );
+        // arity errors.
+        assert!(exec("xpcall()").is_err());
+        assert!(exec("xpcall(print)").is_err());
     }
 
     #[test]

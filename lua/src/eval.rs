@@ -576,6 +576,107 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 }
             }
         }
+        Value::Native(26) => {
+            // xpcall(f, err, ...): protected call with an error handler. On
+            // success returns true plus f's results; on failure calls err with
+            // the error object and returns false plus the handler's results.
+            // This fallback path (metamethod/coroutine body) does not support
+            // yielding across the call.
+            if argc < 2 {
+                return Err("xpcall expects at least 2 arguments".into());
+            }
+            let f = argbuf[0];
+            let err_handler = argbuf[1];
+            let saved_vsp = base;
+            let saved_fsp = s.fsp;
+            let saved_marks = s.mark_sp;
+            let callee_args = argc - 2;
+            match call(s, f, callee_args) {
+                Ok(ExecResult::Normal) => ExecResult::Ret(Value::Bool(true)),
+                Ok(ExecResult::Ret(v)) => ExecResult::Ret2(Value::Bool(true), v),
+                Ok(ExecResult::Ret2(a, b)) => {
+                    // Three results: push true,a,b then rotate it to the front.
+                    s.push_val(a)?;
+                    s.push_val(b)?;
+                    s.push_val(Value::Bool(true))?;
+                    let top = s.vsp as usize;
+                    let start = top - 3;
+                    let t = s.vstack[top - 1];
+                    for j in (start + 1..top).rev() {
+                        s.vstack[j] = s.vstack[j - 1];
+                    }
+                    s.vstack[start] = t;
+                    ExecResult::RetN(3)
+                }
+                Ok(ExecResult::RetN(n)) => {
+                    // Results are on the stack; insert `true` before them.
+                    s.push_val(Value::Bool(true))?;
+                    let top = s.vsp as usize;
+                    let start = top - (n as usize + 1);
+                    let t = s.vstack[top - 1];
+                    for j in (start + 1..top).rev() {
+                        s.vstack[j] = s.vstack[j - 1];
+                    }
+                    s.vstack[start] = t;
+                    ExecResult::RetN(n + 1)
+                }
+                Ok(ExecResult::Shell) => ExecResult::Shell,
+                Ok(ExecResult::Exit) => ExecResult::Exit,
+                Ok(ExecResult::Yield(_)) => {
+                    return Err("attempt to yield across a protected call".into())
+                }
+                Ok(ExecResult::Break) => return Err("break outside loop".into()),
+                Ok(ExecResult::Goto(_)) => return Err("goto outside function".into()),
+                Err(e) => {
+                    // Unwind to the saved state before invoking the handler.
+                    s.vsp = saved_vsp as u32;
+                    s.fsp = saved_fsp;
+                    s.mark_sp = saved_marks;
+                    let err_obj = match e {
+                        LuaError::Obj(v) => v,
+                        LuaError::Msg(m) => Value::Str(s.intern(m.as_bytes())?),
+                    };
+                    s.push_val(err_obj)?;
+                    let handler_res = call(s, err_handler, 1)?;
+                    // Prepend false to the handler's results.
+                    match handler_res {
+                        ExecResult::Normal => ExecResult::Ret(Value::Bool(false)),
+                        ExecResult::Ret(v) => ExecResult::Ret2(Value::Bool(false), v),
+                        ExecResult::Ret2(a, b) => {
+                            s.push_val(a)?;
+                            s.push_val(b)?;
+                            s.push_val(Value::Bool(false))?;
+                            let top = s.vsp as usize;
+                            let start = top - 3;
+                            let t = s.vstack[top - 1];
+                            for j in (start + 1..top).rev() {
+                                s.vstack[j] = s.vstack[j - 1];
+                            }
+                            s.vstack[start] = t;
+                            ExecResult::RetN(3)
+                        }
+                        ExecResult::RetN(n) => {
+                            s.push_val(Value::Bool(false))?;
+                            let top = s.vsp as usize;
+                            let start = top - (n as usize + 1);
+                            let t = s.vstack[top - 1];
+                            for j in (start + 1..top).rev() {
+                                s.vstack[j] = s.vstack[j - 1];
+                            }
+                            s.vstack[start] = t;
+                            ExecResult::RetN(n + 1)
+                        }
+                        ExecResult::Shell => ExecResult::Shell,
+                        ExecResult::Exit => ExecResult::Exit,
+                        ExecResult::Yield(_) => {
+                            return Err("attempt to yield across a protected call".into())
+                        }
+                        ExecResult::Break => return Err("break outside loop".into()),
+                        ExecResult::Goto(_) => return Err("goto outside function".into()),
+                    }
+                }
+            }
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source

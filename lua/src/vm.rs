@@ -997,6 +997,88 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
                             }
                         }
                     }
+                    Value::Native(26) => {
+                        // VM-level `xpcall`: like `pcall`, but on error the
+                        // error object is passed to the user-supplied handler
+                        // and the handler's results are returned after `false`.
+                        if argc < 2 {
+                            return Err("xpcall expects at least 2 arguments".into());
+                        }
+                        // Drop the xpcall callee: [xpcall, f, err, args...]
+                        // -> [f, err, args...].
+                        for i in 0..argc {
+                            s.vstack[base + i] = s.vstack[base + 1 + i];
+                        }
+                        s.vsp = (base + argc) as u32;
+                        let fv = s.vstack[base];
+                        let err_handler = s.vstack[base + 1];
+                        // Move args down to skip the handler: [f, args...].
+                        for i in 0..(argc - 2) {
+                            s.vstack[base + 1 + i] = s.vstack[base + 2 + i];
+                        }
+                        s.vsp = (base + argc - 1) as u32;
+                        s.push_frame()?;
+                        let pf = (s.fsp - 1) as usize;
+                        s.frames[pf].ret_ip = ip;
+                        s.frames[pf].want = ins.b;
+                        s.frames[pf].base = base as u32;
+                        s.frames[pf].protected = true;
+                        s.frames[pf].err_handler = Some(err_handler);
+                        s.frames[pf].mark_sp = s.mark_sp;
+                        match fv {
+                            Value::Func(fi) => {
+                                setup_func_frame(
+                                    s,
+                                    fi,
+                                    (argc - 2) as u8,
+                                    base + 1,
+                                    0,
+                                    RET_PCALL,
+                                    WANT_ALL,
+                                    NO_CLOSURE,
+                                )?;
+                                ip = s.funcs[fi as usize].entry;
+                            }
+                            Value::Closure(ci) => {
+                                let fi = s.closures[ci as usize].func;
+                                setup_func_frame(
+                                    s,
+                                    fi,
+                                    (argc - 2) as u8,
+                                    base + 1,
+                                    0,
+                                    RET_PCALL,
+                                    WANT_ALL,
+                                    ci,
+                                )?;
+                                ip = s.funcs[fi as usize].entry;
+                            }
+                            _ => {
+                                let r = eval::call(s, fv, (argc - 2) as u8)?;
+                                match r {
+                                    ExecResult::Shell => {
+                                        s.pop_frame();
+                                        return Ok(Some(ExecResult::Shell));
+                                    }
+                                    ExecResult::Exit => {
+                                        s.pop_frame();
+                                        return Ok(Some(ExecResult::Exit));
+                                    }
+                                    ExecResult::Yield(_) => {
+                                        return Err(
+                                            "attempt to yield across a protected call".into()
+                                        );
+                                    }
+                                    ExecResult::Break | ExecResult::Goto(_) => {
+                                        return Err(
+                                            "internal error: control flow from call".into()
+                                        );
+                                    }
+                                    r => finish_pcall(s, base, ins.b, r)?,
+                                }
+                            }
+                        }
+                    }
                     _ => {
                         for i in 0..argc {
                             s.vstack[base + i] = s.vstack[base + 1 + i];
@@ -1254,34 +1336,124 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
             Ok(None) => {}
             Ok(Some(r)) => return Ok(r),
             Err(e) => match unwind_protected(s, floor, e)? {
-                Some(new_ip) => ip = new_ip,
-                None => return Err(e),
+                UnwindResult::Resume(new_ip) => ip = new_ip,
+                UnwindResult::Control(r) => return Ok(r),
+                UnwindResult::Propagate => return Err(e),
             },
         }
     }
 }
 
-/// Catch `e` at the innermost protected (`pcall`) frame at or above `floor`.
-/// On success, unwinds the frame/operand/mark stacks to that frame, pushes
-/// `false` plus the error value at its base, and returns the instruction
-/// pointer to resume at.
+/// Result of catching an error at a protected frame.
+enum UnwindResult {
+    /// Resume execution at the given instruction pointer.
+    Resume(u16),
+    /// The `xpcall` error handler produced control flow (`Shell`/`Exit`) that
+    /// must propagate to the REPL.
+    Control(ExecResult),
+    /// No protected frame was found; the error should propagate to the caller.
+    Propagate,
+}
+
+/// Catch `e` at the innermost protected (`pcall`/`xpcall`) frame at or above
+/// `floor`. On success, unwinds the frame/operand/mark stacks to that frame,
+/// pushes `false` plus the error value (or the `xpcall` handler's results) at
+/// its base, and returns the instruction pointer to resume at.
 fn unwind_protected(
     s: &mut LuaState,
     floor: usize,
     e: LuaError,
-) -> Result<Option<u16>, LuaError> {
+) -> Result<UnwindResult, LuaError> {
     let mut i = s.fsp as usize;
     while i > floor {
         i -= 1;
         if s.frames[i].protected {
             let pframe = s.frames[i];
-            s.fsp = i as u32;
-            s.vsp = pframe.base;
-            s.mark_sp = pframe.mark_sp;
             let v = match e {
                 LuaError::Obj(v) => v,
                 LuaError::Msg(m) => Value::Str(s.intern(m.as_bytes())?),
             };
+            if let Some(err_handler) = pframe.err_handler {
+                // `xpcall`: call the error handler with the error object, then
+                // return false plus the handler's results. Pop the protected
+                // frame before invoking the handler so an error in the handler
+                // propagates to the caller of `xpcall`.
+                let ret_ip = pframe.ret_ip;
+                let base = pframe.base as usize;
+                let want = pframe.want;
+                // Unwind to just below the protected frame, removing both the
+                // protected frame and any callee frames above it.
+                s.fsp = i as u32;
+                s.vsp = base as u32;
+                s.mark_sp = pframe.mark_sp;
+                s.push_val(v)?;
+                let r = match eval::call(s, err_handler, 1) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // The error handler itself raised an error: discard the
+                        // handler frame and any values it left, then let the
+                        // next protected frame (e.g. an outer `pcall`) catch it.
+                        s.fsp = i as u32;
+                        s.vsp = base as u32;
+                        return unwind_protected(s, floor, e);
+                    }
+                };
+                // Prepend `false` to the handler's results at `base`. The
+                // handler was called with its argument at `base`, so its `Ret`
+                // and `Ret2` results are not yet on the stack.
+                let (_n, m) = match r {
+                    ExecResult::Normal => {
+                        s.vstack[base] = Value::Bool(false);
+                        (0usize, 1usize)
+                    }
+                    ExecResult::Ret(v) => {
+                        s.vstack[base] = Value::Bool(false);
+                        s.vstack[base + 1] = v;
+                        (1usize, 2usize)
+                    }
+                    ExecResult::Ret2(a, b) => {
+                        s.vstack[base] = Value::Bool(false);
+                        s.vstack[base + 1] = a;
+                        s.vstack[base + 2] = b;
+                        (2usize, 3usize)
+                    }
+                    ExecResult::RetN(k) => {
+                        let n = k as usize;
+                        s.push_val(Value::Bool(false))?;
+                        let top = s.vsp as usize;
+                        let start = top - (n + 1);
+                        let t = s.vstack[top - 1];
+                        for j in (start + 1..top).rev() {
+                            s.vstack[j] = s.vstack[j - 1];
+                        }
+                        s.vstack[start] = t;
+                        (n, n + 1)
+                    }
+                    ExecResult::Shell => {
+                        return Ok(UnwindResult::Control(ExecResult::Shell));
+                    }
+                    ExecResult::Exit => {
+                        return Ok(UnwindResult::Control(ExecResult::Exit));
+                    }
+                    ExecResult::Yield(_) => {
+                        return Err("attempt to yield across a protected call".into());
+                    }
+                    ExecResult::Break | ExecResult::Goto(_) => {
+                        return Err("internal error: control flow from error handler".into());
+                    }
+                };
+                let out_n = if want == WANT_ALL { m } else { want as usize };
+                if out_n > m {
+                    for j in m..out_n {
+                        s.vstack[base + j] = Value::Nil;
+                    }
+                }
+                s.vsp = (base + out_n) as u32;
+                return Ok(UnwindResult::Resume(ret_ip));
+            }
+            s.fsp = i as u32;
+            s.vsp = pframe.base;
+            s.mark_sp = pframe.mark_sp;
             s.push_val(Value::Bool(false))?;
             s.push_val(v)?;
             let m = 2usize;
@@ -1297,10 +1469,10 @@ fn unwind_protected(
                     s.push_val(Value::Nil)?;
                 }
             }
-            return Ok(Some(pframe.ret_ip));
+            return Ok(UnwindResult::Resume(pframe.ret_ip));
         }
     }
-    Ok(None)
+    Ok(UnwindResult::Propagate)
 }
 
 /// Finish a VM-level `pcall` whose callee was a native (or callable table):

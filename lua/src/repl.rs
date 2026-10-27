@@ -842,12 +842,37 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   resumes and finishes when the coroutine is resumed.\n",
     },
     HelpEntry {
+        name: "xpcall",
+        short: "Call a function with an error handler",
+        detail: "xpcall(f, err, ...)\n\
+                  Like pcall, but on failure calls err(error_object) and\n\
+                  returns false plus the handler's results. The handler itself\n\
+                  runs unprotected; errors inside it propagate to the caller.\n",
+    },
+    HelpEntry {
         name: "error",
         short: "Raise an error",
         detail: "error(v [, level])\n\
                   Raises v as an error object. pcall catches it and returns\n\
                   the value unchanged. level is validated but ignored (this\n\
                   interpreter has no source positions).\n",
+    },
+    HelpEntry {
+        name: "assert",
+        short: "Raise an error if a condition is false",
+        detail: "assert(v [, message, ...])\n\
+                  Returns all its arguments when v is truthy. Raises an error\n\
+                  with message (default \"assertion failed!\") otherwise.\n",
+    },
+    HelpEntry {
+        name: "coroutine",
+        short: "Coroutine library",
+        detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
+                  coroutine.yield(...), coroutine.status(co),\n\
+                  coroutine.wrap(f), coroutine.isyieldable(),\n\
+                  coroutine.running(), coroutine.close(co)\n\
+                  Real coroutines on the bytecode VM (a pool of 3).\n\
+                  type(co) returns \"thread\".\n",
     },
     HelpEntry {
         name: "fetch",
@@ -1247,7 +1272,14 @@ mod tests {
     #[test]
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
-        for cmd in ["help", "exit", "clear", "print", "fetch", "dofile", "ls", "shell", "dhcp", "type", "warn", "pcall", "error"] {
+        for cmd in [
+            "help", "exit", "clear", "lua", "shell",
+            "print", "next", "pairs", "setmetatable",
+            "rawequal", "rawget", "rawlen", "rawset", "select",
+            "tonumber", "tostring", "type", "warn",
+            "pcall", "xpcall", "error", "assert", "coroutine",
+            "fetch", "dofile", "ls", "dhcp",
+        ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
         }
         assert!(out.contains("Type 'help <cmd>'"));

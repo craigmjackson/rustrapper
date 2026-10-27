@@ -130,6 +130,7 @@ Builtins:
 - `_VERSION` — the interpreter version string, `"Lua 5.5"`
 - `next(t [, k])` — return the next key/value pair of a table (or `nil` at the end); `next(t) == nil` tests for an empty table
 - `pairs(t)` — the `next` function plus the table, for `for k, v in pairs(t) do ... end`; a `__pairs` metamethod is dispatched
+- `print(v1, v2, ...)` — print values separated by tabs, followed by a newline
 - `setmetatable(table, metatable|nil)` — store/remove a table's metatable and return the table; dispatched metamethods: `__index`, `__newindex`, `__eq`, `__lt`, `__le`, `__concat`, `__add`/`__sub`/`__mul`/`__div`/`__mod`, `__unm`, `__call`, `__tostring`, `__pairs`; a `__metatable` field protects it
 - `rawequal(v1, v2)` — primitive equality, never `__eq`
 - `rawget(table, index)` — the real `table[index]` without `__index` (agrees with `table[index]`)
@@ -141,7 +142,9 @@ Builtins:
 - `type(v)` — the Lua type name of a value: `"nil"`, `"boolean"`, `"number"`, `"string"`, `"table"`, or `"function"` (native builtins count as functions)
 - `warn(msg, ...)` — concatenate string/number arguments and print `Lua warning: <msg>`; the control messages `"@off"`/`"@on"` toggle warnings
 - `pcall(f, ...)` — protected call: `true` plus the results on success, or `false` plus the error object on failure (a coroutine can `yield` through it)
+- `xpcall(f, err, ...)` — like `pcall`, but on failure calls `err(error_object)` and returns `false` plus the handler's results; the handler runs unprotected
 - `error(v [, level])` — raise `v` as an error object; `level` is validated but ignored (no source positions)
+- `assert(v [, message, ...])` — returns all arguments when `v` is truthy; otherwise raises an error with `message` (default `"assertion failed!"`)
 - `coroutine.create(f)` / `coroutine.resume(co, ...)` / `coroutine.yield(...)` / `coroutine.status(co)` / `coroutine.wrap(co)` / `coroutine.isyieldable()` / `coroutine.running()` / `coroutine.close(co)` — real coroutines on the bytecode VM (a pool of 3; `type(co)` is `"thread"`)
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
 - `fetch("file"[, "dest"])` — download a file from the TFTP server, saving it under the optional local `dest` name, and return its byte count (or `nil`)
