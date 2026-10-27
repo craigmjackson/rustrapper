@@ -65,6 +65,9 @@
 //!   `yield` through `pcall` (the protected frame is kept across the yield).
 //! - `error(v [, level])` builtin: raises `v` as an error object (`level` is
 //!   validated but ignored; there are no source positions).
+//! - `assert(v [, message, ...])` builtin: returns all its arguments when `v`
+//!   is truthy; otherwise raises an error with `message` (default
+//!   `"assertion failed!"`).
 //! - `dhcp` / `dhcp()` builtin: runs the network setup (e1000 + DHCP) and
 //!   enables the `fetch()` builtin. The REPL starts with networking disabled
 //!   until the user runs `dhcp`.
@@ -260,7 +263,7 @@ pub enum Value {
     /// `tostring` is `Native(12)`, `type` is `Native(13)`, `warn` is
     /// `Native(14)`, `pcall` is `Native(15)`, `error` is `Native(16)`, and
     /// 17..=24 are the `coroutine` library (create, resume, yield, status,
-    /// wrap, isyieldable, running, close).
+    /// wrap, isyieldable, running, close). `assert` is `Native(25)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -988,6 +991,9 @@ impl LuaState {
         let _ = self.intern(b"error");
         let error_name = self.intern(b"error").unwrap();
         self.set_global(error_name, Value::Native(16));
+        let _ = self.intern(b"assert");
+        let assert_name = self.intern(b"assert").unwrap();
+        self.set_global(assert_name, Value::Native(25));
         // The `coroutine` library is a table of builtins.
         let coroutine_name = self.intern(b"coroutine").unwrap();
         let tid = crate::eval::new_table(self).unwrap();
@@ -2758,6 +2764,32 @@ mod tests {
         let r = state.intern(b"custom").unwrap();
         let n = super::eval::error_bytes(&state, LuaError::Obj(super::Value::Str(r)), &mut buf);
         assert_eq!(&buf[..n], b"custom");
+    }
+
+    #[test]
+    fn assert_builtin() {
+        // Truthy values return all arguments.
+        assert_eq!(exec("print(assert(1))").unwrap(), "1\n");
+        assert_eq!(exec("print(assert(true, 2, 3))").unwrap(), "true\t2\t3\n");
+        assert_eq!(exec("local a, b = assert(5, 7)\nprint(a, b)").unwrap(), "5\t7\n");
+        // Falsy values raise an error (default or custom message).
+        let mut state = super::LuaState::new();
+        let mut buf = [0u8; 64];
+        let run = |s: &mut super::LuaState, src: &str| -> Result<String, LuaError> {
+            OUT.with(|o| o.borrow_mut().clear());
+            super::LuaState::run(s, src.as_bytes(), putc_test)?;
+            Ok(OUT.with(|o| String::from_utf8(o.borrow().clone()).unwrap()))
+        };
+        let r = run(&mut state, "assert(nil)");
+        assert!(r.is_err());
+        let n = super::eval::error_bytes(&state, r.unwrap_err(), &mut buf);
+        assert_eq!(&buf[..n], b"assertion failed!");
+        let r = run(&mut state, "assert(false, 'custom message')");
+        assert!(r.is_err());
+        let n = super::eval::error_bytes(&state, r.unwrap_err(), &mut buf);
+        assert_eq!(&buf[..n], b"custom message");
+        // Arity error.
+        assert!(exec("assert()").is_err());
     }
 
     #[test]

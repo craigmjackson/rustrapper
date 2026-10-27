@@ -594,6 +594,24 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let obj = if argc >= 1 { argbuf[0] } else { Value::Nil };
             return Err(LuaError::Obj(obj));
         }
+        Value::Native(25) => {
+            // assert(v [, message, ...]): returns all arguments if the first
+            // argument is truthy, otherwise raises an error. The default
+            // message is "assertion failed!".
+            if argc < 1 {
+                return Err("assert expects at least 1 argument".into());
+            }
+            if truthy(argbuf[0]) {
+                ExecResult::RetN(argc)
+            } else {
+                let obj = if argc >= 2 {
+                    argbuf[1]
+                } else {
+                    Value::Str(s.intern(b"assertion failed!")?)
+                };
+                return Err(LuaError::Obj(obj));
+            }
+        }
         Value::Native(17) => {
             // coroutine.create(f) -> thread.
             if argc != 1 {
