@@ -948,6 +948,13 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: string.gsub(\"a b\", \" \", \"-\") -> a-b 1\n",
     },
     HelpEntry {
+        name: "string.len",
+        short: "Length of a string in bytes",
+        detail: "string.len(s)\n\
+                  Returns the number of bytes in `s` (same as #s).\n\
+                  Example: string.len(\"abc\") -> 3\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1425,7 +1432,7 @@ mod tests {
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
-            "string.format", "string.gmatch", "string.gsub",
+            "string.format", "string.gmatch", "string.gsub", "string.len",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

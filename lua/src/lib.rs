@@ -274,7 +274,8 @@ pub enum Value {
     /// `string.char` is `Native(28)`, `string.dump` is `Native(29)`,
     /// `string.find` is `Native(30)`, `string.format` is `Native(31)`,
     /// `string.gmatch` is `Native(32)` (returns a [`Value::Gmatch`]
-    /// iterator), and `string.gsub` is `Native(33)`.
+    /// iterator), `string.gsub` is `Native(33)`, and `string.len` is
+    /// `Native(34)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1120,6 +1121,14 @@ impl LuaState {
             Value::Table(tid),
             Value::Str(gsub_name),
             Value::Native(33),
+        )
+        .unwrap();
+        let len_name = self.intern(b"len").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(len_name),
+            Value::Native(34),
         )
         .unwrap();
         self.set_global(string_name, Value::Table(tid));
@@ -3338,6 +3347,16 @@ mod tests {
         assert!(exec("print(string.gsub(\"x\"))").is_err());
         assert!(exec("print(string.gsub(\"x\", 123, \"y\"))").is_err());
         assert!(exec("print(string.gsub(\"a\", \"a\", true))").is_err());
+    }
+
+    #[test]
+    fn string_len() {
+        assert_eq!(exec("print(string.len(\"abc\"))").unwrap(), "3\n");
+        assert_eq!(exec("print(string.len(\"\"))").unwrap(), "0\n");
+        assert_eq!(exec("print(string.len(\"a\\tb\"))").unwrap(), "3\n");
+        // Error cases.
+        assert!(exec("print(string.len())").is_err());
+        assert!(exec("print(string.len(42))").is_err());
     }
 
     #[test]

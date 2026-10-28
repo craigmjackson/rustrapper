@@ -1840,6 +1840,17 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 Value::Num(count as i64),
             )
         }
+        Value::Native(34) => {
+            // string.len(s): length of the string in bytes.
+            if argc != 1 {
+                return Err("string.len expects 1 argument".into());
+            }
+            let n = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r).len() as i64,
+                _ => return Err("string.len expects a string".into()),
+            };
+            ExecResult::Ret(Value::Num(n))
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
