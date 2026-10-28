@@ -955,6 +955,14 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: string.len(\"abc\") -> 3\n",
     },
     HelpEntry {
+        name: "string.lower",
+        short: "Lowercase a string",
+        detail: "string.lower(s)\n\
+                  Returns a copy of `s` with all ASCII uppercase letters\n\
+                  converted to lowercase. Non-ASCII bytes are unchanged.\n\
+                  Example: string.lower(\"ABC\") -> abc\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1432,7 +1440,7 @@ mod tests {
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
-            "string.format", "string.gmatch", "string.gsub", "string.len",
+            "string.format", "string.gmatch", "string.gsub", "string.len", "string.lower",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

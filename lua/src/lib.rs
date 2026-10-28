@@ -145,7 +145,7 @@ pub const MAX_FUNCS: usize = 32;
 pub const MAX_GLOBALS: usize = 64;
 /// Number of key/value slots per table (tables have their own fixed slots,
 /// so nested table literals can't interleave and corrupt each other).
-pub const TABLE_SLOTS: usize = 8;
+pub const TABLE_SLOTS: usize = 16;
 /// Maximum number of tables alive at once.
 pub const MAX_TABLES: usize = 16;
 /// Safety cap on total statements executed per script run.
@@ -274,8 +274,8 @@ pub enum Value {
     /// `string.char` is `Native(28)`, `string.dump` is `Native(29)`,
     /// `string.find` is `Native(30)`, `string.format` is `Native(31)`,
     /// `string.gmatch` is `Native(32)` (returns a [`Value::Gmatch`]
-    /// iterator), `string.gsub` is `Native(33)`, and `string.len` is
-    /// `Native(34)`.
+    /// iterator), `string.gsub` is `Native(33)`, `string.len` is
+    /// `Native(34)`, and `string.lower` is `Native(35)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1129,6 +1129,14 @@ impl LuaState {
             Value::Table(tid),
             Value::Str(len_name),
             Value::Native(34),
+        )
+        .unwrap();
+        let lower_name = self.intern(b"lower").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(lower_name),
+            Value::Native(35),
         )
         .unwrap();
         self.set_global(string_name, Value::Table(tid));
@@ -3357,6 +3365,14 @@ mod tests {
         // Error cases.
         assert!(exec("print(string.len())").is_err());
         assert!(exec("print(string.len(42))").is_err());
+    }
+
+    #[test]
+    fn string_lower() {
+        assert_eq!(exec("print(string.lower(\"ABC def 123\"))").unwrap(), "abc def 123\n");
+        assert_eq!(exec("print(string.lower(\"\"))").unwrap(), "\n");
+        assert!(exec("print(string.lower())").is_err());
+        assert!(exec("print(string.lower(42))").is_err());
     }
 
     #[test]

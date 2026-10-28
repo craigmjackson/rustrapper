@@ -1851,6 +1851,29 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             };
             ExecResult::Ret(Value::Num(n))
         }
+        Value::Native(35) => {
+            // string.lower(s): copy of s with ASCII uppercase letters lowercased.
+            if argc != 1 {
+                return Err("string.lower expects 1 argument".into());
+            }
+            let bytes = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.lower expects a string".into()),
+            };
+            let mut buf = [0u8; super::STR_CAP];
+            if bytes.len() > buf.len() {
+                return Err("string too long".into());
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                buf[i] = if b.is_ascii_uppercase() {
+                    b + (b'a' - b'A')
+                } else {
+                    b
+                };
+            }
+            let r = s.intern(&buf[..bytes.len()])?;
+            ExecResult::Ret(Value::Str(r))
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
