@@ -1874,6 +1874,76 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let r = s.intern(&buf[..bytes.len()])?;
             ExecResult::Ret(Value::Str(r))
         }
+        Value::Native(36) => {
+            // string.match(s, pattern [, init]): first match's captures (or the
+            // whole match when there are no captures), or nil.
+            if argc < 2 || argc > 3 {
+                return Err("string.match expects 2 or 3 arguments".into());
+            }
+            let subject = match argbuf[0] {
+                Value::Str(r) => r,
+                _ => return Err("string.match expects a string subject".into()),
+            };
+            let pattern = match argbuf[1] {
+                Value::Str(r) => r,
+                _ => return Err("string.match expects a string pattern".into()),
+            };
+            let init = if argc == 3 {
+                integer_index(argbuf[2])?
+            } else {
+                1
+            };
+            let pat_bytes = s.str_bytes(pattern);
+            if !valid_gmatch_pattern(pat_bytes) {
+                return Err("malformed pattern (unfinished capture)".into());
+            }
+
+            // Copy subject/pattern out of the arena.
+            let subj_bytes = s.str_bytes(subject);
+            let mut sbuf = [0u8; super::STR_CAP];
+            let mut pbuf = [0u8; super::STR_CAP];
+            if subj_bytes.len() > sbuf.len() || pat_bytes.len() > pbuf.len() {
+                return Err("string too long".into());
+            }
+            sbuf[..subj_bytes.len()].copy_from_slice(subj_bytes);
+            pbuf[..pat_bytes.len()].copy_from_slice(pat_bytes);
+            let subject = &sbuf[..subj_bytes.len()];
+            let pattern = &pbuf[..pat_bytes.len()];
+
+            let subj_len = subject.len() as i64;
+            let mut start = if init >= 0 { init } else { subj_len + init + 1 };
+            if start < 1 {
+                start = 1;
+            }
+            let pos = (start - 1) as usize;
+
+            match gm_find(subject, pattern, pos) {
+                None => ExecResult::Ret(Value::Nil),
+                Some(m) => {
+                    if m.ncap == 0 {
+                        let v = s.intern(&subject[m.mstart..m.mend])?;
+                        ExecResult::Ret(Value::Str(v))
+                    } else if m.ncap == 1 {
+                        let (cs, ce) = m.caps[0];
+                        let v = s.intern(&subject[cs..ce])?;
+                        ExecResult::Ret(Value::Str(v))
+                    } else if m.ncap == 2 {
+                        let (cs0, ce0) = m.caps[0];
+                        let (cs1, ce1) = m.caps[1];
+                        let a = s.intern(&subject[cs0..ce0])?;
+                        let b = s.intern(&subject[cs1..ce1])?;
+                        ExecResult::Ret2(Value::Str(a), Value::Str(b))
+                    } else {
+                        for k in 0..m.ncap {
+                            let (cs, ce) = m.caps[k];
+                            let v = s.intern(&subject[cs..ce])?;
+                            s.push_val(Value::Str(v))?;
+                        }
+                        ExecResult::RetN(m.ncap as u8)
+                    }
+                }
+            }
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source

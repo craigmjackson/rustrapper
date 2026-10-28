@@ -963,6 +963,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: string.lower(\"ABC\") -> abc\n",
     },
     HelpEntry {
+        name: "string.match",
+        short: "First match of a pattern",
+        detail: "string.match(s, pattern [, init])\n\
+                  Returns the captures of the first match of `pattern` in `s`\n\
+                  (or the whole match when there are no captures), starting at\n\
+                  `init` (default 1). Returns nil if there is no match.\n\
+                  Example: string.match(\"a=5\", \"(%a)=(%d+)\") -> a 5\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1440,7 +1449,7 @@ mod tests {
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
-            "string.format", "string.gmatch", "string.gsub", "string.len", "string.lower",
+            "string.format", "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

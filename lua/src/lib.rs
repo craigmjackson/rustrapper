@@ -275,7 +275,8 @@ pub enum Value {
     /// `string.find` is `Native(30)`, `string.format` is `Native(31)`,
     /// `string.gmatch` is `Native(32)` (returns a [`Value::Gmatch`]
     /// iterator), `string.gsub` is `Native(33)`, `string.len` is
-    /// `Native(34)`, and `string.lower` is `Native(35)`.
+    /// `Native(34)`, `string.lower` is `Native(35)`, and `string.match`
+    /// is `Native(36)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1137,6 +1138,14 @@ impl LuaState {
             Value::Table(tid),
             Value::Str(lower_name),
             Value::Native(35),
+        )
+        .unwrap();
+        let match_name = self.intern(b"match").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(match_name),
+            Value::Native(36),
         )
         .unwrap();
         self.set_global(string_name, Value::Table(tid));
@@ -3373,6 +3382,19 @@ mod tests {
         assert_eq!(exec("print(string.lower(\"\"))").unwrap(), "\n");
         assert!(exec("print(string.lower())").is_err());
         assert!(exec("print(string.lower(42))").is_err());
+    }
+
+    #[test]
+    fn string_match() {
+        assert_eq!(exec("print(string.match(\"hello 123\", \"%d+\"))").unwrap(), "123\n");
+        assert_eq!(exec("print(string.match(\"hello 123\", \"(%a+) (%d+)\"))").unwrap(), "hello\t123\n");
+        assert_eq!(exec("print(string.match(\"abc\", \"z\"))").unwrap(), "nil\n");
+        assert_eq!(exec("local a, b = string.match(\"x=5\", \"(%a)=(%d+)\")\nprint(a, b)").unwrap(), "x\t5\n");
+        assert_eq!(exec("print(string.match(\"abcabc\", \"abc\", 4))").unwrap(), "abc\n");
+        assert!(exec("print(string.match())").is_err());
+        assert!(exec("print(string.match(\"x\"))").is_err());
+        assert!(exec("print(string.match(42, \"x\"))").is_err());
+        assert!(exec("print(string.match(\"x\", \"(abc\"))").is_err());
     }
 
     #[test]
