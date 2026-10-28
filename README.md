@@ -135,6 +135,7 @@ Builtins:
 - `string.char(b1, b2, ...)` — return a string made from the given byte values (each 0..255); with no arguments returns `""`
 - `string.dump(f)` — return a binary string containing the function's bytecode and metadata (interpreter-specific format; no `load` is provided)
 - `string.find(s, pattern [, init [, plain]])` — find the first match of `pattern` in `s`; returns the 1-based start/end indices or `nil`; `plain=true` does a literal substring search; supports a subset of Lua patterns (`.`, `%a/%d/%l/%s/%u/%w/%x/%p/%c`, `[set]`, `[^set]`, `*`, `+`, `-`, `?`, `^`, `$`)
+- `string.format(formatstring, ...)` — format arguments according to `formatstring`; supports `%% %s %q %c %d %i %u %o %x %X %f %e %E %g %G` with flags `- + ' ' 0 #`, width, and precision; `%g`/`%G` use `%.14g` precision; results over 1024 bytes error
 - `setmetatable(table, metatable|nil)` — store/remove a table's metatable and return the table; dispatched metamethods: `__index`, `__newindex`, `__eq`, `__lt`, `__le`, `__concat`, `__add`/`__sub`/`__mul`/`__div`/`__mod`, `__unm`, `__call`, `__tostring`, `__pairs`; a `__metatable` field protects it
 - `rawequal(v1, v2)` — primitive equality, never `__eq`
 - `rawget(table, index)` — the real `table[index]` without `__index` (agrees with `table[index]`)
@@ -271,13 +272,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 297 tests across all crates
+cargo test --workspace   # 303 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 112   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
+| `lua`        | 118   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

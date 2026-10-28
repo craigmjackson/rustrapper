@@ -902,6 +902,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   [^set], *, +, -, ?, ^, $.\n",
     },
     HelpEntry {
+        name: "string.format",
+        short: "Format values into a string",
+        detail: "string.format(formatstring, ...)\n\
+                  Formats the arguments according to `formatstring`. Supported\n\
+                  conversions: %% %s %q %c %d %i %u %o %x %X %f %e %E %g %G.\n\
+                  Flags: - + ' ' 0 #. Width and precision are supported.\n\
+                  %g/%G use %.14g precision. Results are capped at 1024 bytes.\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1316,6 +1325,7 @@ mod tests {
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
+            "string.format",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

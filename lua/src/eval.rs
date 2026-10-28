@@ -48,6 +48,40 @@ fn float_floor(x: f64) -> f64 {
     }
 }
 
+fn float_ceil(x: f64) -> f64 {
+    let t = x as i64;
+    let tf = t as f64;
+    if tf < x {
+        tf + 1.0
+    } else {
+        tf
+    }
+}
+
+fn float_trunc(x: f64) -> f64 {
+    if x >= 0.0 {
+        float_floor(x)
+    } else {
+        float_ceil(x)
+    }
+}
+
+fn float_round(x: f64) -> f64 {
+    if x >= 0.0 {
+        float_floor(x + 0.5)
+    } else {
+        float_ceil(x - 0.5)
+    }
+}
+
+fn pow10_u32(exp: u32) -> f64 {
+    let mut r = 1.0_f64;
+    for _ in 0..exp {
+        r *= 10.0;
+    }
+    r
+}
+
 /// Convert a value to an integer index, accepting integers and finite floats
 /// that represent whole numbers (used by `string.byte`).
 fn integer_index(v: Value) -> Result<i64, LuaError> {
@@ -1171,6 +1205,70 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 }
             }
         }
+        Value::Native(31) => {
+            // string.format(formatstring, ...): formats arguments according to
+            // the format string. Supports %% %s %q %c %d %i %u %o %x %X %f %e
+            // %E %g %G plus flags - + ' ' 0 #, width, and precision.
+            if argc < 1 {
+                return Err("string.format expects at least 1 argument".into());
+            }
+            let fmt_bytes = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.format expects a string format".into()),
+            };
+            if fmt_bytes.len() > 1024 {
+                return Err("string.format format string too long".into());
+            }
+            let mut fmt_buf = [0u8; 1024];
+            fmt_buf[..fmt_bytes.len()].copy_from_slice(fmt_bytes);
+            let fmt = &fmt_buf[..fmt_bytes.len()];
+            let mut out = [0u8; 1024];
+            let mut out_len = 0usize;
+            let mut argi = 1usize;
+            let mut i = 0usize;
+            while i < fmt.len() {
+                if fmt[i] != b'%' {
+                    if out_len >= out.len() {
+                        return Err("string.format result too long".into());
+                    }
+                    out[out_len] = fmt[i];
+                    out_len += 1;
+                    i += 1;
+                    continue;
+                }
+                if i + 1 >= fmt.len() {
+                    return Err("malformed format string".into());
+                }
+                if fmt[i + 1] == b'%' {
+                    if out_len >= out.len() {
+                        return Err("string.format result too long".into());
+                    }
+                    out[out_len] = b'%';
+                    out_len += 1;
+                    i += 2;
+                    continue;
+                }
+                let (spec, consumed) = parse_format_spec(fmt, i)?;
+                if argi >= argc as usize {
+                    return Err("not enough arguments for string.format".into());
+                }
+                let mut piece = [0u8; 1024];
+                let n = format_value(s, &spec, argbuf[argi], &mut piece)?;
+                let piece = &piece[..n];
+                if out_len + piece.len() > out.len() {
+                    return Err("string.format result too long".into());
+                }
+                out[out_len..out_len + piece.len()].copy_from_slice(piece);
+                out_len += piece.len();
+                argi += 1;
+                i += consumed;
+            }
+            if argi < argc as usize {
+                return Err("too many arguments for string.format".into());
+            }
+            let r = s.intern(&out[..out_len])?;
+            ExecResult::Ret(Value::Str(r))
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
@@ -2193,6 +2291,500 @@ fn itoa(n: i64) -> ([u8; 24], usize) {
         j += 1;
     }
     (buf, len)
+}
+
+// ── string.format helpers ───────────────────────────────────────────────────
+
+/// Bit flags for `string.format` format specifiers.
+const F_LEFT: u8 = 1 << 0;
+const F_PLUS: u8 = 1 << 1;
+const F_SPACE: u8 = 1 << 2;
+const F_ZERO: u8 = 1 << 3;
+const F_HASH: u8 = 1 << 4;
+
+/// A parsed `printf`-style format specifier (excluding the leading `%`).
+#[derive(Clone, Copy)]
+struct FormatSpec {
+    flags: u8,
+    width: usize,
+    precision: Option<usize>,
+    ty: u8,
+}
+
+/// Parse a format specifier starting at `fmt[start] == '%'`. Returns the parsed
+/// specifier and the number of bytes consumed (including the `%`).
+fn parse_format_spec(fmt: &[u8], start: usize) -> Result<(FormatSpec, usize), LuaError> {
+    if fmt[start] != b'%' || start + 1 >= fmt.len() {
+        return Err("malformed format string".into());
+    }
+    let mut i = start + 1;
+    let mut flags = 0u8;
+    while i < fmt.len() {
+        match fmt[i] {
+            b'-' => flags |= F_LEFT,
+            b'+' => flags |= F_PLUS,
+            b' ' => flags |= F_SPACE,
+            b'0' => flags |= F_ZERO,
+            b'#' => flags |= F_HASH,
+            _ => break,
+        }
+        i += 1;
+    }
+    let mut width = 0usize;
+    while i < fmt.len() && fmt[i].is_ascii_digit() {
+        width = width.saturating_mul(10).saturating_add((fmt[i] - b'0') as usize);
+        i += 1;
+    }
+    let mut precision = None;
+    if i < fmt.len() && fmt[i] == b'.' {
+        i += 1;
+        let mut p = 0usize;
+        while i < fmt.len() && fmt[i].is_ascii_digit() {
+            p = p.saturating_mul(10).saturating_add((fmt[i] - b'0') as usize);
+            i += 1;
+        }
+        precision = Some(p);
+    }
+    if i >= fmt.len() {
+        return Err("malformed format string".into());
+    }
+    let ty = fmt[i];
+    match ty {
+        b's' | b'q' | b'c' | b'd' | b'i' | b'u' | b'o' | b'x' | b'X' | b'f' | b'e' | b'E'
+        | b'g' | b'G' => {}
+        _ => return Err("invalid option in format string".into()),
+    }
+    i += 1;
+    Ok((
+        FormatSpec {
+            flags,
+            width,
+            precision,
+            ty,
+        },
+        i - start,
+    ))
+}
+
+/// Convert a value to an integer for integer/`%c` conversions, accepting
+/// integers and finite whole floats.
+fn to_integer_for_format(v: Value) -> Result<i64, LuaError> {
+    match v {
+        Value::Num(n) => Ok(n),
+        Value::Float(f) if f.is_finite() && f == float_floor(f) => Ok(f as i64),
+        _ => Err("bad argument (number expected, got string)".into()),
+    }
+}
+
+/// Format a single argument according to `spec`, writing the rendered piece
+/// into `out` and returning its length.
+fn format_value(
+    s: &mut LuaState,
+    spec: &FormatSpec,
+    arg: Value,
+    out: &mut [u8],
+) -> Result<usize, LuaError> {
+    match spec.ty {
+        b's' => {
+            let sr = value_to_string(s, arg)?;
+            let bytes = s.str_bytes(sr);
+            let body = if let Some(p) = spec.precision {
+                &bytes[..bytes.len().min(p)]
+            } else {
+                bytes
+            };
+            Ok(apply_layout(out, None, &[], body, spec, false))
+        }
+        b'q' => {
+            let bytes = match arg {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("bad argument #2 (string expected)".into()),
+            };
+            let mut quoted = [0u8; 1024];
+            let len = quote_string(bytes, &mut quoted)?;
+            Ok(apply_layout(out, None, &[], &quoted[..len], spec, false))
+        }
+        b'c' => {
+            let n = to_integer_for_format(arg)?;
+            if n < 0 || n > 255 {
+                return Err("bad argument (value out of range)".into());
+            }
+            let ch = [n as u8];
+            Ok(apply_layout(out, None, &[], &ch, spec, false))
+        }
+        b'd' | b'i' => format_integer(arg, spec, 10, false, out),
+        b'u' => format_integer(arg, spec, 10, true, out),
+        b'o' => format_integer(arg, spec, 8, true, out),
+        b'x' | b'X' => format_integer(arg, spec, 16, true, out),
+        b'f' | b'e' | b'E' | b'g' | b'G' => format_float(arg, spec, out),
+        _ => Err("invalid option in format string".into()),
+    }
+}
+
+/// Quote a string for `%q`, escaping `\`, `"`, `\n`, `\r`, `\t`, and writing
+/// non-printable bytes as `\ddd`.
+fn quote_string(src: &[u8], out: &mut [u8]) -> Result<usize, LuaError> {
+    if out.len() < 2 {
+        return Err("string.format result too long".into());
+    }
+    let mut o = 0usize;
+    out[o] = b'"';
+    o += 1;
+    for &b in src {
+        if o + 4 > out.len() {
+            return Err("string.format result too long".into());
+        }
+        match b {
+            b'\\' => {
+                out[o] = b'\\';
+                out[o + 1] = b'\\';
+                o += 2;
+            }
+            b'"' => {
+                out[o] = b'\\';
+                out[o + 1] = b'"';
+                o += 2;
+            }
+            b'\n' => {
+                out[o] = b'\\';
+                out[o + 1] = b'n';
+                o += 2;
+            }
+            b'\r' => {
+                out[o] = b'\\';
+                out[o + 1] = b'r';
+                o += 2;
+            }
+            b'\t' => {
+                out[o] = b'\\';
+                out[o + 1] = b't';
+                o += 2;
+            }
+            0x20..=0x7E => {
+                out[o] = b;
+                o += 1;
+            }
+            _ => {
+                out[o] = b'\\';
+                out[o + 1] = b'0' + (b / 100);
+                out[o + 2] = b'0' + ((b % 100) / 10);
+                out[o + 3] = b'0' + (b % 10);
+                o += 4;
+            }
+        }
+    }
+    if o + 1 > out.len() {
+        return Err("string.format result too long".into());
+    }
+    out[o] = b'"';
+    o += 1;
+    Ok(o)
+}
+
+/// Format an integer value according to `spec` in the given `base`.
+fn format_integer(
+    v: Value,
+    spec: &FormatSpec,
+    base: u32,
+    unsigned: bool,
+    out: &mut [u8],
+) -> Result<usize, LuaError> {
+    let n = to_integer_for_format(v)?;
+    let (mut mag, negative) = if unsigned {
+        (n as u64, false)
+    } else if n < 0 {
+        (n.wrapping_neg() as u64, true)
+    } else {
+        (n as u64, false)
+    };
+
+    let mut digits = [0u8; 64];
+    let mut dlen = 0usize;
+    let skip_digits = spec.precision == Some(0) && mag == 0;
+    if !skip_digits {
+        loop {
+            let d = (mag % base as u64) as u8;
+            digits[dlen] = if d < 10 {
+                b'0' + d
+            } else if spec.ty == b'X' {
+                b'A' + (d - 10)
+            } else {
+                b'a' + (d - 10)
+            };
+            dlen += 1;
+            mag /= base as u64;
+            if mag == 0 {
+                break;
+            }
+        }
+        // Reverse digits in place.
+        let mut a = 0usize;
+        let mut b = dlen;
+        while a < b {
+            b -= 1;
+            digits.swap(a, b);
+            a += 1;
+        }
+    }
+
+    let sign: Option<u8> = if negative {
+        Some(b'-')
+    } else if spec.flags & F_PLUS != 0 {
+        Some(b'+')
+    } else if spec.flags & F_SPACE != 0 {
+        Some(b' ')
+    } else {
+        None
+    };
+
+    let prefix: &[u8] = if spec.flags & F_HASH != 0 && !skip_digits {
+        match spec.ty {
+            b'o' => b"0",
+            b'x' => b"0x",
+            b'X' => b"0X",
+            _ => b"",
+        }
+    } else {
+        b""
+    };
+
+    let prec = spec.precision.unwrap_or(0);
+    let leading_zeros = if dlen < prec { prec - dlen } else { 0 };
+    let mut body = [0u8; 80];
+    let mut body_len = 0usize;
+    for _ in 0..leading_zeros {
+        body[body_len] = b'0';
+        body_len += 1;
+    }
+    body[body_len..body_len + dlen].copy_from_slice(&digits[..dlen]);
+    body_len += dlen;
+
+    Ok(apply_layout(out, sign, prefix, &body[..body_len], spec, true))
+}
+
+/// Format a floating-point value according to `spec`.
+fn format_float(v: Value, spec: &FormatSpec, out: &mut [u8]) -> Result<usize, LuaError> {
+    let f = match v {
+        Value::Num(n) => n as f64,
+        Value::Float(x) => x,
+        _ => return Err("bad argument (number expected, got string)".into()),
+    };
+    let prec = spec.precision.unwrap_or(6);
+    let mut tmp = [0u8; 128];
+    let len = match spec.ty {
+        b'f' => format_fixed(f, prec, &mut tmp),
+        b'e' | b'E' => {
+            let mut w = FmtBuf { buf: &mut tmp, len: 0 };
+            use core::fmt::Write;
+            let _ = if spec.ty == b'E' {
+                write!(w, "{:.prec$E}", f, prec = prec)
+            } else {
+                write!(w, "{:.prec$e}", f, prec = prec)
+            };
+            w.len
+        }
+        b'g' | b'G' => {
+            // `%g`/%G` reuse the same digit generator as `tostring` (%.14g),
+            // ignoring precision for simplicity.
+            let n = fmt_float(f, &mut tmp);
+            if spec.ty == b'G' {
+                for b in &mut tmp[..n] {
+                    if b'a' <= *b && *b <= b'z' {
+                        *b = *b - b'a' + b'A';
+                    }
+                }
+            }
+            n
+        }
+        _ => unreachable!(),
+    };
+    let len = if matches!(spec.ty, b'e' | b'E') {
+        normalize_exponent(&mut tmp, len)
+    } else {
+        len
+    };
+
+    let value_bytes = &tmp[..len];
+    let mut sign: Option<u8> = None;
+    let mut body_start = 0usize;
+    if !value_bytes.is_empty() && value_bytes[0] == b'-' {
+        sign = Some(b'-');
+        body_start = 1;
+    } else if spec.flags & F_PLUS != 0 {
+        sign = Some(b'+');
+    } else if spec.flags & F_SPACE != 0 {
+        sign = Some(b' ');
+    }
+    // For floating-point conversions the zero flag pads to the field width
+    // even when a precision is present (unlike integer conversions, where a
+    // precision disables the zero flag).
+    let pad_spec = FormatSpec {
+        precision: None,
+        ..*spec
+    };
+    Ok(apply_layout(
+        out,
+        sign,
+        &[],
+        &value_bytes[body_start..],
+        &pad_spec,
+        true,
+    ))
+}
+
+/// Ensure the exponent part of a scientific-notation float includes an
+/// explicit sign and at least two digits (e.g. `1.23e3` -> `1.23e+03`),
+/// matching C `printf`/`%e`.
+fn normalize_exponent(buf: &mut [u8], len: usize) -> usize {
+    let pos = match buf[..len].iter().position(|&b| b == b'e' || b == b'E') {
+        Some(p) => p,
+        None => return len,
+    };
+    let after = pos + 1;
+    let mut new_len = len;
+    // Insert a `+` if the exponent starts with a digit.
+    if after < new_len && buf[after].is_ascii_digit() {
+        for i in (after..new_len).rev() {
+            buf[i + 1] = buf[i];
+        }
+        buf[after] = b'+';
+        new_len += 1;
+    }
+    let sign_pos = after;
+    let digits_start = sign_pos + 1;
+    let mut digits_end = digits_start;
+    while digits_end < new_len && buf[digits_end].is_ascii_digit() {
+        digits_end += 1;
+    }
+    let nd = digits_end - digits_start;
+    if nd < 2 {
+        let insert = 2 - nd;
+        for i in (digits_start..new_len).rev() {
+            buf[i + insert] = buf[i];
+        }
+        for i in 0..insert {
+            buf[digits_start + i] = b'0';
+        }
+        new_len += insert;
+    }
+    new_len
+}
+
+/// Format a float in fixed-point notation with `prec` digits after the
+/// decimal point. `out` must be at least 64 bytes.
+fn format_fixed(f: f64, prec: usize, out: &mut [u8]) -> usize {
+    if f.is_nan() {
+        out[..3].copy_from_slice(b"nan");
+        return 3;
+    }
+    if f.is_infinite() {
+        let s: &[u8] = if f < 0.0 { b"-inf" } else { b"inf" };
+        out[..s.len()].copy_from_slice(s);
+        return s.len();
+    }
+    let neg = f.is_sign_negative() && f != 0.0;
+    let mut v = if neg { -f } else { f };
+    if prec > 0 {
+        let factor = pow10_u32(prec as u32);
+        v = float_round(v * factor) / factor;
+    } else {
+        v = float_round(v);
+    }
+    let int_part = float_trunc(v);
+    let frac_part = float_round((v - int_part) * pow10_u32(prec as u32)) as u64;
+
+    let mut o = 0usize;
+    if neg {
+        out[o] = b'-';
+        o += 1;
+    }
+    let (ibuf, ilen) = itoa(int_part as i64);
+    out[o..o + ilen].copy_from_slice(&ibuf[..ilen]);
+    o += ilen;
+    if prec > 0 {
+        out[o] = b'.';
+        o += 1;
+        let mut tmp = [0u8; 20];
+        let mut tlen = 0usize;
+        if frac_part == 0 {
+            tmp[0] = b'0';
+            tlen = 1;
+        } else {
+            let mut fv = frac_part;
+            while fv > 0 {
+                tmp[tlen] = b'0' + (fv % 10) as u8;
+                tlen += 1;
+                fv /= 10;
+            }
+            let mut a = 0usize;
+            let mut b = tlen;
+            while a < b {
+                b -= 1;
+                tmp.swap(a, b);
+                a += 1;
+            }
+        }
+        for _ in tlen..prec {
+            out[o] = b'0';
+            o += 1;
+        }
+        out[o..o + tlen].copy_from_slice(&tmp[..tlen]);
+        o += tlen;
+    }
+    o
+}
+
+/// Apply width, alignment, and zero-padding to a formatted body.
+fn apply_layout(
+    out: &mut [u8],
+    sign: Option<u8>,
+    prefix: &[u8],
+    body: &[u8],
+    spec: &FormatSpec,
+    allow_zero_pad: bool,
+) -> usize {
+    let content_len = sign.map_or(0, |_| 1) + prefix.len() + body.len();
+    let pad = if spec.width > content_len {
+        spec.width - content_len
+    } else {
+        0
+    };
+    let left = spec.flags & F_LEFT != 0;
+    let zero = !left
+        && allow_zero_pad
+        && spec.flags & F_ZERO != 0
+        && spec.precision.is_none();
+
+    let mut o = 0usize;
+    if !left && !zero {
+        for _ in 0..pad {
+            out[o] = b' ';
+            o += 1;
+        }
+    }
+    if let Some(c) = sign {
+        out[o] = c;
+        o += 1;
+    }
+    for &b in prefix {
+        out[o] = b;
+        o += 1;
+    }
+    if zero {
+        for _ in 0..pad {
+            out[o] = b'0';
+            o += 1;
+        }
+    }
+    out[o..o + body.len()].copy_from_slice(body);
+    o += body.len();
+    if left {
+        for _ in 0..pad {
+            out[o] = b' ';
+            o += 1;
+        }
+    }
+    o
 }
 
 // ── Tables ──────────────────────────────────────────────────────────────────

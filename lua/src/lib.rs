@@ -269,8 +269,8 @@ pub enum Value {
     /// 17..=24 are the `coroutine` library (create, resume, yield, status,
     /// wrap, isyieldable, running, close). `assert` is `Native(25)`,
     /// `xpcall` is `Native(26)`, `string.byte` is `Native(27)`,
-    /// `string.char` is `Native(28)`, `string.dump` is `Native(29)`, and
-    /// `string.find` is `Native(30)`.
+    /// `string.char` is `Native(28)`, `string.dump` is `Native(29)`,
+    /// `string.find` is `Native(30)`, and `string.format` is `Native(31)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1060,6 +1060,14 @@ impl LuaState {
             Value::Table(tid),
             Value::Str(find_name),
             Value::Native(30),
+        )
+        .unwrap();
+        let format_name = self.intern(b"format").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(format_name),
+            Value::Native(31),
         )
         .unwrap();
         self.set_global(string_name, Value::Table(tid));
@@ -2919,7 +2927,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn multiple_assignment() {
         // A right-hand-side list is not supported (only a call expands).
         assert!(exec("a, b = 1, 2\nprint(a, b)").is_err());
@@ -3113,6 +3120,69 @@ mod tests {
         assert!(exec("print(string.find(\"x\", 123))").is_err());
         // Error: wrong argument count.
         assert!(exec("print(string.find(\"x\"))").is_err());
+    }
+
+    #[test]
+    fn string_format() {
+        // Literal text with no conversions.
+        assert_eq!(exec("print(string.format(\"hello\"))").unwrap(), "hello\n");
+        // %% literal.
+        assert_eq!(exec("print(string.format(\"100%%\"))").unwrap(), "100%\n");
+        // %s
+        assert_eq!(exec("print(string.format(\"hello %s\", \"world\"))").unwrap(), "hello world\n");
+        // %s coerces numbers via tostring.
+        assert_eq!(exec("print(string.format(\"%s\", 42))").unwrap(), "42\n");
+        // %s width and left align.
+        assert_eq!(exec("print(string.format(\"[%10s]\", \"hi\"))").unwrap(), "[        hi]\n");
+        assert_eq!(exec("print(string.format(\"[%-10s]\", \"hi\"))").unwrap(), "[hi        ]\n");
+        // %s precision truncates.
+        assert_eq!(exec("print(string.format(\"%.3s\", \"hello\"))").unwrap(), "hel\n");
+        // %q
+        assert_eq!(exec("print(string.format(\"%q\", \"a\tb\"))").unwrap(), "\"a\\tb\"\n");
+        // %c
+        assert_eq!(exec("print(string.format(\"%c\", 65))").unwrap(), "A\n");
+        assert_eq!(exec("print(string.format(\"%c\", 48))").unwrap(), "0\n");
+        // %d / %i signed decimal.
+        assert_eq!(exec("print(string.format(\"%d\", 42))").unwrap(), "42\n");
+        assert_eq!(exec("print(string.format(\"%i\", -7))").unwrap(), "-7\n");
+        assert_eq!(exec("print(string.format(\"%+d\", 5))").unwrap(), "+5\n");
+        assert_eq!(exec("print(string.format(\"% d\", 5))").unwrap(), " 5\n");
+        assert_eq!(exec("print(string.format(\"%05d\", 7))").unwrap(), "00007\n");
+        assert_eq!(exec("print(string.format(\"%-5d\", 7))").unwrap(), "7    \n");
+        assert_eq!(exec("print(string.format(\"%.5d\", 7))").unwrap(), "00007\n");
+        // %u unsigned.
+        assert_eq!(exec("print(string.format(\"%u\", 42))").unwrap(), "42\n");
+        assert_eq!(exec("print(string.format(\"%u\", -1))").unwrap(), "18446744073709551615\n");
+        // %o octal.
+        assert_eq!(exec("print(string.format(\"%o\", 8))").unwrap(), "10\n");
+        assert_eq!(exec("print(string.format(\"%#o\", 8))").unwrap(), "010\n");
+        // %x / %X hex.
+        assert_eq!(exec("print(string.format(\"%x\", 255))").unwrap(), "ff\n");
+        assert_eq!(exec("print(string.format(\"%X\", 255))").unwrap(), "FF\n");
+        assert_eq!(exec("print(string.format(\"%#x\", 255))").unwrap(), "0xff\n");
+        assert_eq!(exec("print(string.format(\"%#08x\", 1))").unwrap(), "0x000001\n");
+        // %f fixed-point.
+        assert_eq!(exec("print(string.format(\"%.3f\", 3.14159))").unwrap(), "3.142\n");
+        assert_eq!(exec("print(string.format(\"%f\", 1.5))").unwrap(), "1.500000\n");
+        assert_eq!(exec("print(string.format(\"%.0f\", 2.5))").unwrap(), "3\n");
+        assert_eq!(exec("print(string.format(\"%8.2f\", 3.1))").unwrap(), "    3.10\n");
+        assert_eq!(exec("print(string.format(\"%08.2f\", 3.1))").unwrap(), "00003.10\n");
+        assert_eq!(exec("print(string.format(\"%-8.2f\", 3.1))").unwrap(), "3.10    \n");
+        // %e / %E scientific.
+        assert_eq!(exec("print(string.format(\"%.2e\", 1234.5))").unwrap(), "1.23e+03\n");
+        assert_eq!(exec("print(string.format(\"%.2E\", 1234.5))").unwrap(), "1.23E+03\n");
+        // %g / %G shortest (precision is ignored; uses %.14g).
+        assert_eq!(exec("print(string.format(\"%g\", 1.5))").unwrap(), "1.5\n");
+        assert_eq!(exec("print(string.format(\"%G\", 1.5))").unwrap(), "1.5\n");
+        assert_eq!(exec("print(string.format(\"%g\", 1e20))").unwrap(), "1e+20\n");
+        // Multiple conversions.
+        assert_eq!(exec("print(string.format(\"%s=%d %x\", \"val\", 10, 15))").unwrap(), "val=10 f\n");
+        // Errors.
+        assert!(exec("print(string.format())").is_err());
+        assert!(exec("print(string.format(\"%d\"))").is_err());
+        assert!(exec("print(string.format(\"%d\", 1, 2))").is_err());
+        assert!(exec("print(string.format(\"%z\", 1))").is_err());
+        assert!(exec("print(string.format(\"%d\", \"x\"))").is_err());
     }
 
     #[test]
