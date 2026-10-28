@@ -269,7 +269,8 @@ pub enum Value {
     /// 17..=24 are the `coroutine` library (create, resume, yield, status,
     /// wrap, isyieldable, running, close). `assert` is `Native(25)`,
     /// `xpcall` is `Native(26)`, `string.byte` is `Native(27)`,
-    /// `string.char` is `Native(28)`, and `string.dump` is `Native(29)`.
+    /// `string.char` is `Native(28)`, `string.dump` is `Native(29)`, and
+    /// `string.find` is `Native(30)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1051,6 +1052,14 @@ impl LuaState {
             Value::Table(tid),
             Value::Str(dump_name),
             Value::Native(29),
+        )
+        .unwrap();
+        let find_name = self.intern(b"find").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(find_name),
+            Value::Native(30),
         )
         .unwrap();
         self.set_global(string_name, Value::Table(tid));
@@ -3059,6 +3068,51 @@ mod tests {
         // Error: wrong argument count.
         assert!(exec("print(string.dump())").is_err());
         assert!(exec("print(string.dump(f, 1))").is_err());
+    }
+
+    #[test]
+    fn string_find() {
+        // Basic literal match (plain).
+        assert_eq!(exec("print(string.find(\"hello world\", \"world\", 1, true))").unwrap(), "7\t11\n");
+        // Default init=1, plain=false but pattern has no magic chars.
+        assert_eq!(exec("print(string.find(\"hello\", \"ell\"))").unwrap(), "2\t4\n");
+        // Not found.
+        assert_eq!(exec("print(string.find(\"hello\", \"xyz\"))").unwrap(), "nil\n");
+        // init > 1.
+        assert_eq!(exec("print(string.find(\"hello hello\", \"hello\", 2, true))").unwrap(), "7\t11\n");
+        // Negative init.
+        assert_eq!(exec("print(string.find(\"hello\", \"ell\", -4))").unwrap(), "2\t4\n");
+        // Empty pattern matches at start.
+        assert_eq!(exec("print(string.find(\"abc\", \"\", 2, true))").unwrap(), "2\t1\n");
+        // Pattern with `.`.
+        assert_eq!(exec("print(string.find(\"abc123\", \"c.2\"))").unwrap(), "3\t5\n");
+        // Pattern with `%d`.
+        assert_eq!(exec("print(string.find(\"abc123\", \"%d+\"))").unwrap(), "4\t6\n");
+        // Pattern with character class.
+        assert_eq!(exec("print(string.find(\"abc123\", \"[a-z]+\"))").unwrap(), "1\t3\n");
+        // Negated class.
+        assert_eq!(exec("print(string.find(\"abc123\", \"[^0-9]+\"))").unwrap(), "1\t3\n");
+        // Start anchor.
+        assert_eq!(exec("print(string.find(\"hello\", \"^he\"))").unwrap(), "1\t2\n");
+        assert_eq!(exec("print(string.find(\"hello\", \"^lo\"))").unwrap(), "nil\n");
+        // End anchor.
+        assert_eq!(exec("print(string.find(\"hello\", \"lo$\"))").unwrap(), "4\t5\n");
+        assert_eq!(exec("print(string.find(\"hello\", \"he$\"))").unwrap(), "nil\n");
+        // Quantifiers.
+        assert_eq!(exec("print(string.find(\"aaab\", \"a*b\"))").unwrap(), "1\t4\n");
+        assert_eq!(exec("print(string.find(\"b\", \"a*b\"))").unwrap(), "1\t1\n");
+        assert_eq!(exec("print(string.find(\"aaab\", \"a+b\"))").unwrap(), "1\t4\n");
+        assert_eq!(exec("print(string.find(\"b\", \"a+b\"))").unwrap(), "nil\n");
+        assert_eq!(exec("print(string.find(\"aaab\", \"a*\"))").unwrap(), "1\t3\n");
+        assert_eq!(exec("print(string.find(\"aaab\", \"a-\"))").unwrap(), "1\t0\n");
+        // Captures are not supported; parentheses are treated as literals.
+        assert_eq!(exec("print(string.find(\"a(b)c\", \"(b)\"))").unwrap(), "2\t4\n");
+        // Error: non-string subject.
+        assert!(exec("print(string.find(123, \"x\"))").is_err());
+        // Error: non-string pattern.
+        assert!(exec("print(string.find(\"x\", 123))").is_err());
+        // Error: wrong argument count.
+        assert!(exec("print(string.find(\"x\"))").is_err());
     }
 
     #[test]

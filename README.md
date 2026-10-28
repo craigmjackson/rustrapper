@@ -134,6 +134,7 @@ Builtins:
 - `string.byte(s [, i [, j]])` — return the numeric byte codes of characters `s[i..j]`; default `i=1`, default `j=i`; negative indices count from the end; returns nothing if the range is empty
 - `string.char(b1, b2, ...)` — return a string made from the given byte values (each 0..255); with no arguments returns `""`
 - `string.dump(f)` — return a binary string containing the function's bytecode and metadata (interpreter-specific format; no `load` is provided)
+- `string.find(s, pattern [, init [, plain]])` — find the first match of `pattern` in `s`; returns the 1-based start/end indices or `nil`; `plain=true` does a literal substring search; supports a subset of Lua patterns (`.`, `%a/%d/%l/%s/%u/%w/%x/%p/%c`, `[set]`, `[^set]`, `*`, `+`, `-`, `?`, `^`, `$`)
 - `setmetatable(table, metatable|nil)` — store/remove a table's metatable and return the table; dispatched metamethods: `__index`, `__newindex`, `__eq`, `__lt`, `__le`, `__concat`, `__add`/`__sub`/`__mul`/`__div`/`__mod`, `__unm`, `__call`, `__tostring`, `__pairs`; a `__metatable` field protects it
 - `rawequal(v1, v2)` — primitive equality, never `__eq`
 - `rawget(table, index)` — the real `table[index]` without `__index` (agrees with `table[index]`)

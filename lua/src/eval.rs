@@ -119,6 +119,292 @@ fn dump_function(s: &mut LuaState, fi: u16) -> Result<super::StrRef, LuaError> {
     Ok(s.intern(&buf[..pos])?)
 }
 
+/// Find `pattern` in `subject` starting at byte offset `start`. Returns
+/// 1-based inclusive indices on success. If `plain` is true the pattern is
+/// treated as a literal substring; otherwise a subset of Lua patterns is
+/// supported: `.`, character classes (`%a`, `%d`, `%l`, `%s`, `%u`, `%w`, `%x`,
+/// `%p`, `%c`), bracket classes (`[abc]`, `[^abc]`, `[a-z]`), quantifiers
+/// (`*`, `+`, `-`, `?`), anchors (`^`, `$`), and the escape prefix `%`.
+fn string_find(subject: &[u8], pattern: &[u8], start: usize, plain: bool) -> Option<(usize, usize)> {
+    if plain {
+        return find_plain(subject, pattern, start);
+    }
+    if pattern.is_empty() {
+        return Some((start + 1, start));
+    }
+    let anchored = pattern[0] == b'^';
+    let p = if anchored { &pattern[1..] } else { pattern };
+    let mut i = start;
+    loop {
+        if let Some(len) = match_here(subject, i, p) {
+            return Some((i + 1, i + len));
+        }
+        if anchored || i >= subject.len() {
+            break;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_plain(subject: &[u8], pattern: &[u8], start: usize) -> Option<(usize, usize)> {
+    if pattern.is_empty() {
+        return Some((start + 1, start));
+    }
+    if start > subject.len() {
+        return None;
+    }
+    let limit = subject.len() - pattern.len();
+    for i in start..=limit {
+        if &subject[i..i + pattern.len()] == pattern {
+            return Some((i + 1, i + pattern.len()));
+        }
+    }
+    None
+}
+
+/// Try to match `pattern` starting at `subject[i]`. Returns the length of the
+/// matched substring, or `None` if the pattern does not match here.
+fn match_here(subject: &[u8], i: usize, pattern: &[u8]) -> Option<usize> {
+    let mut si = i;
+    let mut pi = 0usize;
+    while pi < pattern.len() {
+        if pattern[pi] == b'$' {
+            return if si == subject.len() { Some(si - i) } else { None };
+        }
+        let item_len = item_size(pattern, pi);
+        if item_len == 0 {
+            return None;
+        }
+        let quant = if pi + item_len < pattern.len() {
+            pattern[pi + item_len]
+        } else {
+            0
+        };
+        match quant {
+            b'*' | b'+' | b'-' | b'?' => {
+                let rest_pi = pi + item_len + 1;
+                let item_pi = pi;
+                match quant {
+                    b'?' => {
+                        // Try with the item first, then without it.
+                        if let Some(n) = match_item(subject, si, pattern, item_pi) {
+                            if let Some(len) = match_here(subject, si + n, &pattern[rest_pi..]) {
+                                return Some(si + n - i + len);
+                            }
+                        }
+                        if let Some(len) = match_here(subject, si, &pattern[rest_pi..]) {
+                            return Some(si - i + len);
+                        }
+                        return None;
+                    }
+                    b'*' | b'+' => {
+                        // Greedy: consume as many items as possible, then
+                        // backtrack one byte at a time until the rest matches.
+                        // All quantified items in this implementation consume
+                        // exactly one byte, so backtracking by single bytes is
+                        // correct.
+                        let min = if quant == b'*' { 0usize } else { 1usize };
+                        let mut end = si;
+                        while let Some(n) = match_item(subject, end, pattern, item_pi) {
+                            if n == 0 {
+                                break;
+                            }
+                            end += n;
+                        }
+                        let max = end - si;
+                        let mut k = max;
+                        loop {
+                            if k >= min {
+                                let pos = si + k;
+                                if let Some(len) = match_here(subject, pos, &pattern[rest_pi..]) {
+                                    return Some(pos - i + len);
+                                }
+                            }
+                            if k == 0 {
+                                break;
+                            }
+                            k -= 1;
+                        }
+                        return None;
+                    }
+                    b'-' => {
+                        // Lazy: try the rest with 0, 1, 2, ... matches.
+                        let mut end = si;
+                        loop {
+                            if let Some(len) = match_here(subject, end, &pattern[rest_pi..]) {
+                                return Some(end - i + len);
+                            }
+                            match match_item(subject, end, pattern, item_pi) {
+                                Some(n) if n > 0 => end += n,
+                                _ => break,
+                            }
+                        }
+                        return None;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                let n = match_item(subject, si, pattern, pi)?;
+                si += n;
+                pi += item_len;
+            }
+        }
+    }
+    Some(si - i)
+}
+
+/// Length in pattern bytes of the item starting at `pattern[pi]`.
+fn item_size(pattern: &[u8], pi: usize) -> usize {
+    if pi >= pattern.len() {
+        return 0;
+    }
+    match pattern[pi] {
+        b'%' => 2,
+        b'[' => {
+            let mut j = pi + 1;
+            while j < pattern.len() && pattern[j] != b']' {
+                if pattern[j] == b'%' && j + 1 < pattern.len() {
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            if j < pattern.len() { j + 1 - pi } else { pattern.len() - pi }
+        }
+        _ => 1,
+    }
+}
+
+/// Try to match the single item at `pattern[pi]` against `subject[si..]`.
+/// Returns the number of subject bytes consumed (0 for an item that can match
+/// zero bytes, or 1 for a normal char/class). Returns `None` if the item cannot
+/// match.
+fn match_item(subject: &[u8], si: usize, pattern: &[u8], pi: usize) -> Option<usize> {
+    if pi >= pattern.len() {
+        return Some(0);
+    }
+    let ch = pattern[pi];
+    if ch == b'.' {
+        return if si < subject.len() { Some(1) } else { None };
+    }
+    if ch == b'%' {
+        if pi + 1 >= pattern.len() {
+            return None;
+        }
+        let cls = pattern[pi + 1];
+        if cls == b'%' {
+            return if si < subject.len() && subject[si] == b'%' {
+                Some(1)
+            } else {
+                None
+            };
+        }
+        return if si < subject.len() && class_match(subject[si], cls) {
+            Some(1)
+        } else {
+            None
+        };
+    }
+    if ch == b'[' {
+        return match_bracket(subject, si, pattern, pi);
+    }
+    if ch == b'^' || ch == b'$' {
+        // Anchors are handled by the caller; as standalone items they match
+        // zero bytes at the appropriate position.
+        return Some(0);
+    }
+    // Literal character.
+    if si < subject.len() && subject[si] == ch {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Match a bracket class `[...]` at `pattern[pi]`.
+fn match_bracket(subject: &[u8], si: usize, pattern: &[u8], pi: usize) -> Option<usize> {
+    if pattern[pi] != b'[' {
+        return None;
+    }
+    let mut j = pi + 1;
+    let mut negate = false;
+    if j < pattern.len() && pattern[j] == b'^' {
+        negate = true;
+        j += 1;
+    }
+    if si >= subject.len() {
+        return None;
+    }
+    let c = subject[si];
+    let mut matched = false;
+    while j < pattern.len() && pattern[j] != b']' {
+        let (lo, lo_cls, consumed) = bracket_elem(pattern, j);
+        j += consumed;
+        let is_range = j + 1 < pattern.len() && pattern[j] == b'-' && pattern[j + 1] != b']';
+        if is_range {
+            j += 1; // skip '-'
+            let (hi, hi_cls, consumed2) = bracket_elem(pattern, j);
+            j += consumed2;
+            let in_range = if lo_cls == 0 && hi_cls == 0 {
+                c >= lo && c <= hi
+            } else if lo_cls != 0 && hi_cls == 0 {
+                class_match(c, lo_cls) || c >= lo && c <= hi
+            } else if lo_cls == 0 && hi_cls != 0 {
+                c >= lo && c <= hi || class_match(c, hi_cls)
+            } else {
+                class_match(c, lo_cls) || class_match(c, hi_cls)
+            };
+            if in_range {
+                matched = true;
+            }
+        } else if lo_cls != 0 {
+            if class_match(c, lo_cls) {
+                matched = true;
+            }
+        } else if c == lo {
+            matched = true;
+        }
+    }
+    if (matched && !negate) || (!matched && negate) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Read one element from a bracket expression. Returns the literal byte value,
+/// the class character (or 0 for a literal), and the number of pattern bytes
+/// consumed.
+fn bracket_elem(pattern: &[u8], i: usize) -> (u8, u8, usize) {
+    if i >= pattern.len() {
+        return (0, 0, 0);
+    }
+    if pattern[i] == b'%' && i + 1 < pattern.len() {
+        (0, pattern[i + 1], 2)
+    } else {
+        (pattern[i], 0, 1)
+    }
+}
+
+/// Check whether a byte belongs to a `%x` character class.
+fn class_match(c: u8, cls: u8) -> bool {
+    match cls {
+        b'a' => c.is_ascii_alphabetic(),
+        b'A' => c.is_ascii_uppercase(),
+        b'c' => c < 0x20 || c == 0x7F,
+        b'd' => c.is_ascii_digit(),
+        b'l' => c.is_ascii_lowercase(),
+        b'p' => c.is_ascii_punctuation(),
+        b's' => c.is_ascii_whitespace(),
+        b'u' => c.is_ascii_uppercase(),
+        b'w' => c.is_ascii_alphanumeric(),
+        b'x' => c.is_ascii_hexdigit(),
+        _ => c == cls,
+    }
+}
+
 /// Trim leading/trailing ASCII whitespace.
 fn trim_ascii(b: &[u8]) -> &[u8] {
     let mut s = 0;
@@ -838,6 +1124,52 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             };
             let r = dump_function(s, fi)?;
             ExecResult::Ret(Value::Str(r))
+        }
+        Value::Native(30) => {
+            // string.find(s, pattern [, init [, plain]]): returns the start and
+            // end indices (1-based, inclusive) of the first match of `pattern`
+            // in `s`, or nil if not found. `init` defaults to 1 and `plain`
+            // defaults to false. When `plain` is true the pattern is treated as
+            // a literal substring.
+            if argc < 2 || argc > 4 {
+                return Err("string.find expects 2 to 4 arguments".into());
+            }
+            let subject = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.find expects a string subject".into()),
+            };
+            let pattern = match argbuf[1] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.find expects a string pattern".into()),
+            };
+            let init = if argc >= 3 {
+                integer_index(argbuf[2])?
+            } else {
+                1
+            };
+            let plain = if argc >= 4 { truthy(argbuf[3]) } else { false };
+            let len = subject.len() as i64;
+            let mut start = if init >= 0 {
+                init
+            } else {
+                len + init + 1
+            };
+            if start < 1 {
+                start = 1;
+            }
+            let s0 = (start - 1) as usize;
+            if s0 > subject.len() {
+                ExecResult::Ret(Value::Nil)
+            } else {
+                match string_find(subject, pattern, s0, plain) {
+                    Some((a, b)) => {
+                        s.push_val(Value::Num(a as i64))?;
+                        s.push_val(Value::Num(b as i64))?;
+                        ExecResult::Ret2(s.vstack[s.vsp as usize - 2], s.vstack[s.vsp as usize - 1])
+                    }
+                    None => ExecResult::Ret(Value::Nil),
+                }
+            }
         }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is

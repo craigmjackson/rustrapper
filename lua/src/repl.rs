@@ -891,6 +891,17 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   loadable without a corresponding loader.\n",
     },
     HelpEntry {
+        name: "string.find",
+        short: "Find a pattern in a string",
+        detail: "string.find(s, pattern [, init [, plain]])\n\
+                  Returns the start and end indices (1-based, inclusive) of\n\
+                  the first match of `pattern` in `s`, or nil if not found.\n\
+                  `init` defaults to 1; `plain` defaults to false. When `plain`\n\
+                  is true the pattern is treated as a literal substring.\n\
+                  Supported patterns: ., %a/%d/%l/%s/%u/%w/%x/%p/%c, [set],\n\
+                  [^set], *, +, -, ?, ^, $.\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1304,7 +1315,7 @@ mod tests {
             "rawequal", "rawget", "rawlen", "rawset", "select",
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
-            "string.byte", "string.char", "string.dump",
+            "string.byte", "string.char", "string.dump", "string.find",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
