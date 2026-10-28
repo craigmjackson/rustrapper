@@ -739,7 +739,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Returns the next key and value after key k in table t, or the\n\
                   first pair when k is nil/missing, or nil at the end. Use\n\
                   'k, v = next(t, k)' to walk a table; 'next(t) == nil' tests\n\
-                  whether t is empty.\n",
+                  whether t is empty.\n\
+                  Example: next({10, 20}) -> 1 10\n",
     },
     HelpEntry {
         name: "pairs",
@@ -747,14 +748,16 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "pairs(t)\n\
                   Returns the next function and the table, so that\n\
                   'for k, v in pairs(t) do ... end' iterates every pair. A\n\
-                  __pairs metamethod is dispatched when present.\n",
+                  __pairs metamethod is dispatched when present.\n\
+                  Example: for k, v in pairs({a=1}) do print(k, v) end\n",
     },
     HelpEntry {
         name: "rawequal",
         short: "Compare two values without metamethods",
         detail: "rawequal(v1, v2)\n\
                   Returns whether v1 equals v2 using primitive equality, never\n\
-                  the __eq metamethod (unlike `v1 == v2`).\n",
+                  the __eq metamethod (unlike `v1 == v2`).\n\
+                  Example: rawequal(1, 1.0) -> true\n",
     },
     HelpEntry {
         name: "rawget",
@@ -762,7 +765,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "rawget(table, index)\n\
                   Returns the real value of table[index], never consulting the\n\
                   __index metamethod. The index may be any value; the table\n\
-                  must be a table.\n",
+                  must be a table.\n\
+                  Example: rawget({a=1}, \"a\") -> 1\n",
     },
     HelpEntry {
         name: "rawlen",
@@ -770,7 +774,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "rawlen(v)\n\
                   Returns the length of v, which must be a table or a string.\n\
                   A table's length is the run of consecutive integer keys\n\
-                  starting at 1 (no __len is consulted).\n",
+                  starting at 1 (no __len is consulted).\n\
+                  Example: rawlen(\"abc\") -> 3\n",
     },
     HelpEntry {
         name: "rawset",
@@ -778,7 +783,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "rawset(table, index, value)\n\
                   Sets the real value of table[index] and returns the table,\n\
                   never consulting the __newindex metamethod. The index may\n\
-                  not be nil or NaN.\n",
+                  not be nil or NaN.\n\
+                  Example: rawset({}, \"k\", 7) -> table\n",
     },
     HelpEntry {
         name: "select",
@@ -797,7 +803,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   returns the table. Dispatched metamethods: __index,\n\
                   __newindex, __eq, __lt, __le, __concat, __add, __sub, __mul,\n\
                   __div, __mod, __unm, __call, __tostring, __pairs. A metatable\n\
-                  with a non-nil __metatable field is protected.\n",
+                  with a non-nil __metatable field is protected.\n\
+                  Example: setmetatable({}, {}) -> table\n",
     },
     HelpEntry {
         name: "tonumber",
@@ -814,14 +821,16 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "tostring(v)\n\
                   Returns the human-readable string form of any value, using\n\
                   the same rendering as print. A table's __tostring metamethod\n\
-                  is dispatched (it must return a string).\n",
+                  is dispatched (it must return a string).\n\
+                  Example: tostring(42) -> 42\n",
     },
     HelpEntry {
         name: "type",
         short: "Return the type name of a value",
         detail: "type(v)\n\
                   Returns \"nil\", \"boolean\", \"number\", \"string\", \"table\"\n\
-                  or \"function\". Metamethods are not consulted.\n",
+                  or \"function\". Metamethods are not consulted.\n\
+                  Example: type(42) -> number\n",
     },
     HelpEntry {
         name: "warn",
@@ -829,7 +838,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "warn(msg, ...)\n\
                   Concatenates its string (or number) arguments and prints\n\
                   'Lua warning: <msg>'. The control messages \"@off\" and \"@on\"\n\
-                  turn warnings off and on again.\n",
+                  turn warnings off and on again.\n\
+                  Example: warn(\"hi\") -> Lua warning: hi\n",
     },
     HelpEntry {
         name: "pcall",
@@ -839,7 +849,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   results on success, or false plus the error object on\n\
                   failure. Example: pcall(next, {5}) -> true 1 5\n\
                   A coroutine may yield through pcall; the protected call\n\
-                  resumes and finishes when the coroutine is resumed.\n",
+                  resumes and finishes when the coroutine is resumed.\n\
+                  Example: pcall(next, {5}) -> true 1 5\n",
     },
     HelpEntry {
         name: "xpcall",
@@ -847,7 +858,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "xpcall(f, err, ...)\n\
                   Like pcall, but on failure calls err(error_object) and\n\
                   returns false plus the handler's results. The handler itself\n\
-                  runs unprotected; errors inside it propagate to the caller.\n",
+                  runs unprotected; errors inside it propagate to the caller.\n\
+                  Example: xpcall(function() error(\"boom\") end, function(e) return e end) -> false boom\n",
     },
     HelpEntry {
         name: "error",
@@ -855,14 +867,16 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "error(v [, level])\n\
                   Raises v as an error object. pcall catches it and returns\n\
                   the value unchanged. level is validated but ignored (this\n\
-                  interpreter has no source positions).\n",
+                  interpreter has no source positions).\n\
+                  Example: pcall(error, \"boom\") -> false boom\n",
     },
     HelpEntry {
         name: "assert",
         short: "Raise an error if a condition is false",
         detail: "assert(v [, message, ...])\n\
                   Returns all its arguments when v is truthy. Raises an error\n\
-                  with message (default \"assertion failed!\") otherwise.\n",
+                  with message (default \"assertion failed!\") otherwise.\n\
+                  Example: assert(1 == 1) -> true\n",
     },
     HelpEntry {
         name: "string.byte",
@@ -888,7 +902,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "string.dump(f)\n\
                   Returns a binary string containing the function's bytecode\n\
                   and metadata. The format is interpreter-specific and is not\n\
-                  loadable without a corresponding loader.\n",
+                  loadable without a corresponding loader.\n\
+                  Example: type(string.dump(print)) -> string\n",
     },
     HelpEntry {
         name: "string.find",
@@ -899,7 +914,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   `init` defaults to 1; `plain` defaults to false. When `plain`\n\
                   is true the pattern is treated as a literal substring.\n\
                   Supported patterns: ., %a/%d/%l/%s/%u/%w/%x/%p/%c, [set],\n\
-                  [^set], *, +, -, ?, ^, $.\n",
+                  [^set], *, +, -, ?, ^, $.\n\
+                  Example: string.find(\"abc\", \"b\") -> 2 2\n",
     },
     HelpEntry {
         name: "string.format",
@@ -908,7 +924,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Formats the arguments according to `formatstring`. Supported\n\
                   conversions: %% %s %q %c %d %i %u %o %x %X %f %e %E %g %G.\n\
                   Flags: - + ' ' 0 #. Width and precision are supported.\n\
-                  %g/%G use %.14g precision. Results are capped at 1024 bytes.\n",
+                  %g/%G use %.14g precision. Results are capped at 1024 bytes.\n\
+                  Example: string.format(\"%d\", 42) -> 42\n",
     },
     HelpEntry {
         name: "string.gmatch",
@@ -918,7 +935,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   of `pattern` in `s` (or the whole match when the pattern has\n\
                   no captures), starting at `init` (default 1). Usable in a\n\
                   `for` loop or by calling the iterator directly; it returns\n\
-                  nil once exhausted. Capture groups `(...)` are supported.\n",
+                  nil once exhausted. Capture groups `(...)` are supported.\n\
+                  Example: string.gmatch(\"a b\", \"%a+\")() -> a\n",
     },
     HelpEntry {
         name: "string.gsub",
@@ -926,7 +944,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         detail: "string.gsub(s, pattern, repl [, n])\n\
                   Replaces up to `n` matches of `pattern` in `s` with `repl`\n\
                   (a string, table, or function) and returns (result, count).\n\
-                  In a string `repl`, %0..%9 stand for captures and %% is %.\n",
+                  In a string `repl`, %0..%9 stand for captures and %% is %.\n\
+                  Example: string.gsub(\"a b\", \" \", \"-\") -> a-b 1\n",
     },
     HelpEntry {
         name: "coroutine",
@@ -936,7 +955,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   coroutine.wrap(f), coroutine.isyieldable(),\n\
                   coroutine.running(), coroutine.close(co)\n\
                   Real coroutines on the bytecode VM (a pool of 3).\n\
-                  type(co) returns \"thread\".\n",
+                  type(co) returns \"thread\".\n\
+                  Example: coroutine.resume(coroutine.create(function() return 42 end)) -> true 42\n",
     },
     HelpEntry {
         name: "fetch",
@@ -1003,6 +1023,68 @@ fn trim(b: &[u8]) -> &[u8] {
     &b[s..e]
 }
 
+/// Render the detailed help for one command in a readable, indented layout:
+/// a `Usage:` line, a blank line, the description, and (when present) an
+/// `Example:` section with the example on the same line.
+fn print_detail(puts: fn(&str), detail: &'static str) {
+    // Collect the detail lines (the first line is the usage signature).
+    let mut lines = [""; 16];
+    let mut n = 0usize;
+    for l in detail.lines() {
+        if n < lines.len() {
+            lines[n] = l;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return;
+    }
+    puts("Usage: ");
+    puts(lines[0].trim());
+    puts("\n\n");
+
+    // Find the "Example:" line, if any.
+    let mut ex_idx = n;
+    for i in 1..n {
+        if lines[i].trim_start().starts_with("Example:") {
+            ex_idx = i;
+            break;
+        }
+    }
+
+    // Description (lines 1..ex_idx), trimmed and de-indented.
+    let mut wrote_desc = false;
+    for i in 1..ex_idx {
+        let t = lines[i].trim();
+        if t.is_empty() {
+            continue;
+        }
+        puts(t);
+        puts("\n");
+        wrote_desc = true;
+    }
+
+    if ex_idx < n {
+        if wrote_desc {
+            puts("\n");
+        }
+        let ex_line = lines[ex_idx].trim();
+        let ex_text = ex_line.strip_prefix("Example:").unwrap_or("").trim();
+        puts("Example: ");
+        if !ex_text.is_empty() {
+            puts(ex_text);
+        }
+        puts("\n");
+        for i in (ex_idx + 1)..n {
+            let t = lines[i].trim();
+            if !t.is_empty() {
+                puts(t);
+                puts("\n");
+            }
+        }
+    }
+}
+
 fn print_general_help(puts: fn(&str)) {
     puts("Commands:\n");
     // Pad every name to the longest one plus one space, so the descriptions
@@ -1046,7 +1128,7 @@ fn handle_repl_cmd(line: &[u8], putc: fn(u8), puts: fn(&str)) -> bool {
             let mut found = false;
             for e in HELP_COMMANDS {
                 if e.name.as_bytes() == sub {
-                    puts(e.detail);
+                    print_detail(puts, e.detail);
                     found = true;
                 }
             }
