@@ -915,6 +915,7 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   is true the pattern is treated as a literal substring.\n\
                   Supported patterns: ., %a/%d/%l/%s/%u/%w/%x/%p/%c, [set],\n\
                   [^set], *, +, -, ?, ^, $.\n\
+                  See 'help patterns' for pattern syntax.\n\
                   Example: string.find(\"abc\", \"b\") -> 2 2\n",
     },
     HelpEntry {
@@ -936,6 +937,7 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   no captures), starting at `init` (default 1). Usable in a\n\
                   `for` loop or by calling the iterator directly; it returns\n\
                   nil once exhausted. Capture groups `(...)` are supported.\n\
+                  See 'help patterns' for pattern syntax.\n\
                   Example: string.gmatch(\"a b\", \"%a+\")() -> a\n",
     },
     HelpEntry {
@@ -945,6 +947,7 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Replaces up to `n` matches of `pattern` in `s` with `repl`\n\
                   (a string, table, or function) and returns (result, count).\n\
                   In a string `repl`, %0..%9 stand for captures and %% is %.\n\
+                  See 'help patterns' for pattern syntax.\n\
                   Example: string.gsub(\"a b\", \" \", \"-\") -> a-b 1\n",
     },
     HelpEntry {
@@ -969,7 +972,94 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Returns the captures of the first match of `pattern` in `s`\n\
                   (or the whole match when there are no captures), starting at\n\
                   `init` (default 1). Returns nil if there is no match.\n\
+                  See 'help patterns' for pattern syntax.\n\
                   Example: string.match(\"a=5\", \"(%a)=(%d+)\") -> a 5\n",
+    },
+    HelpEntry {
+        name: "string.pack",
+        short: "Pack values into a binary string",
+        detail: "string.pack(fmt, v1, ...)
+\
+                  Returns a binary string containing the values packed according\n\
+                  to the format string `fmt`. See 'help format-strings' for the\n\
+                  meaning of `fmt`.\n\
+                  Example: string.pack(\"<i4\", 42) -> *\n",
+    },
+    HelpEntry {
+        name: "string.packsize",
+        short: "Size of a packed string",
+        detail: "string.packsize(fmt)
+\
+                  Returns the size (in bytes) of a string created by\n\
+                  string.pack with the given format string `fmt`. See\n\
+                  'help format-strings' for the meaning of `fmt`.\n\
+                  Example: string.packsize(\"<i4\") -> 4\n",
+    },
+    HelpEntry {
+        name: "string.rep",
+        short: "Repeat a string",
+        detail: "string.rep(s, n [, sep])\n\
+                  Returns a string containing `n` copies of `s`, optionally\n\
+                  separated by `sep`.\n\
+                  Example: string.rep(\"ab\", 3) -> ababab\n",
+    },
+    HelpEntry {
+        name: "string.reverse",
+        short: "Reverse a string",
+        detail: "string.reverse(s)\n\
+                  Returns a string with the characters of `s` in reverse order.\n\
+                  Example: string.reverse(\"abc\") -> cba\n",
+    },
+    HelpEntry {
+        name: "string.sub",
+        short: "Substring of a string",
+        detail: "string.sub(s, i [, j])\n\
+                  Returns the substring of `s` from index `i` to `j` (inclusive).\n\
+                  Negative indices count from the end. Defaults: i=1, j=-1.\n\
+                  Example: string.sub(\"hello\", 2, 4) -> ell\n",
+    },
+    HelpEntry {
+        name: "string.unpack",
+        short: "Unpack values from a binary string",
+        detail: "string.unpack(fmt, s [, pos])\n\
+                  Unpacks values from `s` according to `fmt`, starting at `pos`\n\
+                  (default 1), returning the values plus the next position.\n\
+                  See 'help format-strings' for the meaning of `fmt`.\n\
+                  Example: string.unpack(\"<i4\", string.pack(\"<i4\", 42)) -> 42 5\n",
+    },
+    HelpEntry {
+        name: "string.upper",
+        short: "Uppercase a string",
+        detail: "string.upper(s)\n\
+                  Returns a copy of `s` with all ASCII lowercase letters\n\
+                  converted to uppercase.\n\
+                  Example: string.upper(\"abc\") -> ABC\n",
+    },
+    HelpEntry {
+        name: "patterns",
+        short: "Pattern syntax for find/gmatch/gsub/match",
+        detail: "patterns\n\
+                  Patterns are described by regular strings interpreted by\n\
+                  string.find, string.gmatch, string.gsub, and string.match.\n\
+                  Character classes: . (any), %a (letters), %d (digits),\n\
+                  %l/%u (lower/upper), %s (space), %w (alphanumeric),\n\
+                  %x (hex), %p (punct), %c (control), %g (printable).\n\
+                  Magic chars ^$()%.[]*+-? are escaped with %.\n\
+                  Quantifiers: * (0+ greedy), + (1+ greedy), - (0+ lazy),\n\
+                  ? (0 or 1). Captures: (subpattern). Anchors: ^ and $.\n\
+                  See the Lua 5.5 manual section 6.5.1 for full details.\n",
+    },
+    HelpEntry {
+        name: "format-strings",
+        short: "Format strings for pack/unpack",
+        detail: "format-strings\n\
+                  Format strings describe binary layouts for string.pack,\n\
+                  string.packsize, and string.unpack. Options: < > = (endian),\n\
+                  !n (alignment), b/B (byte), h/H (short), i/I (int), l/L (long),\n\
+                  j/J (lua_Integer), T (size_t), f (float), d (double), n (number),\n\
+                  cN (fixed string), z (zero-terminated), s (length-prefixed),\n\
+                  x (padding), Xop (align), space (ignored).\n\
+                  See the Lua 5.5 manual section 6.5.2 for full details.\n",
     },
     HelpEntry {
         name: "coroutine",
@@ -1450,6 +1540,8 @@ mod tests {
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
             "string.format", "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
+            "string.pack", "string.packsize", "string.rep", "string.reverse", "string.sub",
+            "string.unpack", "string.upper", "patterns", "format-strings",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

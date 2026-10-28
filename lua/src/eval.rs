@@ -1944,6 +1944,771 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 }
             }
         }
+        Value::Native(39) => {
+            // string.rep(s, n [, sep]): repeat s n times, optionally separated
+            // by sep.
+            if argc < 2 || argc > 3 {
+                return Err("string.rep expects 2 or 3 arguments".into());
+            }
+            let s_bytes = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.rep expects a string".into()),
+            };
+            let n = to_integer_for_format(argbuf[1])?;
+            if n < 0 {
+                return Err("string.rep: bad count".into());
+            }
+            let n = n as usize;
+            let sep: &[u8] = if argc == 3 {
+                match argbuf[2] {
+                    Value::Str(r) => s.str_bytes(r),
+                    _ => return Err("string.rep expects a string separator".into()),
+                }
+            } else {
+                b""
+            };
+            // Build result.
+            let mut out = [0u8; 4096];
+            let mut out_len = 0usize;
+            for i in 0..n {
+                if i > 0 && !sep.is_empty() {
+                    if out_len + sep.len() > out.len() {
+                        return Err("string.rep result too long".into());
+                    }
+                    out[out_len..out_len + sep.len()].copy_from_slice(sep);
+                    out_len += sep.len();
+                }
+                if out_len + s_bytes.len() > out.len() {
+                    return Err("string.rep result too long".into());
+                }
+                out[out_len..out_len + s_bytes.len()].copy_from_slice(s_bytes);
+                out_len += s_bytes.len();
+            }
+            let r = s.intern(&out[..out_len])?;
+            ExecResult::Ret(Value::Str(r))
+        }
+        Value::Native(40) => {
+            // string.reverse(s)
+            if argc != 1 {
+                return Err("string.reverse expects 1 argument".into());
+            }
+            let bytes = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.reverse expects a string".into()),
+            };
+            let mut buf = [0u8; super::STR_CAP];
+            if bytes.len() > buf.len() {
+                return Err("string too long".into());
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                buf[bytes.len() - 1 - i] = b;
+            }
+            let r = s.intern(&buf[..bytes.len()])?;
+            ExecResult::Ret(Value::Str(r))
+        }
+        Value::Native(41) => {
+            // string.sub(s, i [, j])
+            if argc < 2 || argc > 3 {
+                return Err("string.sub expects 2 or 3 arguments".into());
+            }
+            let bytes = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.sub expects a string".into()),
+            };
+            let mut buf = [0u8; super::STR_CAP];
+            if bytes.len() > buf.len() {
+                return Err("string too long".into());
+            }
+            buf[..bytes.len()].copy_from_slice(bytes);
+            let bytes = &buf[..bytes.len()];
+            let len = bytes.len() as i64;
+            let i = to_integer_for_format(argbuf[1])?;
+            let j = if argc == 3 {
+                to_integer_for_format(argbuf[2])?
+            } else {
+                -1
+            };
+            // Translate negative indices.
+            let mut ii = if i < 0 { len + i + 1 } else { i };
+            let mut jj = if j < 0 { len + j + 1 } else { j };
+            if ii < 1 {
+                ii = 1;
+            }
+            if jj > len {
+                jj = len;
+            }
+            if ii > jj || ii > len {
+                let r = s.intern(b"")?;
+                return Ok(ExecResult::Ret(Value::Str(r)));
+            }
+            let r = s.intern(&bytes[(ii - 1) as usize..jj as usize])?;
+            ExecResult::Ret(Value::Str(r))
+        }
+        Value::Native(43) => {
+            // string.upper(s)
+            if argc != 1 {
+                return Err("string.upper expects 1 argument".into());
+            }
+            let bytes = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.upper expects a string".into()),
+            };
+            let mut buf = [0u8; super::STR_CAP];
+            if bytes.len() > buf.len() {
+                return Err("string too long".into());
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                buf[i] = if b.is_ascii_lowercase() {
+                    b - (b'a' - b'A')
+                } else {
+                    b
+                };
+            }
+            let r = s.intern(&buf[..bytes.len()])?;
+            ExecResult::Ret(Value::Str(r))
+        }
+        Value::Native(37) => {
+            // string.pack(fmt, v1, ...): pack values into a binary string.
+            if argc < 1 {
+                return Err("string.pack expects at least 1 argument".into());
+            }
+            let fmt = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.pack expects a string format".into()),
+            };
+            // Copy fmt out.
+            let mut fbuf = [0u8; super::STR_CAP];
+            if fmt.len() > fbuf.len() {
+                return Err("format string too long".into());
+            }
+            fbuf[..fmt.len()].copy_from_slice(fmt);
+            let fmt = &fbuf[..fmt.len()];
+
+            let mut out = [0u8; 4096];
+            let mut pos = 0usize;
+            let mut vi = 1usize;
+            let mut little = true;
+            let mut align_max = 1usize;
+            let mut i = 0usize;
+            while i < fmt.len() {
+                match fmt[i] {
+                    b'<' => { little = true; i += 1; }
+                    b'>' => { little = false; i += 1; }
+                    b'=' => { little = true; i += 1; }
+                    b'!' => {
+                        i += 1;
+                        let mut n = 0usize;
+                        let mut any = false;
+                        while i < fmt.len() && fmt[i].is_ascii_digit() {
+                            n = n * 10 + (fmt[i] - b'0') as usize;
+                            i += 1;
+                            any = true;
+                        }
+                        align_max = if any && n > 0 { n } else { 16 };
+                    }
+                    b' ' => { i += 1; }
+                    b'x' => {
+                        if pos >= out.len() {
+                            return Err("string.pack result too long".into());
+                        }
+                        out[pos] = 0;
+                        pos += 1;
+                        i += 1;
+                    }
+                    b'X' => {
+                        i += 1;
+                        if i >= fmt.len() {
+                            return Err("invalid format".into());
+                        }
+                        let op = fmt[i];
+                        i += 1;
+                        let mut n = None;
+                        if i < fmt.len() && fmt[i].is_ascii_digit() {
+                            let mut v = 0usize;
+                            while i < fmt.len() && fmt[i].is_ascii_digit() {
+                                v = v * 10 + (fmt[i] - b'0') as usize;
+                                i += 1;
+                            }
+                            n = Some(v);
+                        }
+                        let sz = fmt_option_size(op, n);
+                        pos = align_pos(pos, sz, align_max);
+                    }
+                    b'b' | b'B' => {
+                        let signed = fmt[i] == b'b';
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let val = to_integer_for_format(argbuf[vi])?;
+                        vi += 1;
+                        pos = align_pos(pos, 1, align_max);
+                        write_int(&mut out, &mut pos, val, 1, little, signed)?;
+                    }
+                    b'h' | b'H' => {
+                        let signed = fmt[i] == b'h';
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let val = to_integer_for_format(argbuf[vi])?;
+                        vi += 1;
+                        pos = align_pos(pos, 2, align_max);
+                        write_int(&mut out, &mut pos, val, 2, little, signed)?;
+                    }
+                    b'i' | b'I' => {
+                        let signed = fmt[i] == b'i';
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).unwrap_or(4);
+                        if n < 1 || n > 16 {
+                            return Err("invalid format".into());
+                        }
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let val = to_integer_for_format(argbuf[vi])?;
+                        vi += 1;
+                        pos = align_pos(pos, n, align_max);
+                        write_int(&mut out, &mut pos, val, n, little, signed)?;
+                    }
+                    b'l' | b'L' => {
+                        let signed = fmt[i] == b'l';
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let val = to_integer_for_format(argbuf[vi])?;
+                        vi += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        write_int(&mut out, &mut pos, val, 8, little, signed)?;
+                    }
+                    b'j' | b'J' => {
+                        let signed = fmt[i] == b'j';
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let val = to_integer_for_format(argbuf[vi])?;
+                        vi += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        write_int(&mut out, &mut pos, val, 8, little, signed)?;
+                    }
+                    b'T' => {
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let val = to_integer_for_format(argbuf[vi])?;
+                        vi += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        write_int(&mut out, &mut pos, val, 8, little, false)?;
+                    }
+                    b'f' => {
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let f = match argbuf[vi] {
+                            Value::Num(n) => n as f64,
+                            Value::Float(x) => x,
+                            _ => return Err("number expected".into()),
+                        };
+                        vi += 1;
+                        pos = align_pos(pos, 4, align_max);
+                        if pos + 4 > out.len() {
+                            return Err("result too long".into());
+                        }
+                        let bytes = if little {
+                            (f as f32).to_le_bytes()
+                        } else {
+                            (f as f32).to_be_bytes()
+                        };
+                        out[pos..pos + 4].copy_from_slice(&bytes);
+                        pos += 4;
+                    }
+                    b'd' => {
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let f = match argbuf[vi] {
+                            Value::Num(n) => n as f64,
+                            Value::Float(x) => x,
+                            _ => return Err("number expected".into()),
+                        };
+                        vi += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        if pos + 8 > out.len() {
+                            return Err("result too long".into());
+                        }
+                        let bytes = if little { f.to_le_bytes() } else { f.to_be_bytes() };
+                        out[pos..pos + 8].copy_from_slice(&bytes);
+                        pos += 8;
+                    }
+                    b'n' => {
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let f = match argbuf[vi] {
+                            Value::Num(n) => n as f64,
+                            Value::Float(x) => x,
+                            _ => return Err("number expected".into()),
+                        };
+                        vi += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        if pos + 8 > out.len() {
+                            return Err("result too long".into());
+                        }
+                        let bytes = if little { f.to_le_bytes() } else { f.to_be_bytes() };
+                        out[pos..pos + 8].copy_from_slice(&bytes);
+                        pos += 8;
+                    }
+                    b'c' => {
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).ok_or("invalid format")?;
+                        if n < 1 {
+                            return Err("invalid format".into());
+                        }
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let bytes = match argbuf[vi] {
+                            Value::Str(r) => s.str_bytes(r),
+                            _ => return Err("string expected".into()),
+                        };
+                        vi += 1;
+                        // c is not aligned.
+                        if pos + n > out.len() {
+                            return Err("result too long".into());
+                        }
+                        // Copy up to n bytes, pad with spaces (Lua pads with \0? use \0).
+                        let copy = bytes.len().min(n);
+                        out[pos..pos + copy].copy_from_slice(&bytes[..copy]);
+                        for k in copy..n {
+                            out[pos + k] = 0;
+                        }
+                        pos += n;
+                    }
+                    b'z' => {
+                        i += 1;
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let bytes = match argbuf[vi] {
+                            Value::Str(r) => s.str_bytes(r),
+                            _ => return Err("string expected".into()),
+                        };
+                        vi += 1;
+                        if pos + bytes.len() + 1 > out.len() {
+                            return Err("result too long".into());
+                        }
+                        out[pos..pos + bytes.len()].copy_from_slice(bytes);
+                        pos += bytes.len();
+                        out[pos] = 0;
+                        pos += 1;
+                    }
+                    b's' => {
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).unwrap_or(0); // 0 => size_t (8)
+                        let sz = if n == 0 { 8usize } else { n };
+                        if sz < 1 || sz > 16 {
+                            return Err("invalid format".into());
+                        }
+                        if vi >= argc as usize {
+                            return Err("wrong number of arguments to string.pack".into());
+                        }
+                        let bytes = match argbuf[vi] {
+                            Value::Str(r) => s.str_bytes(r),
+                            _ => return Err("string expected".into()),
+                        };
+                        vi += 1;
+                        pos = align_pos(pos, sz, align_max);
+                        // write length
+                        let len = bytes.len() as u64;
+                        write_int(&mut out, &mut pos, len as i64, sz, little, false)?;
+                        if pos + bytes.len() > out.len() {
+                            return Err("result too long".into());
+                        }
+                        out[pos..pos + bytes.len()].copy_from_slice(bytes);
+                        pos += bytes.len();
+                    }
+                    _ => return Err("invalid format".into()),
+                }
+            }
+
+            let newstr = s.intern(&out[..pos])?;
+            // Push result + count of consumed values? Lua returns just the string.
+            // Actually string.pack returns the packed string only.
+            ExecResult::Ret(Value::Str(newstr))
+        }
+        Value::Native(38) => {
+            // string.packsize(fmt): size of packed string.
+            if argc != 1 {
+                return Err("string.packsize expects 1 argument".into());
+            }
+            let fmt = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.packsize expects a string format".into()),
+            };
+            let mut fbuf = [0u8; super::STR_CAP];
+            if fmt.len() > fbuf.len() {
+                return Err("format string too long".into());
+            }
+            fbuf[..fmt.len()].copy_from_slice(fmt);
+            let fmt = &fbuf[..fmt.len()];
+
+            let mut size = 0usize;
+            let mut _little = true;
+            let mut align_max = 1usize;
+            let mut i = 0usize;
+            while i < fmt.len() {
+                match fmt[i] {
+                    b'<' => { _little = true; i += 1; }
+                    b'>' => { _little = false; i += 1; }
+                    b'=' => { _little = true; i += 1; }
+                    b'!' => {
+                        i += 1;
+                        let mut n = 0usize;
+                        let mut any = false;
+                        while i < fmt.len() && fmt[i].is_ascii_digit() {
+                            n = n * 10 + (fmt[i] - b'0') as usize;
+                            i += 1;
+                            any = true;
+                        }
+                        align_max = if any && n > 0 { n } else { 16 };
+                    }
+                    b' ' => { i += 1; }
+                    b'x' => {
+                        size += 1;
+                        i += 1;
+                    }
+                    b'X' => {
+                        i += 1;
+                        if i >= fmt.len() {
+                            return Err("invalid format".into());
+                        }
+                        let op = fmt[i];
+                        i += 1;
+                        let mut n = None;
+                        if i < fmt.len() && fmt[i].is_ascii_digit() {
+                            let mut v = 0usize;
+                            while i < fmt.len() && fmt[i].is_ascii_digit() {
+                                v = v * 10 + (fmt[i] - b'0') as usize;
+                                i += 1;
+                            }
+                            n = Some(v);
+                        }
+                        let sz = fmt_option_size(op, n);
+                        size = align_pos(size, sz, align_max);
+                    }
+                    b'b' | b'B' => { size = align_pos(size, 1, align_max) + 1; i += 1; }
+                    b'h' | b'H' => { size = align_pos(size, 2, align_max) + 2; i += 1; }
+                    b'i' | b'I' => {
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).unwrap_or(4);
+                        if n < 1 || n > 16 {
+                            return Err("invalid format".into());
+                        }
+                        size = align_pos(size, n, align_max) + n;
+                    }
+                    b'l' | b'L' => { size = align_pos(size, 8, align_max) + 8; i += 1; }
+                    b'j' | b'J' => { size = align_pos(size, 8, align_max) + 8; i += 1; }
+                    b'T' => { size = align_pos(size, 8, align_max) + 8; i += 1; }
+                    b'f' => { size = align_pos(size, 4, align_max) + 4; i += 1; }
+                    b'd' => { size = align_pos(size, 8, align_max) + 8; i += 1; }
+                    b'n' => { size = align_pos(size, 8, align_max) + 8; i += 1; }
+                    b'c' => {
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).ok_or("invalid format")?;
+                        if n < 1 {
+                            return Err("invalid format".into());
+                        }
+                        size += n;
+                    }
+                    b'z' | b's' => {
+                        // variable size: error in packsize
+                        return Err("variable-length format".into());
+                    }
+                    _ => return Err("invalid format".into()),
+                }
+            }
+            ExecResult::Ret(Value::Num(size as i64))
+        }
+        Value::Native(42) => {
+            // string.unpack(fmt, s [, pos]): unpack values, return them + next pos.
+            if argc < 2 || argc > 3 {
+                return Err("string.unpack expects 2 or 3 arguments".into());
+            }
+            let fmt = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.unpack expects a string format".into()),
+            };
+            let src_bytes = match argbuf[1] {
+                Value::Str(r) => s.str_bytes(r),
+                _ => return Err("string.unpack expects a string".into()),
+            };
+            let mut src_buf = [0u8; 4096];
+            if src_bytes.len() > src_buf.len() {
+                return Err("string too long".into());
+            }
+            src_buf[..src_bytes.len()].copy_from_slice(src_bytes);
+            let src_str: &[u8] = &src_buf[..src_bytes.len()];
+            let mut pos = if argc == 3 {
+                (to_integer_for_format(argbuf[2])? - 1) as usize
+            } else {
+                0usize
+            };
+            if pos > src_str.len() {
+                return Err("initial position out of string".into());
+            }
+
+            let mut fbuf = [0u8; super::STR_CAP];
+            if fmt.len() > fbuf.len() {
+                return Err("format string too long".into());
+            }
+            fbuf[..fmt.len()].copy_from_slice(fmt);
+            let fmt = &fbuf[..fmt.len()];
+
+            let mut little = true;
+            let mut align_max = 1usize;
+            let mut i = 0usize;
+            let mut nres = 0u8;
+            while i < fmt.len() {
+                match fmt[i] {
+                    b'<' => { little = true; i += 1; }
+                    b'>' => { little = false; i += 1; }
+                    b'=' => { little = true; i += 1; }
+                    b'!' => {
+                        i += 1;
+                        let mut n = 0usize;
+                        let mut any = false;
+                        while i < fmt.len() && fmt[i].is_ascii_digit() {
+                            n = n * 10 + (fmt[i] - b'0') as usize;
+                            i += 1;
+                            any = true;
+                        }
+                        align_max = if any && n > 0 { n } else { 16 };
+                    }
+                    b' ' => { i += 1; }
+                    b'x' => {
+                        if pos >= src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        pos += 1;
+                        i += 1;
+                    }
+                    b'X' => {
+                        i += 1;
+                        if i >= fmt.len() {
+                            return Err("invalid format".into());
+                        }
+                        let op = fmt[i];
+                        i += 1;
+                        let mut n = None;
+                        if i < fmt.len() && fmt[i].is_ascii_digit() {
+                            let mut v = 0usize;
+                            while i < fmt.len() && fmt[i].is_ascii_digit() {
+                                v = v * 10 + (fmt[i] - b'0') as usize;
+                                i += 1;
+                            }
+                            n = Some(v);
+                        }
+                        let sz = fmt_option_size(op, n);
+                        pos = align_pos(pos, sz, align_max);
+                    }
+                    b'b' | b'B' => {
+                        let signed = fmt[i] == b'b';
+                        i += 1;
+                        pos = align_pos(pos, 1, align_max);
+                        if pos + 1 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let val = read_int(src_str, &mut pos, 1, little, signed)?;
+                        s.push_val(Value::Num(val))?;
+                        nres += 1;
+                    }
+                    b'h' | b'H' => {
+                        let signed = fmt[i] == b'h';
+                        i += 1;
+                        pos = align_pos(pos, 2, align_max);
+                        if pos + 2 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let val = read_int(src_str, &mut pos, 2, little, signed)?;
+                        s.push_val(Value::Num(val))?;
+                        nres += 1;
+                    }
+                    b'i' | b'I' => {
+                        let signed = fmt[i] == b'i';
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).unwrap_or(4);
+                        if n < 1 || n > 16 {
+                            return Err("invalid format".into());
+                        }
+                        pos = align_pos(pos, n, align_max);
+                        if pos + n > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let val = read_int(src_str, &mut pos, n, little, signed)?;
+                        s.push_val(Value::Num(val))?;
+                        nres += 1;
+                    }
+                    b'l' | b'L' => {
+                        let signed = fmt[i] == b'l';
+                        i += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        if pos + 8 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let val = read_int(src_str, &mut pos, 8, little, signed)?;
+                        s.push_val(Value::Num(val))?;
+                        nres += 1;
+                    }
+                    b'j' | b'J' => {
+                        let signed = fmt[i] == b'j';
+                        i += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        if pos + 8 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let val = read_int(src_str, &mut pos, 8, little, signed)?;
+                        s.push_val(Value::Num(val))?;
+                        nres += 1;
+                    }
+                    b'T' => {
+                        i += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        if pos + 8 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let val = read_int(src_str, &mut pos, 8, little, false)?;
+                        s.push_val(Value::Num(val))?;
+                        nres += 1;
+                    }
+                    b'f' => {
+                        i += 1;
+                        pos = align_pos(pos, 4, align_max);
+                        if pos + 4 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let bytes: [u8; 4] = src_str[pos..pos + 4].try_into().unwrap();
+                        pos += 4;
+                        let v = if little {
+                            f32::from_le_bytes(bytes) as f64
+                        } else {
+                            f32::from_be_bytes(bytes) as f64
+                        };
+                        s.push_val(Value::Float(v))?;
+                        nres += 1;
+                    }
+                    b'd' => {
+                        i += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        if pos + 8 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let bytes: [u8; 8] = src_str[pos..pos + 8].try_into().unwrap();
+                        pos += 8;
+                        let v = if little {
+                            f64::from_le_bytes(bytes)
+                        } else {
+                            f64::from_be_bytes(bytes)
+                        };
+                        s.push_val(Value::Float(v))?;
+                        nres += 1;
+                    }
+                    b'n' => {
+                        i += 1;
+                        pos = align_pos(pos, 8, align_max);
+                        if pos + 8 > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let bytes: [u8; 8] = src_str[pos..pos + 8].try_into().unwrap();
+                        pos += 8;
+                        let v = if little {
+                            f64::from_le_bytes(bytes)
+                        } else {
+                            f64::from_be_bytes(bytes)
+                        };
+                        s.push_val(Value::Float(v))?;
+                        nres += 1;
+                    }
+                    b'c' => {
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).ok_or("invalid format")?;
+                        if n < 1 {
+                            return Err("invalid format".into());
+                        }
+                        if pos + n > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let v = s.intern(&src_str[pos..pos + n])?;
+                        pos += n;
+                        s.push_val(Value::Str(v))?;
+                        nres += 1;
+                    }
+                    b'z' => {
+                        i += 1;
+                        let start = pos;
+                        while pos < src_str.len() && src_str[pos] != 0 {
+                            pos += 1;
+                        }
+                        let v = s.intern(&src_str[start..pos])?;
+                        if pos < src_str.len() {
+                            pos += 1; // skip null
+                        }
+                        s.push_val(Value::Str(v))?;
+                        nres += 1;
+                    }
+                    b's' => {
+                        i += 1;
+                        let n = parse_fmt_num(fmt, &mut i).unwrap_or(0);
+                        let sz = if n == 0 { 8usize } else { n };
+                        if sz < 1 || sz > 16 {
+                            return Err("invalid format".into());
+                        }
+                        pos = align_pos(pos, sz, align_max);
+                        if pos + sz > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        // read length
+                        let mut v: u64 = 0;
+                        if little {
+                            for k in 0..sz {
+                                v |= (src_str[pos + k] as u64) << (k * 8);
+                            }
+                        } else {
+                            for k in 0..sz {
+                                v |= (src_str[pos + k] as u64) << ((sz - 1 - k) * 8);
+                            }
+                        }
+                        pos += sz;
+                        let len = v as usize;
+                        if pos + len > src_str.len() {
+                            return Err("string.unpack: out of string".into());
+                        }
+                        let val = s.intern(&src_str[pos..pos + len])?;
+                        pos += len;
+                        s.push_val(Value::Str(val))?;
+                        nres += 1;
+                    }
+                    _ => return Err("invalid format".into()),
+                }
+            }
+            // Push the next position (1-based).
+            s.push_val(Value::Num((pos + 1) as i64))?;
+            nres += 1;
+            // If nres > 1, use RetN; else Ret2? Always at least 2 (value + pos).
+            if nres == 2 {
+                let a = s.vstack[s.vsp as usize - 2];
+                let b = s.vstack[s.vsp as usize - 1];
+                s.vsp -= 2;
+                ExecResult::Ret2(a, b)
+            } else {
+                ExecResult::RetN(nres)
+            }
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
@@ -3066,6 +3831,100 @@ fn to_integer_for_format(v: Value) -> Result<i64, LuaError> {
         Value::Float(f) if f.is_finite() && f == float_floor(f) => Ok(f as i64),
         _ => Err("bad argument (number expected, got string)".into()),
     }
+}
+
+// ── string.pack / unpack helpers ─────────────────────────────────────────────
+
+fn parse_fmt_num(fmt: &[u8], i: &mut usize) -> Option<usize> {
+    let mut n = 0usize;
+    let mut any = false;
+    while *i < fmt.len() && fmt[*i].is_ascii_digit() {
+        n = n * 10 + (fmt[*i] - b'0') as usize;
+        *i += 1;
+        any = true;
+    }
+    if any { Some(n) } else { None }
+}
+
+fn fmt_option_size(op: u8, n: Option<usize>) -> usize {
+    match op {
+        b'b' | b'B' => 1,
+        b'h' | b'H' => 2,
+        b'i' | b'I' => n.unwrap_or(4),
+        b'l' | b'L' => 8,
+        b'j' | b'J' => 8,
+        b'T' => 8,
+        b'f' => 4,
+        b'd' => 8,
+        b'n' => 8,
+        b'c' => n.unwrap_or(0),
+        b'x' => 1,
+        _ => 0,
+    }
+}
+
+fn align_pos(pos: usize, size: usize, align_max: usize) -> usize {
+    let a = size.min(align_max);
+    if a <= 1 {
+        return pos;
+    }
+    let mask = a - 1;
+    if pos & mask == 0 {
+        pos
+    } else {
+        (pos + a - 1) & !mask
+    }
+}
+
+fn write_int(
+    buf: &mut [u8],
+    pos: &mut usize,
+    val: i64,
+    size: usize,
+    little: bool,
+    _signed: bool,
+) -> Result<(), LuaError> {
+    if *pos + size > buf.len() {
+        return Err("result too long".into());
+    }
+    let mut v = val as u64;
+    if little {
+        for k in 0..size {
+            buf[*pos + k] = (v & 0xFF) as u8;
+            v >>= 8;
+        }
+    } else {
+        for k in 0..size {
+            buf[*pos + size - 1 - k] = (v & 0xFF) as u8;
+            v >>= 8;
+        }
+    }
+    *pos += size;
+    Ok(())
+}
+
+fn read_int(
+    buf: &[u8],
+    pos: &mut usize,
+    size: usize,
+    little: bool,
+    signed: bool,
+) -> Result<i64, LuaError> {
+    let mut v: u64 = 0;
+    if little {
+        for k in 0..size {
+            v |= (buf[*pos + k] as u64) << (k * 8);
+        }
+    } else {
+        for k in 0..size {
+            v |= (buf[*pos + k] as u64) << ((size - 1 - k) * 8);
+        }
+    }
+    *pos += size;
+    if signed && size < 8 && (v & (1u64 << (size * 8 - 1))) != 0 {
+        v |= !((1u64 << (size * 8)) - 1);
+    }
+    Ok(v as i64)
 }
 
 /// Format a single argument according to `spec`, writing the rendered piece

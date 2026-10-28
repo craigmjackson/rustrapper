@@ -145,7 +145,7 @@ pub const MAX_FUNCS: usize = 32;
 pub const MAX_GLOBALS: usize = 64;
 /// Number of key/value slots per table (tables have their own fixed slots,
 /// so nested table literals can't interleave and corrupt each other).
-pub const TABLE_SLOTS: usize = 16;
+pub const TABLE_SLOTS: usize = 32;
 /// Maximum number of tables alive at once.
 pub const MAX_TABLES: usize = 16;
 /// Safety cap on total statements executed per script run.
@@ -275,8 +275,11 @@ pub enum Value {
     /// `string.find` is `Native(30)`, `string.format` is `Native(31)`,
     /// `string.gmatch` is `Native(32)` (returns a [`Value::Gmatch`]
     /// iterator), `string.gsub` is `Native(33)`, `string.len` is
-    /// `Native(34)`, `string.lower` is `Native(35)`, and `string.match`
-    /// is `Native(36)`.
+    /// `Native(34)`, `string.lower` is `Native(35)`, `string.match` is
+    /// `Native(36)`, `string.pack` is `Native(37)`, `string.packsize` is
+    /// `Native(38)`, `string.rep` is `Native(39)`, `string.reverse` is
+    /// `Native(40)`, `string.sub` is `Native(41)`, `string.unpack` is
+    /// `Native(42)`, and `string.upper` is `Native(43)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1148,6 +1151,18 @@ impl LuaState {
             Value::Native(36),
         )
         .unwrap();
+        for (nm, id) in [
+            ("pack", 37u8),
+            ("packsize", 38),
+            ("rep", 39),
+            ("reverse", 40),
+            ("sub", 41),
+            ("unpack", 42),
+            ("upper", 43),
+        ] {
+            let n = self.intern(nm.as_bytes()).unwrap();
+            crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
+        }
         self.set_global(string_name, Value::Table(tid));
     }
 
@@ -3395,6 +3410,20 @@ mod tests {
         assert!(exec("print(string.match(\"x\"))").is_err());
         assert!(exec("print(string.match(42, \"x\"))").is_err());
         assert!(exec("print(string.match(\"x\", \"(abc\"))").is_err());
+    }
+
+    #[test]
+    fn string_pack_unpack() {
+        assert_eq!(exec("print(string.packsize(\"<i4 f d\"))").unwrap(), "16\n");
+        assert_eq!(exec("local s = string.pack(\"<i4 f d\", 42, 3.5, 2.25)\nprint(string.len(s))").unwrap(), "16\n");
+        assert_eq!(exec("local s = string.pack(\"<i4 f d\", 42, 3.5, 2.25)\nlocal a, b, c, pos = string.unpack(\"<i4 f d\", s)\nprint(a, b, c, pos)").unwrap(), "42\t3.5\t2.25\t17\n");
+        assert_eq!(exec("local s = string.pack(\">I2\", 4660)\nprint(string.unpack(\">I2\", s))").unwrap(), "4660\t3\n");
+        assert_eq!(exec("local s = string.pack(\"s\", \"hi\")\nlocal v, p = string.unpack(\"s\", s)\nprint(v, p)").unwrap(), "hi\t11\n");
+        assert_eq!(exec("local s = string.pack(\"z\", \"ab\")\nprint(string.unpack(\"z\", s))").unwrap(), "ab\t4\n");
+        assert_eq!(exec("local s = string.pack(\"c4\", \"hi\")\nprint(string.len(s))\nprint(string.unpack(\"c4\", s))").unwrap(), "4\nhi\0\0\t5\n");
+        assert!(exec("print(string.pack())").is_err());
+        assert!(exec("print(string.packsize())").is_err());
+        assert!(exec("print(string.unpack(\"<i4\", \"ab\"))").is_err());
     }
 
     #[test]

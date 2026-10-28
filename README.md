@@ -277,13 +277,13 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 308 tests across all crates
+cargo test --workspace   # 309 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 123   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `string.gmatch`, `string.gsub`, `string.len`, `string.lower`, `string.match`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
+| `lua`        | 124   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `string.gmatch`, `string.gsub`, `string.len`, `string.lower`, `string.match`, `string.pack`/`unpack`, `string.rep`/`reverse`/`sub`/`upper`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

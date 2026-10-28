@@ -666,9 +666,9 @@ make x86_64-seabios-clean        # Remove SeaBIOS checkout
 Run the full host-testable suite:
 
 ```bash
-cargo test --workspace        # All 308 tests across all crates
+cargo test --workspace        # All 309 tests across all crates
 cargo test --package common   # 98 tests (formatting incl. DHCP info formatter, scan loop, DHCP build/parse, ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection, bootfile BOOTP-file fallback)
-cargo test --package lua      # 123 tests (lexer, parser, bytecode VM, integer & float arithmetic/formatting, global keyword, next/pairs/rawequal/rawget/rawlen/rawset/select/setmetatable/tonumber/tostring/type/warn/pcall/error/coroutine builtins, _VERSION global + multiple values/assignment/library nil-removal, string.find, string.format, string.gmatch, string.gsub, string.len, string.lower, string.match, dhcp builtin incl. printed network info and variable globals, dofile builtin, fetch with optional dest, demo script output, REPL fetch/dhcp + shell features: history, editing, tab, ctrl-c, clear, multiline, escape mapping, help alignment)
+cargo test --package lua      # 124 tests (lexer, parser, bytecode VM, integer & float arithmetic/formatting, global keyword, next/pairs/rawequal/rawget/rawlen/rawset/select/setmetatable/tonumber/tostring/type/warn/pcall/error/coroutine builtins, _VERSION global + multiple values/assignment/library nil-removal, string.find, string.format, string.gmatch, string.gsub, string.len, string.lower, string.match, string.pack/unpack, string.rep/reverse/sub/upper, dhcp builtin incl. printed network info and variable globals, dofile builtin, fetch with optional dest, demo script output, REPL fetch/dhcp + shell features: history, editing, tab, ctrl-c, clear, multiline, escape mapping, help alignment)
 cargo test --package bios     # 7 tests (E820 region selection: min_addr, largest region, non-usable/small filtering, >4 GB handling, 4 GB clamping, empty map)
 cargo test --package uefi     # 33 tests (type sizes, GUID values, constants, SNP mode layout)
 cargo test --package arm64-bare  # 21 tests (pci_off, storage_name)
