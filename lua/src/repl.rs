@@ -921,6 +921,14 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   nil once exhausted. Capture groups `(...)` are supported.\n",
     },
     HelpEntry {
+        name: "string.gsub",
+        short: "Replace matches of a pattern",
+        detail: "string.gsub(s, pattern, repl [, n])\n\
+                  Replaces up to `n` matches of `pattern` in `s` with `repl`\n\
+                  (a string, table, or function) and returns (result, count).\n\
+                  In a string `repl`, %0..%9 stand for captures and %% is %.\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1335,7 +1343,7 @@ mod tests {
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
-            "string.format", "string.gmatch",
+            "string.format", "string.gmatch", "string.gsub",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

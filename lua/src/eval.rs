@@ -1576,6 +1576,270 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let id = s.alloc_gmatch(subject, pattern, pos)?;
             ExecResult::Ret(Value::Gmatch(id))
         }
+        Value::Native(33) => {
+            // string.gsub(s, pattern, repl [, n]): replace up to n matches of
+            // `pattern` in `s` with `repl` (a string, table, or function),
+            // returning (newstring, count). `%0`..`%9` and `%%` are recognised
+            // in a string replacement.
+            if argc < 3 || argc > 4 {
+                return Err("string.gsub expects 3 or 4 arguments".into());
+            }
+            let subject = match argbuf[0] {
+                Value::Str(r) => r,
+                _ => return Err("string.gsub expects a string subject".into()),
+            };
+            let pattern = match argbuf[1] {
+                Value::Str(r) => r,
+                _ => return Err("string.gsub expects a string pattern".into()),
+            };
+            let repl = argbuf[2];
+            let max_n = if argc == 4 {
+                to_integer_for_format(argbuf[3])?
+            } else {
+                i64::MAX
+            };
+            let max_n = if max_n < 0 { 0usize } else { max_n as usize };
+
+            let subj_bytes = s.str_bytes(subject);
+            let pat_bytes = s.str_bytes(pattern);
+            if !valid_gmatch_pattern(pat_bytes) {
+                return Err("malformed pattern (unfinished capture)".into());
+            }
+            // Copy subject/pattern out of the string arena so `intern` and
+            // host calls below can mutate the arena without borrow conflicts.
+            let mut sbuf = [0u8; super::STR_CAP];
+            let mut pbuf = [0u8; super::STR_CAP];
+            if subj_bytes.len() > sbuf.len() || pat_bytes.len() > pbuf.len() {
+                return Err("string too long".into());
+            }
+            sbuf[..subj_bytes.len()].copy_from_slice(subj_bytes);
+            pbuf[..pat_bytes.len()].copy_from_slice(pat_bytes);
+            let subj_bytes: &[u8] = &sbuf[..subj_bytes.len()];
+            let pat_bytes: &[u8] = &pbuf[..pat_bytes.len()];
+
+            // Build the result in a fixed buffer.
+            let mut out = [0u8; 4096];
+            let mut out_len = 0usize;
+            let mut pos = 0usize;
+            let mut count = 0usize;
+
+            while count < max_n && pos <= subj_bytes.len() {
+                match gm_find(subj_bytes, pat_bytes, pos) {
+                    None => break,
+                    Some(m) => {
+                        // Copy the prefix before the match.
+                        let prefix = &subj_bytes[pos..m.mstart];
+                        if out_len + prefix.len() > out.len() {
+                            return Err("string.gsub result too long".into());
+                        }
+                        out[out_len..out_len + prefix.len()].copy_from_slice(prefix);
+                        out_len += prefix.len();
+
+                        // Compute the replacement bytes (if any) and the
+                        // number of captures.
+                        let ncap = m.ncap;
+                        // Collect capture slices for function/table use.
+                        // Determine whether to substitute.
+                        let mut do_sub = true;
+                        let mut repl_buf = [0u8; 4096];
+                        let mut repl_len = 0usize;
+
+                        match repl {
+                            Value::Str(rr) => {
+                                let rbytes = s.str_bytes(rr);
+                                let mut ri = 0usize;
+                                while ri < rbytes.len() {
+                                    if rbytes[ri] == b'%' {
+                                        if ri + 1 >= rbytes.len() {
+                                            return Err("invalid capture index".into());
+                                        }
+                                        if rbytes[ri + 1] == b'%' {
+                                            if repl_len >= repl_buf.len() {
+                                                return Err("string.gsub result too long".into());
+                                            }
+                                            repl_buf[repl_len] = b'%';
+                                            repl_len += 1;
+                                            ri += 2;
+                                            continue;
+                                        }
+                                        let d = rbytes[ri + 1];
+                                        if !d.is_ascii_digit() {
+                                            return Err("invalid capture index".into());
+                                        }
+                                        let idx = (d - b'0') as usize;
+                                        let src_slice: &[u8] = if idx == 0 {
+                                            &subj_bytes[m.mstart..m.mend]
+                                        } else if idx <= ncap {
+                                            let (cs, ce) = m.caps[idx - 1];
+                                            &subj_bytes[cs..ce]
+                                        } else {
+                                            return Err("invalid capture index".into());
+                                        };
+                                        if repl_len + src_slice.len() > repl_buf.len() {
+                                            return Err("string.gsub result too long".into());
+                                        }
+                                        repl_buf[repl_len..repl_len + src_slice.len()]
+                                            .copy_from_slice(src_slice);
+                                        repl_len += src_slice.len();
+                                        ri += 2;
+                                    } else {
+                                        if repl_len >= repl_buf.len() {
+                                            return Err("string.gsub result too long".into());
+                                        }
+                                        repl_buf[repl_len] = rbytes[ri];
+                                        repl_len += 1;
+                                        ri += 1;
+                                    }
+                                }
+                            }
+                            Value::Table(tid) => {
+                                // Key: first capture if any, else whole match.
+                                let key_bytes: &[u8] = if ncap > 0 {
+                                    let (cs, ce) = m.caps[0];
+                                    &subj_bytes[cs..ce]
+                                } else {
+                                    &subj_bytes[m.mstart..m.mend]
+                                };
+                                let key = s.intern(key_bytes)?;
+                                let v = raw_get(s, tid, Value::Str(key));
+                                match v {
+                                    Value::Nil | Value::Bool(false) => {
+                                        do_sub = false;
+                                    }
+                                    Value::Str(_) | Value::Num(_) | Value::Float(_) => {
+                                        // Coerce to bytes via tostring.
+                                        let sr = value_to_string(s, v)?;
+                                        let bytes = s.str_bytes(sr);
+                                        if repl_len + bytes.len() > repl_buf.len() {
+                                            return Err("string.gsub result too long".into());
+                                        }
+                                        repl_buf[repl_len..repl_len + bytes.len()]
+                                            .copy_from_slice(bytes);
+                                        repl_len = bytes.len();
+                                    }
+                                    _ => {
+                                        return Err("invalid replacement value".into());
+                                    }
+                                }
+                            }
+                            Value::Func(_) | Value::Closure(_) => {
+                                // Call with captures (or whole match).
+                                let base_vsp = s.vsp as usize;
+                                if ncap > 0 {
+                                    for k in 0..ncap {
+                                        let (cs, ce) = m.caps[k];
+                                        let v = s.intern(&subj_bytes[cs..ce])?;
+                                        s.push_val(Value::Str(v))?;
+                                    }
+                                } else {
+                                    let v = s.intern(&subj_bytes[m.mstart..m.mend])?;
+                                    s.push_val(Value::Str(v))?;
+                                }
+                                let argc = if ncap > 0 { ncap as u8 } else { 1 };
+                                enter_mm(s)?;
+                                let r = crate::vm::call_value(s, repl, argc);
+                                leave_mm(s);
+                                let r = r?;
+                                let nres = match r {
+                                    ExecResult::Ret(_) => 1usize,
+                                    ExecResult::Ret2(..) => 2usize,
+                                    ExecResult::RetN(n) => n as usize,
+                                    ExecResult::Normal => 0usize,
+                                    _ => return Err("invalid replacement value".into()),
+                                };
+                                if nres == 0 {
+                                    do_sub = false;
+                                } else {
+                                    let rv = s.vstack[base_vsp];
+                                    s.vsp = base_vsp as u32;
+                                    match rv {
+                                        Value::Nil | Value::Bool(false) => {
+                                            do_sub = false;
+                                        }
+                                        Value::Str(_) | Value::Num(_) | Value::Float(_) => {
+                                            let sr = crate::eval::value_to_string(s, rv)?;
+                                            let bytes = s.str_bytes(sr);
+                                            if repl_len + bytes.len() > repl_buf.len() {
+                                                return Err("string.gsub result too long".into());
+                                            }
+                                            repl_buf[repl_len..repl_len + bytes.len()]
+                                                .copy_from_slice(bytes);
+                                            repl_len = bytes.len();
+                                        }
+                                        _ => {
+                                            return Err("invalid replacement value".into());
+                                        }
+                                    }
+                                }
+                            }
+                            Value::Num(_) | Value::Float(_) => {
+                                // Treat a number as a literal replacement string.
+                                let sr = crate::eval::value_to_string(s, repl)?;
+                                let bytes = s.str_bytes(sr);
+                                if repl_len + bytes.len() > repl_buf.len() {
+                                    return Err("string.gsub result too long".into());
+                                }
+                                repl_buf[repl_len..repl_len + bytes.len()]
+                                    .copy_from_slice(bytes);
+                                repl_len = bytes.len();
+                            }
+                            _ => return Err("invalid replacement value".into()),
+                        }
+
+                        if do_sub {
+                            if out_len + repl_len > out.len() {
+                                return Err("string.gsub result too long".into());
+                            }
+                            out[out_len..out_len + repl_len]
+                                .copy_from_slice(&repl_buf[..repl_len]);
+                            out_len += repl_len;
+                            count += 1;
+                        } else {
+                            // No substitution: keep the original match.
+                            let matched = &subj_bytes[m.mstart..m.mend];
+                            if out_len + matched.len() > out.len() {
+                                return Err("string.gsub result too long".into());
+                            }
+                            out[out_len..out_len + matched.len()].copy_from_slice(matched);
+                            out_len += matched.len();
+                        }
+
+                        // Advance past the match (never get stuck on empty). For an
+                        // empty match, also copy the single character at the match
+                        // position so progress is made (Lua semantics).
+                        if m.mend > m.mstart {
+                            pos = m.mend;
+                        } else {
+                            if m.mstart < subj_bytes.len() {
+                                if out_len >= out.len() {
+                                    return Err("string.gsub result too long".into());
+                                }
+                                out[out_len] = subj_bytes[m.mstart];
+                                out_len += 1;
+                            }
+                            pos = m.mstart + 1;
+                        }
+                    }
+                }
+            }
+
+            // Copy the trailing tail.
+            let pos = pos.min(subj_bytes.len());
+            let tail = &subj_bytes[pos..];
+            if out_len + tail.len() > out.len() {
+                return Err("string.gsub result too long".into());
+            }
+            out[out_len..out_len + tail.len()].copy_from_slice(tail);
+            out_len += tail.len();
+
+            let newstr = s.intern(&out[..out_len])?;
+            s.push_val(Value::Str(newstr))?;
+            s.push_val(Value::Num(count as i64))?;
+            ExecResult::Ret2(
+                Value::Str(newstr),
+                Value::Num(count as i64),
+            )
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source

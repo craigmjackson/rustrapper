@@ -272,9 +272,9 @@ pub enum Value {
     /// wrap, isyieldable, running, close). `assert` is `Native(25)`,
     /// `xpcall` is `Native(26)`, `string.byte` is `Native(27)`,
     /// `string.char` is `Native(28)`, `string.dump` is `Native(29)`,
-    /// `string.find` is `Native(30)`, and `string.format` is `Native(31)`.
-    /// `string.gmatch` is `Native(32)`; the iterator it returns is a
-    /// [`Value::Gmatch`].
+    /// `string.find` is `Native(30)`, `string.format` is `Native(31)`,
+    /// `string.gmatch` is `Native(32)` (returns a [`Value::Gmatch`]
+    /// iterator), and `string.gsub` is `Native(33)`.
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1112,6 +1112,14 @@ impl LuaState {
             Value::Table(tid),
             Value::Str(gmatch_name),
             Value::Native(32),
+        )
+        .unwrap();
+        let gsub_name = self.intern(b"gsub").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(gsub_name),
+            Value::Native(33),
         )
         .unwrap();
         self.set_global(string_name, Value::Table(tid));
@@ -3299,6 +3307,37 @@ mod tests {
         assert!(exec("print(string.gmatch(\"x\", 123))").is_err());
         assert!(exec("print(string.gmatch(\"x\"))").is_err());
         assert!(exec("print(string.gmatch(\"x\", \"(abc\"))").is_err());
+    }
+
+    #[test]
+    fn string_gsub() {
+        // Basic replacement and count.
+        assert_eq!(exec("print(string.gsub(\"hello world\", \"world\", \"Lua\"))").unwrap(), "hello Lua\t1\n");
+        // Limit n.
+        assert_eq!(exec("print(string.gsub(\"aaa\", \"a\", \"b\", 2))").unwrap(), "bba\t2\n");
+        // Multiple matches.
+        assert_eq!(exec("print(string.gsub(\"aXbXc\", \"X\", \"-\"))").unwrap(), "a-b-c\t2\n");
+        // No matches.
+        assert_eq!(exec("print(string.gsub(\"abc\", \"x\", \"y\"))").unwrap(), "abc\t0\n");
+        // Captures in the replacement string.
+        assert_eq!(exec("print(string.gsub(\"12/34\", \"(%d+)/(%d+)\", \"%2/%1\"))").unwrap(), "34/12\t1\n");
+        // %% literal percent.
+        assert_eq!(exec("print(string.gsub(\"100%\", \"%%\", \"%%\"))").unwrap(), "100%\t1\n");
+        // Table replacement.
+        assert_eq!(exec("print(string.gsub(\"a b c\", \"%a\", {a=\"A\", b=\"B\"}))").unwrap(), "A B c\t2\n");
+        // Function replacement.
+        assert_eq!(exec("print(string.gsub(\"hello\", \".\", function(c) return \"[\" .. c .. \"]\" end))").unwrap(), "[h][e][l][l][o]\t5\n");
+        // Function returning nil skips the substitution.
+        assert_eq!(exec("print(string.gsub(\"abc\", \"%a\", function(c) if c == \"b\" then return nil end return c end))").unwrap(), "abc\t2\n");
+        // Empty pattern substitutes at every position.
+        assert_eq!(exec("print(string.gsub(\"ab\", \"\", \"-\"))").unwrap(), "-a-b-\t3\n");
+        // Return values.
+        assert_eq!(exec("local s, n = string.gsub(\"aaa\", \"a\", \"b\")\nprint(s, n)").unwrap(), "bbb\t3\n");
+        // Errors.
+        assert!(exec("print(string.gsub())").is_err());
+        assert!(exec("print(string.gsub(\"x\"))").is_err());
+        assert!(exec("print(string.gsub(\"x\", 123, \"y\"))").is_err());
+        assert!(exec("print(string.gsub(\"a\", \"a\", true))").is_err());
     }
 
     #[test]
