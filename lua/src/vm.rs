@@ -1273,54 +1273,83 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
             InstrOp::ForInPrep => {
                 let second = pop(s);
                 let first = pop(s);
-                let tid = match (first, second) {
-                    (Value::Table(i), _) => i,
-                    (Value::Native(3), Value::Table(i)) => i,
-                    _ => return Err("'for in' requires a table or pairs(t)".into()),
-                };
                 let f = (s.fsp - 1) as usize;
-                s.frames[f].ctrl[0] = Value::Num(tid as i64);
-                s.frames[f].ctrl[1] = Value::Num(0);
-                s.frames[f].ctrl[2] = Value::Nil;
+                match (first, second) {
+                    (Value::Gmatch(id), _) => {
+                        s.frames[f].ctrl[0] = Value::Gmatch(id);
+                        s.frames[f].ctrl[1] = Value::Nil;
+                        s.frames[f].ctrl[2] = Value::Nil;
+                    }
+                    (Value::Table(i), _) | (Value::Native(3), Value::Table(i)) => {
+                        s.frames[f].ctrl[0] = Value::Num(i as i64);
+                        s.frames[f].ctrl[1] = Value::Num(0);
+                        s.frames[f].ctrl[2] = Value::Nil;
+                    }
+                    _ => {
+                        return Err(
+                            "'for in' requires a table, pairs(t), or gmatch(...)".into()
+                        )
+                    }
+                }
             }
             InstrOp::ForInNext => {
                 let f = (s.fsp - 1) as usize;
-                let tid = match s.frames[f].ctrl[0] {
-                    Value::Num(n) => n as usize,
-                    _ => return Err("internal error: bad for-in control".into()),
-                };
-                let i = match s.frames[f].ctrl[1] {
-                    Value::Num(n) => n as usize,
-                    _ => return Err("internal error: bad for-in control".into()),
-                };
-                let len = s.tbls[tid].len as usize;
-                if i >= len {
-                    ip = ins.a;
+                if let Value::Gmatch(id) = s.frames[f].ctrl[0] {
+                    // A gmatch iterator: advance it, keeping up to two results
+                    // (a nil-padded second result for a single capture).
+                    let n = crate::eval::gmatch_advance(s, id)?;
+                    if n == 0 {
+                        ip = ins.a;
+                    } else {
+                        let base = s.vsp as usize - n as usize;
+                        let keep = (n as usize).min(2);
+                        s.vsp = (base + keep) as u32;
+                        for _ in keep..2 {
+                            s.push_val(Value::Nil)?;
+                        }
+                    }
                 } else {
-                    let slot = s.tbls[tid].slots[i];
-                    s.frames[f].ctrl[2] = slot.key;
-                    s.push_val(slot.key)?;
-                    s.push_val(slot.value)?;
+                    let tid = match s.frames[f].ctrl[0] {
+                        Value::Num(n) => n as usize,
+                        _ => return Err("internal error: bad for-in control".into()),
+                    };
+                    let i = match s.frames[f].ctrl[1] {
+                        Value::Num(n) => n as usize,
+                        _ => return Err("internal error: bad for-in control".into()),
+                    };
+                    let len = s.tbls[tid].len as usize;
+                    if i >= len {
+                        ip = ins.a;
+                    } else {
+                        let slot = s.tbls[tid].slots[i];
+                        s.frames[f].ctrl[2] = slot.key;
+                        s.push_val(slot.key)?;
+                        s.push_val(slot.value)?;
+                    }
                 }
             }
             InstrOp::ForInAdvance => {
                 let f = (s.fsp - 1) as usize;
-                let tid = match s.frames[f].ctrl[0] {
-                    Value::Num(n) => n as usize,
-                    _ => return Err("internal error: bad for-in control".into()),
-                };
-                let i = match s.frames[f].ctrl[1] {
-                    Value::Num(n) => n as usize,
-                    _ => return Err("internal error: bad for-in control".into()),
-                };
-                let key = s.frames[f].ctrl[2];
-                let len = s.tbls[tid].len as usize;
-                if i >= len || !eval::val_eq(s.tbls[tid].slots[i].key, key) {
-                    // The current entry was removed; the next one shifted in.
+                if matches!(s.frames[f].ctrl[0], Value::Gmatch(_)) {
+                    ip = ins.a;
                 } else {
-                    s.frames[f].ctrl[1] = Value::Num((i + 1) as i64);
+                    let tid = match s.frames[f].ctrl[0] {
+                        Value::Num(n) => n as usize,
+                        _ => return Err("internal error: bad for-in control".into()),
+                    };
+                    let i = match s.frames[f].ctrl[1] {
+                        Value::Num(n) => n as usize,
+                        _ => return Err("internal error: bad for-in control".into()),
+                    };
+                    let key = s.frames[f].ctrl[2];
+                    let len = s.tbls[tid].len as usize;
+                    if i >= len || !eval::val_eq(s.tbls[tid].slots[i].key, key) {
+                        // The current entry was removed; the next one shifted in.
+                    } else {
+                        s.frames[f].ctrl[1] = Value::Num((i + 1) as i64);
+                    }
+                    ip = ins.a;
                 }
-                ip = ins.a;
             }
             InstrOp::Yield => {
                 return Err("attempt to yield from outside a coroutine".into());

@@ -168,6 +168,8 @@ pub const MAX_UPVALS: usize = 8;
 pub const MAX_CELLS: usize = 64;
 /// Maximum live closures.
 pub const MAX_CLOSURES: usize = 32;
+/// Maximum live `string.gmatch` iterators.
+pub const MAX_GMATCH: usize = 8;
 /// Sentinel: a local holds its value directly (not in a cell).
 pub const NO_CELL: u16 = u16::MAX;
 /// Sentinel: a frame is not a closure (no captured upvalues).
@@ -271,6 +273,8 @@ pub enum Value {
     /// `xpcall` is `Native(26)`, `string.byte` is `Native(27)`,
     /// `string.char` is `Native(28)`, `string.dump` is `Native(29)`,
     /// `string.find` is `Native(30)`, and `string.format` is `Native(31)`.
+    /// `string.gmatch` is `Native(32)`; the iterator it returns is a
+    /// [`Value::Gmatch`].
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -286,6 +290,9 @@ pub enum Value {
     /// A wrapped coroutine (`coroutine.wrap`) — callable, resumes the
     /// coroutine and propagates errors; `type()` is "function".
     Wrapped(u8),
+    /// A `string.gmatch` iterator (index into [`LuaState::gmatches`]);
+    /// callable, and `type()` is "function".
+    Gmatch(u8),
     /// A closure (function plus captured upvalue cells), index into
     /// [`LuaState::closures`].
     Closure(u16),
@@ -783,6 +790,9 @@ pub struct LuaState {
     /// Live closures.
     pub closures: [ClosureDef; MAX_CLOSURES],
     pub nclosures: u16,
+    /// Live `string.gmatch` iterators.
+    pub gmatches: [GmatchState; MAX_GMATCH],
+    pub ngmatch: u8,
     /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
     pub mm_refs: [StrRef; MM_COUNT],
     pub mm_ready: bool,
@@ -803,6 +813,30 @@ pub struct CoState {
     /// Thread index that resumed this coroutine.
     pub parent: u8,
     pub started: bool,
+}
+
+/// State of a live `string.gmatch` iterator. `subject` and `pattern` are
+/// interned string references; `pos` is the next search offset (0-based) and
+/// `done` latches once the iterator is exhausted.
+#[derive(Clone, Copy)]
+pub struct GmatchState {
+    pub subject: StrRef,
+    pub pattern: StrRef,
+    pub pos: usize,
+    pub done: bool,
+    pub used: bool,
+}
+
+impl GmatchState {
+    fn empty() -> Self {
+        GmatchState {
+            subject: 0,
+            pattern: 0,
+            pos: 0,
+            done: false,
+            used: false,
+        }
+    }
 }
 
 fn noop(_c: u8) {}
@@ -902,6 +936,8 @@ impl LuaState {
                 nup: 0,
             }; MAX_CLOSURES],
             nclosures: 0,
+            gmatches: [GmatchState::empty(); MAX_GMATCH],
+            ngmatch: 0,
             mm_refs: [0; MM_COUNT],
             mm_ready: false,
             mm_depth: 0,
@@ -1068,6 +1104,14 @@ impl LuaState {
             Value::Table(tid),
             Value::Str(format_name),
             Value::Native(31),
+        )
+        .unwrap();
+        let gmatch_name = self.intern(b"gmatch").unwrap();
+        crate::eval::tset(
+            self,
+            Value::Table(tid),
+            Value::Str(gmatch_name),
+            Value::Native(32),
         )
         .unwrap();
         self.set_global(string_name, Value::Table(tid));
@@ -1272,6 +1316,7 @@ impl LuaState {
         self.mm_depth = 0;
         self.ncells = 0;
         self.nclosures = 0;
+        self.ngmatch = 0;
         for c in self.cos.iter_mut() {
             c.status = CO_DEAD;
         }
@@ -1598,6 +1643,28 @@ impl LuaState {
             nup: 0,
         };
         self.nclosures += 1;
+        Ok(i)
+    }
+
+    /// Allocate a `string.gmatch` iterator slot.
+    pub fn alloc_gmatch(
+        &mut self,
+        subject: StrRef,
+        pattern: StrRef,
+        init: usize,
+    ) -> Result<u8, &'static str> {
+        if self.ngmatch as usize >= MAX_GMATCH {
+            return Err("too many gmatch iterators");
+        }
+        let i = self.ngmatch;
+        self.gmatches[i as usize] = GmatchState {
+            subject,
+            pattern,
+            pos: init,
+            done: false,
+            used: true,
+        };
+        self.ngmatch += 1;
         Ok(i)
     }
 
@@ -3183,6 +3250,55 @@ mod tests {
         assert!(exec("print(string.format(\"%d\", 1, 2))").is_err());
         assert!(exec("print(string.format(\"%z\", 1))").is_err());
         assert!(exec("print(string.format(\"%d\", \"x\"))").is_err());
+    }
+
+    #[test]
+    fn string_gmatch() {
+        // Whole matches (no captures).
+        assert_eq!(
+            exec("for w in string.gmatch(\"hello world\", \"%w+\") do print(w) end").unwrap(),
+            "hello\nworld\n"
+        );
+        // Single capture group.
+        assert_eq!(
+            exec("for w in string.gmatch(\"a1 b2\", \"(%a)%d\") do print(w) end").unwrap(),
+            "a\nb\n"
+        );
+        // Two capture groups.
+        assert_eq!(
+            exec("for k, v in string.gmatch(\"a=1 b=22\", \"(%a)=(%d+)\") do print(k, v) end").unwrap(),
+            "a\t1\nb\t22\n"
+        );
+        // Manual iterator: matches then nil; `type` is "function".
+        assert_eq!(
+            exec("local it = string.gmatch(\"one two\", \"%a+\")\nprint(type(it))\nprint(it())\nprint(it())\nprint(it())").unwrap(),
+            "function\none\ntwo\nnil\n"
+        );
+        // Three captures returned from a manual call.
+        assert_eq!(
+            exec("local it = string.gmatch(\"1,22,333\", \"(%d+),?(%d*),?(%d*)\")\nprint(it())").unwrap(),
+            "1\t22\t333\n"
+        );
+        // `init` starts the scan partway through the subject.
+        assert_eq!(
+            exec("for w in string.gmatch(\"one two three\", \"%a+\", 5) do print(w) end").unwrap(),
+            "two\nthree\n"
+        );
+        // Empty pattern yields one empty match per position.
+        assert_eq!(
+            exec("local c = 0\nfor _ in string.gmatch(\"ab\", \"\") do c = c + 1 end\nprint(c)").unwrap(),
+            "3\n"
+        );
+        // Nested iterators stay independent.
+        assert_eq!(
+            exec("for w in string.gmatch(\"ab cd\", \"%a+\") do\n  local n = 0\n  for _ in string.gmatch(w, \"%a\") do n = n + 1 end\n  print(w, n)\nend").unwrap(),
+            "ab\t2\ncd\t2\n"
+        );
+        // Errors.
+        assert!(exec("print(string.gmatch(123, \"%a\"))").is_err());
+        assert!(exec("print(string.gmatch(\"x\", 123))").is_err());
+        assert!(exec("print(string.gmatch(\"x\"))").is_err());
+        assert!(exec("print(string.gmatch(\"x\", \"(abc\"))").is_err());
     }
 
     #[test]

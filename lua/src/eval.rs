@@ -439,6 +439,276 @@ fn class_match(c: u8, cls: u8) -> bool {
     }
 }
 
+// ── string.gmatch ───────────────────────────────────────────────────────────
+
+/// Maximum number of captures per `string.gmatch` match.
+const GM_CAPS: usize = 8;
+
+/// A single `gmatch` match: the whole-match span and the capture spans, all as
+/// half-open byte ranges `[start, end)` into the subject.
+#[derive(Clone, Copy)]
+struct GmatchMatch {
+    mstart: usize,
+    mend: usize,
+    caps: [(usize, usize); GM_CAPS],
+    ncap: usize,
+}
+
+/// Find the next match of `pattern` in `subject` at or after byte offset
+/// `start`, recording capture spans. Mirrors [`string_find`] but supports
+/// `(...)` capture groups (no nesting).
+fn gm_find(subject: &[u8], pattern: &[u8], start: usize) -> Option<GmatchMatch> {
+    if pattern.is_empty() {
+        return Some(GmatchMatch {
+            mstart: start,
+            mend: start,
+            caps: [(0, 0); GM_CAPS],
+            ncap: 0,
+        });
+    }
+    let anchored = pattern[0] == b'^';
+    let p = if anchored { &pattern[1..] } else { pattern };
+    let mut i = start;
+    loop {
+        let mut caps = [(0usize, 0usize); GM_CAPS];
+        let mut ncap = 0usize;
+        if let Some(len) = gm_match(subject, i, p, 0, &mut caps, &mut ncap) {
+            return Some(GmatchMatch {
+                mstart: i,
+                mend: i + len,
+                caps,
+                ncap,
+            });
+        }
+        if anchored || i >= subject.len() {
+            return None;
+        }
+        i += 1;
+    }
+}
+
+/// Try to match `pattern[pi..]` starting at `subject[si]`, returning the
+/// matched length. Records `(...)` capture spans in `caps`. Supports the same
+/// items/quantifiers/anchors as [`match_here`] plus capture groups.
+fn gm_match(
+    subject: &[u8],
+    si: usize,
+    pattern: &[u8],
+    pi: usize,
+    caps: &mut [(usize, usize); GM_CAPS],
+    ncap: &mut usize,
+) -> Option<usize> {
+    let start = si;
+    let mut si = si;
+    let mut pi = pi;
+    while pi < pattern.len() {
+        if pattern[pi] == b'$' {
+            return if si == subject.len() {
+                Some(si - start)
+            } else {
+                None
+            };
+        }
+        // Capture group.
+        if pattern[pi] == b'(' {
+            let close = find_close_paren(pattern, pi)?;
+            let inner = &pattern[pi + 1..close];
+            let len = match_here(subject, si, inner)?;
+            if *ncap < GM_CAPS {
+                caps[*ncap] = (si, si + len);
+                *ncap += 1;
+            }
+            si += len;
+            pi = close + 1;
+            continue;
+        }
+        let item_len = item_size(pattern, pi);
+        if item_len == 0 {
+            return None;
+        }
+        let quant = if pi + item_len < pattern.len() {
+            pattern[pi + item_len]
+        } else {
+            0
+        };
+        match quant {
+            b'*' | b'+' | b'-' | b'?' => {
+                let rest_pi = pi + item_len + 1;
+                let item_pi = pi;
+                match quant {
+                    b'?' => {
+                        if let Some(n) = match_item(subject, si, pattern, item_pi) {
+                            if let Some(len) =
+                                gm_match(subject, si + n, pattern, rest_pi, caps, ncap)
+                            {
+                                return Some(si + n - start + len);
+                            }
+                        }
+                        if let Some(len) =
+                            gm_match(subject, si, pattern, rest_pi, caps, ncap)
+                        {
+                            return Some(si - start + len);
+                        }
+                        return None;
+                    }
+                    b'*' | b'+' => {
+                        let min = if quant == b'*' { 0usize } else { 1usize };
+                        let mut end = si;
+                        while let Some(n) = match_item(subject, end, pattern, item_pi) {
+                            if n == 0 {
+                                break;
+                            }
+                            end += n;
+                        }
+                        let max = end - si;
+                        let mut k = max;
+                        loop {
+                            if k >= min {
+                                let pos = si + k;
+                                if let Some(len) =
+                                    gm_match(subject, pos, pattern, rest_pi, caps, ncap)
+                                {
+                                    return Some(pos - start + len);
+                                }
+                            }
+                            if k == 0 {
+                                break;
+                            }
+                            k -= 1;
+                        }
+                        return None;
+                    }
+                    b'-' => {
+                        let mut end = si;
+                        loop {
+                            if let Some(len) =
+                                gm_match(subject, end, pattern, rest_pi, caps, ncap)
+                            {
+                                return Some(end - start + len);
+                            }
+                            match match_item(subject, end, pattern, item_pi) {
+                                Some(n) if n > 0 => end += n,
+                                _ => break,
+                            }
+                        }
+                        return None;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                let n = match_item(subject, si, pattern, pi)?;
+                si += n;
+                pi += item_len;
+            }
+        }
+    }
+    Some(si - start)
+}
+
+/// Find the `)` closing the capture group opened at `pattern[open]` (no
+/// nesting is supported; `%` escapes are skipped).
+fn find_close_paren(pattern: &[u8], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    while i < pattern.len() {
+        if pattern[i] == b'%' && i + 1 < pattern.len() {
+            i += 2;
+            continue;
+        }
+        if pattern[i] == b')' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Validate a `gmatch` pattern: every `(` (not `%`-escaped) has a matching `)`.
+fn valid_gmatch_pattern(pattern: &[u8]) -> bool {
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < pattern.len() {
+        if pattern[i] == b'%' && i + 1 < pattern.len() {
+            i += 2;
+            continue;
+        }
+        match pattern[i] {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    depth == 0
+}
+
+/// Advance a `string.gmatch` iterator one step, pushing the capture values (or
+/// the whole match when the pattern has no captures) onto the value stack and
+/// returning the number of values pushed (0 means the iterator is exhausted).
+pub(crate) fn gmatch_advance(s: &mut LuaState, id: u8) -> Result<u8, LuaError> {
+    let st = s.gmatches[id as usize];
+    if st.done {
+        return Ok(0);
+    }
+
+    // Copy the subject/pattern out of the string arena so `intern` below can
+    // mutate the arena without conflicting with the immutable borrows.
+    let mut sbuf = [0u8; super::STR_CAP];
+    let mut pbuf = [0u8; super::STR_CAP];
+    let subj = s.str_bytes(st.subject);
+    let pat = s.str_bytes(st.pattern);
+    if subj.len() > sbuf.len() || pat.len() > pbuf.len() {
+        s.gmatches[id as usize].done = true;
+        return Ok(0);
+    }
+    sbuf[..subj.len()].copy_from_slice(subj);
+    pbuf[..pat.len()].copy_from_slice(pat);
+    let subject = &sbuf[..subj.len()];
+    let pattern = &pbuf[..pat.len()];
+
+    let m = match gm_find(subject, pattern, st.pos) {
+        Some(m) => m,
+        None => {
+            s.gmatches[id as usize].done = true;
+            return Ok(0);
+        }
+    };
+
+    // Advance the search position, never getting stuck on an empty match.
+    let (a, b) = (m.mstart, m.mend);
+    if b > a {
+        s.gmatches[id as usize].pos = b;
+    } else {
+        let np = a + 1;
+        if np > subject.len() {
+            s.gmatches[id as usize].done = true;
+        } else {
+            s.gmatches[id as usize].pos = np;
+        }
+    }
+
+    // Produce the capture values (or the whole match).
+    let mut n = 0u8;
+    if m.ncap > 0 {
+        for k in 0..m.ncap {
+            let (cs, ce) = m.caps[k];
+            let v = s.intern(&subject[cs..ce])?;
+            s.push_val(Value::Str(v))?;
+            n += 1;
+        }
+    } else {
+        let v = s.intern(&subject[a..b])?;
+        s.push_val(Value::Str(v))?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// Trim leading/trailing ASCII whitespace.
 fn trim_ascii(b: &[u8]) -> &[u8] {
     let mut s = 0;
@@ -1269,6 +1539,43 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let r = s.intern(&out[..out_len])?;
             ExecResult::Ret(Value::Str(r))
         }
+        Value::Native(32) => {
+            // string.gmatch(s, pattern [, init]): returns an iterator over the
+            // matches (or captures) of `pattern` in `s`, starting at `init`
+            // (default 1). The returned value is a `Value::Gmatch` iterator
+            // that yields each match's captures (or the whole match when the
+            // pattern has no captures) on each call, and nil once exhausted.
+            if argc < 2 || argc > 3 {
+                return Err("string.gmatch expects 2 or 3 arguments".into());
+            }
+            let subject = match argbuf[0] {
+                Value::Str(r) => r,
+                _ => return Err("string.gmatch expects a string subject".into()),
+            };
+            let pattern = match argbuf[1] {
+                Value::Str(r) => r,
+                _ => return Err("string.gmatch expects a string pattern".into()),
+            };
+            let init = if argc == 3 {
+                integer_index(argbuf[2])?
+            } else {
+                1
+            };
+            {
+                let pat = s.str_bytes(pattern);
+                if !valid_gmatch_pattern(pat) {
+                    return Err("malformed pattern (unfinished capture)".into());
+                }
+            }
+            let subj_len = s.str_bytes(subject).len() as i64;
+            let mut start = if init >= 0 { init } else { subj_len + init + 1 };
+            if start < 1 {
+                start = 1;
+            }
+            let pos = (start - 1) as usize;
+            let id = s.alloc_gmatch(subject, pattern, pos)?;
+            ExecResult::Ret(Value::Gmatch(id))
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
@@ -1438,6 +1745,19 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
         Value::Wrapped(id) => {
             // Calling a wrapped coroutine resumes it and re-raises errors.
             crate::vm::co_wrap_call(s, id, argc)?
+        }
+        Value::Gmatch(id) => {
+            // Calling a gmatch iterator advances it and yields the next
+            // captures (or the whole match), or nil once exhausted.
+            if argc != 0 {
+                return Err("gmatch iterator expects no arguments".into());
+            }
+            let n = gmatch_advance(s, id)?;
+            if n == 0 {
+                ExecResult::Ret(Value::Nil)
+            } else {
+                ExecResult::RetN(n)
+            }
         }
         Value::Co(_) => return Err("attempt to call a thread value".into()),
         _ => {
@@ -1747,6 +2067,7 @@ pub(crate) fn val_eq(a: Value, b: Value) -> bool {
         // Unit builtins compare equal to themselves.
         (Value::Co(x), Value::Co(y)) => x == y,
         (Value::Wrapped(x), Value::Wrapped(y)) => x == y,
+        (Value::Gmatch(x), Value::Gmatch(y)) => x == y,
         (Value::Closure(x), Value::Closure(y)) => x == y,
         // Unit builtins compare equal to themselves.
         (Value::Shell, Value::Shell)
@@ -1926,7 +2247,8 @@ fn type_name(v: Value) -> &'static [u8] {
         | Value::Dhcp
         | Value::Exit
         | Value::Ls
-        | Value::Wrapped(_) => b"function",
+        | Value::Wrapped(_)
+        | Value::Gmatch(_) => b"function",
         Value::Co(_) => b"thread",
     }
 }
@@ -2029,6 +2351,7 @@ fn value_to_string(s: &mut LuaState, v: Value) -> Result<super::StrRef, LuaError
         Value::Ls => Ok(s.intern(b"ls")?),
         Value::Co(_) => Ok(s.intern(b"thread")?),
         Value::Wrapped(_) => Ok(s.intern(b"function")?),
+        Value::Gmatch(_) => Ok(s.intern(b"function")?),
     }
 }
 
@@ -2079,6 +2402,7 @@ pub(crate) fn tostring(s: &mut LuaState, v: Value) -> Result<(), LuaError> {
         Value::Ls => emit_str(s, b"ls"),
         Value::Co(_) => emit_str(s, b"thread"),
         Value::Wrapped(_) => emit_str(s, b"function"),
+        Value::Gmatch(_) => emit_str(s, b"function"),
     }
     Ok(())
 }

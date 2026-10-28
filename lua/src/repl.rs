@@ -911,6 +911,16 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   %g/%G use %.14g precision. Results are capped at 1024 bytes.\n",
     },
     HelpEntry {
+        name: "string.gmatch",
+        short: "Iterate over matches of a pattern",
+        detail: "string.gmatch(s, pattern [, init])\n\
+                  Returns an iterator that yields the captures of each match\n\
+                  of `pattern` in `s` (or the whole match when the pattern has\n\
+                  no captures), starting at `init` (default 1). Usable in a\n\
+                  `for` loop or by calling the iterator directly; it returns\n\
+                  nil once exhausted. Capture groups `(...)` are supported.\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1325,7 +1335,7 @@ mod tests {
             "tonumber", "tostring", "type", "warn",
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
-            "string.format",
+            "string.format", "string.gmatch",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);
