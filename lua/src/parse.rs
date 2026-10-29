@@ -846,6 +846,30 @@ impl<'s, 'l> Parser<'s, 'l> {
                     let base = node;
                     node = self.alloc(Node::Index(base, key))?;
                 }
+                Tok::Colon => {
+                    self.advance()?;
+                    let (off, len) = match self.cur {
+                        Tok::Name(o, l) => (o, l),
+                        _ => return Err("expected name after ':'"),
+                    };
+                    let name = self
+                        .state
+                        .intern(&self.lex.src()[off as usize..][..len as usize])?;
+                    self.advance()?;
+                    let key = self.alloc(Node::Str(name))?;
+                    let method = self.alloc(Node::Index(node, key))?;
+                    // Save the receiver for the method call.
+                    let receiver = node;
+                    self.expect(Tok::LParen, "expected '(' after method name")?;
+                    let args = self.parse_arg_list()?;
+                    // Prepend the receiver as the first argument.
+                    let recv_arg = self.alloc(Node::Arg(receiver))?;
+                    if args != NO_NODE {
+                        self.state.next[recv_arg as usize] = args;
+                    }
+                    let base = method;
+                    node = self.alloc(Node::Call(base, recv_arg))?;
+                }
                 Tok::LBracket => {
                     self.advance()?;
                     let key = self.parse_expr()?;
@@ -859,7 +883,13 @@ impl<'s, 'l> Parser<'s, 'l> {
                     let base = node;
                     node = self.alloc(Node::Call(base, first_arg))?;
                 }
-                _ => break,
+                _ => {
+                    if self.cur == Tok::Colon { return Err("STILL COLON"); }
+                    if self.cur == Tok::Dot { return Err("IT IS DOT"); }
+                    if self.cur == Tok::LParen { return Err("IT IS LPAREN"); }
+                    if self.cur == Tok::Name(0, 0) { /* no */ }
+                    break;
+                }
             }
         }
         Ok(node)

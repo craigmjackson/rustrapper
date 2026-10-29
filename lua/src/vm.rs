@@ -1312,7 +1312,7 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
                         }
                     }
                 } else if let Value::IoLines(id) = s.frames[f].ctrl[0] {
-                    let mut buf = [0u8; 4096];
+                    let mut buf = [0u8; super::STR_CAP];
                     let nr = s.io_read.and_then(|f| f(id, 1, 0, &mut buf));
                     match nr {
                         None | Some(0) => {

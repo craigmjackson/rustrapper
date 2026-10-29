@@ -165,7 +165,7 @@ Builtins:
 - `assert(v [, message, ...])` — returns all arguments when `v` is truthy; otherwise raises an error with `message` (default `"assertion failed!"`)
 - `coroutine.create(f)` / `coroutine.resume(co, ...)` / `coroutine.yield(...)` / `coroutine.status(co)` / `coroutine.wrap(co)` / `coroutine.isyieldable()` / `coroutine.running()` / `coroutine.close(co)` — real coroutines on the bytecode VM (a pool of 3; `type(co)` is `"thread"`)
 - `dhcp` / `dhcp()` — set up the network (e1000 + DHCP); prints the negotiated MAC/IP/subnet/gateway/TFTP server/bootfile, sets the `mac`, `ip`, `subnet`, `gateway`, `server`, `bootfile`, `tftp_port` (default 69) globals, and enables `fetch()` and `dofile()`
-- `fetch("file"[, "dest"])` — download a file from the TFTP server, saving it under the optional local `dest` name, and return its byte count (or `nil`)
+- `fetch("file"[, "dest"])` — download a file from the TFTP/HTTP server (optional `tftp://`/`http://` prefix; defaults to `tftp://`), saving it under the optional local `dest` name, and return its byte count (or `nil`) (HTTP is supported on the native target only)
 - `dofile("file.lua")` — load a Lua chunk from the TFTP server, run it, and return its value
 - `ls` / `ls()` — list the files downloaded with `fetch()`, as `name (N bytes)`
 - `exit` — leave the shell; `shell()` — nested shell (not supported)

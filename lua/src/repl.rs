@@ -204,8 +204,49 @@ pub fn repl_loop(
                         break 'keys;
                     }
                     putc(b'\n');
-                    // Append the current line to the accumulated chunk.
-                    for &b in &line[..len] {
+                    // Append the current line to the accumulated chunk. A
+                    // top-level `local` declaration does not survive past the
+                    // chunk in Lua, so in the REPL we treat a simple
+                    // `local x = ...` / `local x, y = ...` as `global x = ...`
+                    // so the binding persists across lines (use `local` inside
+                    // functions/blocks for real scoping).
+                    let trim_start = line[..len].iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(len);
+                    let is_local_var = len >= 7
+                        && line[trim_start..len].starts_with(b"local ")
+                        && {
+                            let after = trim_start + 6;
+                            let mut i = after;
+                            while i < len && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
+                                i += 1;
+                            }
+                            // skip spaces
+                            while i < len && (line[i] == b' ' || line[i] == b'\t') {
+                                i += 1;
+                            }
+                            // must be '=' or ',' (not 'function' or 'if' etc.)
+                            i < len && (line[i] == b'=' || line[i] == b',')
+                        };
+                    let prefix_offset = if is_local_var { 6 } else { 0 }; // "local " length
+                    let mut src_idx = 0usize;
+                    // skip leading whitespace copy as-is
+                    while src_idx < trim_start {
+                        if acc_len < CHUNK_CAP {
+                            acc[acc_len] = line[src_idx];
+                            acc_len += 1;
+                        }
+                        src_idx += 1;
+                    }
+                    if is_local_var {
+                        // write "global " instead of "local "
+                        for &b in b"global " {
+                            if acc_len < CHUNK_CAP {
+                                acc[acc_len] = b;
+                                acc_len += 1;
+                            }
+                        }
+                        src_idx = trim_start + 6; // skip "local "
+                    }
+                    for &b in &line[src_idx..len] {
                         if acc_len < CHUNK_CAP {
                             acc[acc_len] = b;
                             acc_len += 1;
@@ -724,6 +765,15 @@ const HELP_COMMANDS: &[HelpEntry] = &[
         short: "Clear the screen",
         detail: "clear\n\
                   Clears the display (same as Ctrl-L).\n",
+    },
+    HelpEntry {
+        name: "global",
+        short: "Declare a persistent global variable",
+        detail: "global name [= value]\n\
+                  Declares `name` as a global that persists across REPL lines\n\
+                  (unlike `local`, which is scoped to one chunk). Use this in\n\
+                  the REPL when a value must survive to the next line.\n\
+                  Example: global f = io.open(\"x.txt\", \"r\")\n",
     },
     HelpEntry {
         name: "print",
@@ -1264,6 +1314,7 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Downloads 'file' from the TFTP server (DHCP next_server) and\n\
                   returns its byte count, or nil on failure. The optional\n\
                   'dest' names the local file it is saved under (shown by ls).\n\
+                  `file` may be prefixed with tftp:// or http:// (default tftp).\n\
                   Requires a TFTP server: run 'dhcp' first to set up the\n\
                   network (or it works automatically in PXE scripts).\n",
     },
@@ -1718,7 +1769,7 @@ mod tests {
     fn help_lists_commands() {
         let out = run_session(b"help\rexit\r");
         for cmd in [
-            "help", "exit", "clear", "lua", "shell",
+            "help", "exit", "clear", "global", "lua", "shell",
             "print", "next", "pairs", "setmetatable",
             "rawequal", "rawget", "rawlen", "rawset", "select",
             "tonumber", "tostring", "type", "warn",

@@ -893,7 +893,25 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                             _ => return Err("fetch dest must be a string".into()),
                         }
                     } else {
-                        (r, name)
+                        // Default save name: basename of the URL (last component
+                        // after the last '/', before any '?').
+                        let base = match name.rfind('/') {
+                            Some(i) => &name[i + 1..],
+                            None => name,
+                        };
+                        let base = match base.find('?') {
+                            Some(i) => &base[..i],
+                            None => base,
+                        };
+                        let base = if base.is_empty() { name } else { base };
+                        if base.len() >= 128 {
+                            return Err("fetch dest too long".into());
+                        }
+                        let save_ref = s.intern(base.as_bytes())?;
+                        dbuf[..base.len()].copy_from_slice(base.as_bytes());
+                        let save = core::str::from_utf8(&dbuf[..base.len()])
+                            .map_err(|_| "fetch dest must be ASCII")?;
+                        (save_ref, save)
                     };
 
                     let fetch = s.fetch;
@@ -1635,7 +1653,7 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let pat_bytes: &[u8] = &pbuf[..pat_bytes.len()];
 
             // Build the result in a fixed buffer.
-            let mut out = [0u8; 4096];
+            let mut out = [0u8; super::STR_CAP];
             let mut out_len = 0usize;
             let mut pos = 0usize;
             let mut count = 0usize;
@@ -3180,14 +3198,28 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let id = if argc == 0 {
                 s.io_default_output
             } else {
-                match argbuf[0] {
-                    Value::Num(n) => Some(n as u8),
-                    _ => return Err("io.close expects a file".into()),
-                }
+                io_handle(s, argbuf[0])
             };
+            if id.is_none() && argc >= 1 {
+                return Err("io.close expects a file".into());
+            }
             match id {
                 Some(i) => {
                     let ok = s.io_close.map(|f| f(i)).unwrap_or(false);
+                    // Update the pseudo-fs listing size for writable files.
+                    if ok && argc >= 1 {
+                        if let Value::Table(tid) = argbuf[0] {
+                            let name_key = s.intern(b"name")?;
+                            let name_val = raw_get(s, tid, Value::Str(name_key));
+                            if let Value::Str(nr) = name_val {
+                                let name = s.str_bytes(nr);
+                                if !name.is_empty() {
+                                    let size = s.io_size.map(|f| f(i)).unwrap_or(0);
+                                    let _ = s.record_fetch_ref(nr, size as u64);
+                                }
+                            }
+                        }
+                    }
                     if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
                 }
                 None => ExecResult::Ret(Value::Bool(true)),
@@ -3196,7 +3228,10 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
         Value::Native(61) => {
             // io.flush([file])
             let id = if argc == 0 { s.io_default_output } else {
-                match argbuf[0] { Value::Num(n) => Some(n as u8), _ => return Err("io.flush expects a file".into()) }
+                match io_handle(s, argbuf[0]) {
+                    Some(i) => Some(i),
+                    None => return Err("io.flush expects a file".into()),
+                }
             };
             if let Some(i) = id {
                 if let Some(f) = s.io_flush { let _ = f(i); }
@@ -3226,6 +3261,14 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                         s.io_default_input = Some(n as u8);
                         ExecResult::Ret(Value::Num(n))
                     }
+                    Value::Table(_) => {
+                        if let Some(id) = io_handle(s, argbuf[0]) {
+                            s.io_default_input = Some(id);
+                            ExecResult::Ret(Value::Num(id as i64))
+                        } else {
+                            ExecResult::Ret(Value::Nil)
+                        }
+                    }
                     _ => return Err("io.input expects a string or file".into()),
                 }
             }
@@ -3241,6 +3284,7 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                         s.io_open.map(|f| f(name, "r")).flatten()
                     }
                     Value::Num(n) => Some(n as u8),
+                    Value::Table(_) => io_handle(s, argbuf[0]),
                     _ => return Err("io.lines expects a string or file".into()),
                 }
             };
@@ -3254,21 +3298,65 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             if argc < 1 || argc > 2 {
                 return Err("io.open expects 1 or 2 arguments".into());
             }
-            let name = match argbuf[0] {
-                Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or(""),
+            let name_bytes = match argbuf[0] {
+                Value::Str(r) => s.str_bytes(r),
                 _ => return Err("io.open expects a string filename".into()),
             };
-            let mode = if argc == 2 {
+            let mut name_buf = [0u8; 128];
+            if name_bytes.len() >= name_buf.len() {
+                return Err("io.open: filename too long".into());
+            }
+            name_buf[..name_bytes.len()].copy_from_slice(name_bytes);
+            let name = core::str::from_utf8(&name_buf[..name_bytes.len()]).unwrap_or("");
+            let mut mode_buf = [0u8; 16];
+            let mode_len = if argc == 2 {
                 match argbuf[1] {
-                    Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or("r"),
+                    Value::Str(r) => {
+                        let mb = s.str_bytes(r);
+                        let ml = mb.len().min(mode_buf.len());
+                        mode_buf[..ml].copy_from_slice(&mb[..ml]);
+                        ml
+                    }
                     _ => return Err("io.open expects a string mode".into()),
                 }
             } else {
-                "r"
+                mode_buf[0] = b'r';
+                1
             };
+            let mode = core::str::from_utf8(&mode_buf[..mode_len]).unwrap_or("r");
             match s.io_open {
                 Some(f) => match f(name, mode) {
-                    Some(id) => ExecResult::Ret(Value::Num(id as i64)),
+                    Some(id) => {
+                        // Return a file handle table with an `id` field and
+                        // method entries (stored as Native functions that take
+                        // the table as their first argument).
+                        let tid = crate::eval::new_table(s)?;
+                        let id_key = s.intern(b"id")?;
+                        crate::eval::tset(s, Value::Table(tid), Value::Str(id_key), Value::Num(id as i64))?;
+                        let name_key = s.intern(b"name")?;
+                        let name_ref = s.intern(name.as_bytes())?;
+                        crate::eval::tset(s, Value::Table(tid), Value::Str(name_key), Value::Str(name_ref))?;
+                        for (nm, nid) in [
+                            ("close", 60u8),
+                            ("flush", 61),
+                            ("read", 66),
+                            ("write", 69),
+                        ] {
+                            let n = s.intern(nm.as_bytes())?;
+                            crate::eval::tset(s, Value::Table(tid), Value::Str(n), Value::Native(nid))?;
+                        }
+                        // lines as a method too
+                        let n = s.intern(b"lines")?;
+                        crate::eval::tset(s, Value::Table(tid), Value::Str(n), Value::Native(63))?;
+                        // Register writable files in the pseudo-fs listing.
+                        if mode.contains('w') || mode.contains('a') || mode.contains('+') {
+                            if !name.is_empty() {
+                                let nr = s.intern(name.as_bytes())?;
+                                let _ = s.record_fetch_ref(nr, 0);
+                            }
+                        }
+                        ExecResult::Ret(Value::Table(tid))
+                    }
                     None => ExecResult::Ret(Value::Nil),
                 },
                 None => ExecResult::Ret(Value::Nil),
@@ -3297,6 +3385,14 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                         s.io_default_output = Some(n as u8);
                         ExecResult::Ret(Value::Num(n))
                     }
+                    Value::Table(_) => {
+                        if let Some(id) = io_handle(s, argbuf[0]) {
+                            s.io_default_output = Some(id);
+                            ExecResult::Ret(Value::Num(id as i64))
+                        } else {
+                            ExecResult::Ret(Value::Nil)
+                        }
+                    }
                     _ => return Err("io.output expects a string or file".into()),
                 }
             }
@@ -3304,21 +3400,19 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
         Value::Native(66) => {
             // io.read([file], ...)
             // Determine file handle.
-            let file_id = if argc >= 1 {
-                match argbuf[0] {
-                    Value::Num(n) => Some(n as u8),
-                    _ => None, // first arg is a format string, use default input
-                }
+            let first_is_file = argc >= 1 && matches!(argbuf[0], Value::Table(_));
+            let file_id = if first_is_file {
+                io_handle(s, argbuf[0])
             } else {
-                None
+                None // use default input; first arg is a format
             };
+            let start = if first_is_file { 1 } else { 0 };
             let id = file_id.or(s.io_default_input);
             // Collect formats as small integer codes to avoid holding borrows.
             // code: 0 = all (*a), 1 = line (*l), 2 = N bytes (count in counts[]).
             let mut codes: [u8; 4] = [1, 1, 1, 1];
             let mut counts: [usize; 4] = [0, 0, 0, 0];
             let mut nfmt = 0usize;
-            let start = if file_id.is_some() { 1 } else { 0 };
             if start >= argc as usize {
                 codes[0] = 1;
                 nfmt = 1;
@@ -3361,7 +3455,7 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             for fi in 0..nfmt {
                 let code = codes[fi];
                 let cnt = counts[fi];
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; super::STR_CAP];
                 let bytes_read = match code {
                     0 => s.io_read.map(|f| f(id.unwrap_or(0), 0, 0, &mut buf)).flatten(),
                     1 => s.io_read.map(|f| f(id.unwrap_or(0), 1, 0, &mut buf)).flatten(),
@@ -3399,7 +3493,16 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             // io.tmpfile()
             match s.io_open {
                 Some(f) => match f("", "w+") {
-                    Some(id) => ExecResult::Ret(Value::Num(id as i64)),
+                    Some(id) => {
+                        let tid = crate::eval::new_table(s)?;
+                        let id_key = s.intern(b"id")?;
+                        crate::eval::tset(s, Value::Table(tid), Value::Str(id_key), Value::Num(id as i64))?;
+                        for (nm, nid) in [("close", 60u8), ("flush", 61), ("read", 66), ("write", 69), ("lines", 63)] {
+                            let n = s.intern(nm.as_bytes())?;
+                            crate::eval::tset(s, Value::Table(tid), Value::Str(n), Value::Native(nid))?;
+                        }
+                        ExecResult::Ret(Value::Table(tid))
+                    }
                     None => ExecResult::Ret(Value::Nil),
                 },
                 None => ExecResult::Ret(Value::Nil),
@@ -3408,10 +3511,10 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
         Value::Native(68) => {
             // io.type(obj)
             if argc != 1 { return Err("io.type expects 1 argument".into()); }
-            match argbuf[0] {
-                Value::Num(n) => {
+            match io_handle(s, argbuf[0]) {
+                Some(id) => {
                     match s.io_type {
-                        Some(f) => match f(n as u8) {
+                        Some(f) => match f(id) {
                             Some(t) => {
                                 let r = s.intern(t.as_bytes())?;
                                 ExecResult::Ret(Value::Str(r))
@@ -3421,14 +3524,23 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                         None => ExecResult::Ret(Value::Nil),
                     }
                 }
-                _ => ExecResult::Ret(Value::Nil),
+                None => ExecResult::Ret(Value::Nil),
             }
         }
         Value::Native(69) => {
             // io.write(...)
-            let id = s.io_default_output;
+            // If the first argument is a file handle, write to it instead of
+            // the default output.
+            let (id, start) = if argc >= 1 {
+                match io_handle(s, argbuf[0]) {
+                    Some(h) => (Some(h), 1usize),
+                    None => (s.io_default_output, 0usize),
+                }
+            } else {
+                (s.io_default_output, 0usize)
+            };
             let mut ok = true;
-            for k in 0..argc as usize {
+            for k in start..argc as usize {
                 let bytes: &[u8] = match argbuf[k] {
                     Value::Str(r) => s.str_bytes(r),
                     Value::Num(n) => {
@@ -4657,6 +4769,22 @@ fn to_integer_for_format(v: Value) -> Result<i64, LuaError> {
         Value::Num(n) => Ok(n),
         Value::Float(f) if f.is_finite() && f == float_floor(f) => Ok(f as i64),
         _ => Err("bad argument (number expected, got string)".into()),
+    }
+}
+
+/// Extract a file handle id from a `Value::Num` or a file table (field "id").
+fn io_handle(s: &mut LuaState, v: Value) -> Option<u8> {
+    match v {
+        Value::Num(n) => Some(n as u8),
+        Value::Table(tid) => {
+            let key = s.intern(b"id").unwrap_or(0);
+            let idv = raw_get(s, tid, Value::Str(key));
+            match idv {
+                Value::Num(n) => Some(n as u8),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

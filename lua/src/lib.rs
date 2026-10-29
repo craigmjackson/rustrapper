@@ -130,7 +130,7 @@ pub mod vm;
 /// Maximum number of AST nodes (each node is 16 bytes).
 pub const MAX_NODES: usize = 1024;
 /// String arena capacity in bytes (all strings are interned here).
-pub const STR_CAP: usize = 4096;
+pub const STR_CAP: usize = 32768;
 /// Maximum number of distinct interned strings.
 pub const MAX_STRINGS: usize = 256;
 /// Expression/argument value stack capacity.
@@ -817,6 +817,7 @@ pub struct LuaState {
     pub io_write: Option<fn(id: u8, data: &[u8]) -> bool>,
     pub io_flush: Option<fn(id: u8) -> bool>,
     pub io_type: Option<fn(id: u8) -> Option<&'static str>>,
+    pub io_size: Option<fn(id: u8) -> usize>,
     pub io_default_input: Option<u8>,
     pub io_default_output: Option<u8>,
     /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
@@ -971,6 +972,7 @@ impl LuaState {
             io_write: None,
             io_flush: None,
             io_type: None,
+            io_size: None,
             io_default_input: None,
             io_default_output: None,
             mm_refs: [0; MM_COUNT],
@@ -1385,6 +1387,9 @@ impl LuaState {
     }
     pub fn set_io_type(&mut self, f: Option<fn(id: u8) -> Option<&'static str>>) {
         self.io_type = f;
+    }
+    pub fn set_io_size(&mut self, f: Option<fn(id: u8) -> usize>) {
+        self.io_size = f;
     }
 
     /// Run the `dhcp` builtin: establish network connectivity and enable the
@@ -3053,7 +3058,7 @@ mod tests {
         std::println!("LuaState size: {} bytes", n);
         // The state lives on the caller's stack; keep it within the stack
         // budgets of the firmware targets (ARM64 bare has a 512 KB stack).
-        assert!(n < 128 * 1024, "LuaState grew to {} bytes", n);
+        assert!(n < 192 * 1024, "LuaState grew to {} bytes", n);
     }
 
     #[test]

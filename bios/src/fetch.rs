@@ -159,6 +159,8 @@ pub fn dhcp_values(v: &mut lua::DhcpValues) {
 /// in a slot under the local name `save_as`, and return the byte count (or
 /// `None` on failure).
 pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
+    if name.starts_with("http://") { return None; }
+    let name = name.strip_prefix("tftp://").unwrap_or(name);
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() >= 64 {
         return None;
@@ -215,6 +217,8 @@ pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
 /// Host `dofile()` callback: download `name` from the TFTP server into the
 /// interpreter's buffer and return its length (or `None` on failure).
 pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
+    if name.starts_with("http://") { return None; }
+    let name = name.strip_prefix("tftp://").unwrap_or(name);
     let (base, mac, src_ip, server_ip) = unsafe {
         (
             FETCH_CTX.base,
@@ -325,6 +329,8 @@ pub fn io_type(id: u8) -> Option<&'static str> {
     }
 }
 
+pub fn io_size(_id: u8) -> usize { 0 }
+
 pub fn set_io_callbacks(state: &mut lua::LuaState) {
     state.set_io_open(Some(io_open));
     state.set_io_close(Some(io_close));
@@ -332,4 +338,5 @@ pub fn set_io_callbacks(state: &mut lua::LuaState) {
     state.set_io_write(Some(io_write));
     state.set_io_flush(Some(io_flush));
     state.set_io_type(Some(io_type));
+    state.set_io_size(Some(io_size));
 }

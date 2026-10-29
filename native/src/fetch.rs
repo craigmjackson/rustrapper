@@ -110,21 +110,65 @@ impl TftpSink for FileSink<'_> {
     }
 }
 
-/// Host `fetch()` callback: download `name` from the TFTP server, keep it in
-/// memory under the local name `save_as`, and return its byte count (or `None`
-/// on failure).
+/// Host `fetch()` callback: download `name` from the TFTP/HTTP server, keep it
+/// in memory under the local name `save_as`, and return its byte count (or
+/// `None` on failure). `name` may be prefixed with `tftp://` or `http://`;
+/// a missing prefix defaults to `tftp://`.
 pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
-    let server = CTX.lock().unwrap().as_ref().map(|i| i.server)?;
-    if server == Ipv4Addr::UNSPECIFIED {
-        return None;
-    }
-    let mut data = Vec::new();
-    {
-        let mut sink = FileSink { data: &mut data };
-        crate::net::tftp_download(server, name, &mut sink)?;
-    }
+    let data = if let Some(rest) = name.strip_prefix("http://") {
+        http_download(rest)?
+    } else {
+        let name = name.strip_prefix("tftp://").unwrap_or(name);
+        let server = CTX.lock().unwrap().as_ref().map(|i| i.server)?;
+        if server == Ipv4Addr::UNSPECIFIED {
+            return None;
+        }
+        let mut data = Vec::new();
+        {
+            let mut sink = FileSink { data: &mut data };
+            crate::net::tftp_download(server, name, &mut sink)?;
+        }
+        data
+    };
     FILES.lock().unwrap().push((save_as.to_string(), data.clone()));
     Some(data.len())
+}
+
+/// Minimal HTTP/1.0 GET client. `url` is `host[:port]/path` (no scheme).
+fn http_download(url: &str) -> Option<Vec<u8>> {
+    // Split host[:port] and path.
+    let (hostport, path) = match url.find('/') {
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, "/"),
+    };
+    let (host, port) = match hostport.find(':') {
+        Some(i) => (&hostport[..i], hostport[i + 1..].parse::<u16>().ok()?),
+        None => (hostport, 80u16),
+    };
+    // Resolve host (IP literal only for simplicity; fall back to DNS not done).
+    use std::net::ToSocketAddrs;
+    let addrs = format!("{}:{}", host, port).to_socket_addrs().ok()?;
+    let mut stream = None;
+    for a in addrs {
+        if let Ok(s) = std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(10)) {
+            stream = Some(s);
+            break;
+        }
+    }
+    let mut stream = stream?;
+    use std::io::{Read, Write};
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, host
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).ok()?;
+    // Split headers and body.
+    let sep = b"\r\n\r\n";
+    let idx = resp.windows(4).position(|w| w == sep)?;
+    let body = &resp[idx + 4..];
+    Some(body.to_vec())
 }
 
 /// An open file handle in the pseudo-filesystem.
@@ -143,19 +187,21 @@ pub fn io_open(name: &str, mode: &str) -> Option<u8> {
     let mut files = OPEN_FILES.lock().unwrap();
     let writable = mode.contains('w') || mode.contains('a') || mode.contains('+');
     let data = if mode.contains('r') && !mode.contains('+') {
-        // read-only: find in fetched files
         let fl = FILES.lock().unwrap();
         fl.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone())?
+    } else if mode.contains('a') {
+        let fl = FILES.lock().unwrap();
+        fl.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone()).unwrap_or_default()
     } else {
         Vec::new()
     };
-    // append mode
-    let data = if mode.contains('a') {
-        let fl = FILES.lock().unwrap();
-        fl.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone()).unwrap_or(data)
-    } else {
-        data
-    };
+    // For write/append modes, register a pseudo-fs entry so ls can see it.
+    if writable && !name.is_empty() {
+        let mut fl = FILES.lock().unwrap();
+        if !fl.iter().any(|(n, _)| n == name) {
+            fl.push((name.to_string(), data.clone()));
+        }
+    }
     let id = files.len() as u8;
     if id == u8::MAX { return None; }
     files.push(OpenFile {
@@ -172,8 +218,25 @@ pub fn io_open(name: &str, mode: &str) -> Option<u8> {
 pub fn io_close(id: u8) -> bool {
     let mut files = OPEN_FILES.lock().unwrap();
     if let Some(f) = files.get_mut(id as usize) {
-        f.closed = true;
-        true
+        if f.writable && !f.name.is_empty() {
+            let data = f.data.clone();
+            let name = f.name.clone();
+            drop(files);
+            let mut fl = FILES.lock().unwrap();
+            if let Some(entry) = fl.iter_mut().find(|(n, _)| *n == name) {
+                entry.1 = data;
+            } else {
+                fl.push((name, data));
+            }
+            let mut files = OPEN_FILES.lock().unwrap();
+            if let Some(f) = files.get_mut(id as usize) {
+                f.closed = true;
+            }
+            true
+        } else {
+            f.closed = true;
+            true
+        }
     } else {
         false
     }
@@ -239,6 +302,21 @@ pub fn io_flush(id: u8) -> bool {
     files.get(id as usize).map(|f| !f.closed).unwrap_or(false)
 }
 
+pub fn io_size(id: u8) -> usize {
+    let files = OPEN_FILES.lock().unwrap();
+    if let Some(f) = files.get(id as usize) {
+        if f.closed {
+            // look up in FILES
+            let fl = FILES.lock().unwrap();
+            fl.iter().find(|(n, _)| *n == f.name).map(|(_, d)| d.len()).unwrap_or(f.data.len())
+        } else {
+            f.data.len()
+        }
+    } else {
+        0
+    }
+}
+
 /// Host `io.type()` callback.
 pub fn io_type(id: u8) -> Option<&'static str> {
     let files = OPEN_FILES.lock().unwrap();
@@ -263,15 +341,21 @@ pub fn set_io_callbacks(state: &mut lua::LuaState) {
 /// Host `dofile()` callback: download `name` from the TFTP server into the
 /// interpreter's buffer and return its length (or `None` on failure).
 pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
-    let server = CTX.lock().unwrap().as_ref().map(|i| i.server)?;
-    if server == Ipv4Addr::UNSPECIFIED {
-        return None;
-    }
-    let mut data = Vec::new();
-    {
-        let mut sink = FileSink { data: &mut data };
-        crate::net::tftp_download(server, name, &mut sink)?;
-    }
+    let data = if let Some(rest) = name.strip_prefix("http://") {
+        http_download(rest)?
+    } else {
+        let name = name.strip_prefix("tftp://").unwrap_or(name);
+        let server = CTX.lock().unwrap().as_ref().map(|i| i.server)?;
+        if server == Ipv4Addr::UNSPECIFIED {
+            return None;
+        }
+        let mut data = Vec::new();
+        {
+            let mut sink = FileSink { data: &mut data };
+            crate::net::tftp_download(server, name, &mut sink)?;
+        }
+        data
+    };
     if data.len() > buf.len() {
         return None;
     }
