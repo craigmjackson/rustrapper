@@ -320,6 +320,8 @@ pub fn io_read(id: u8, fmt: u8, n: usize, buf: &mut [u8]) -> Option<usize> {
 
 pub fn io_write(_id: u8, _data: &[u8]) -> bool { false }
 pub fn io_flush(_id: u8) -> bool { true }
+pub fn io_seek(_id: u8, _whence: &str, _offset: i64) -> Option<usize> { None }
+
 pub fn io_type(id: u8) -> Option<&'static str> {
     let i = id as usize;
     if i >= MAX_FETCH_FILES { return None; }
@@ -339,4 +341,5 @@ pub fn set_io_callbacks(state: &mut lua::LuaState) {
     state.set_io_flush(Some(io_flush));
     state.set_io_type(Some(io_type));
     state.set_io_size(Some(io_size));
+    state.set_io_seek(Some(io_seek));
 }

@@ -1297,6 +1297,22 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: io.write(\"hi\")\n",
     },
     HelpEntry {
+        name: "file:seek",
+        short: "Seek in a file",
+        detail: "file:seek([whence [, offset]])\n\
+                  Sets the file position. whence: \"set\", \"cur\", \"end\".\n\
+                  Returns the new position.\n\
+                  Example: f:seek(\"set\", 0)\n",
+    },
+    HelpEntry {
+        name: "file:setvbuf",
+        short: "Set the buffering mode of a file",
+        detail: "file:setvbuf(mode [, size])\n\
+                  Sets the buffering mode (\"no\", \"full\", \"line\").\n\
+                  A no-op in this subset; returns true.\n\
+                  Example: f:setvbuf(\"no\")\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\

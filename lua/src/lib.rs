@@ -818,6 +818,7 @@ pub struct LuaState {
     pub io_flush: Option<fn(id: u8) -> bool>,
     pub io_type: Option<fn(id: u8) -> Option<&'static str>>,
     pub io_size: Option<fn(id: u8) -> usize>,
+    pub io_seek: Option<fn(id: u8, whence: &str, offset: i64) -> Option<usize>>,
     pub io_default_input: Option<u8>,
     pub io_default_output: Option<u8>,
     /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
@@ -973,6 +974,7 @@ impl LuaState {
             io_flush: None,
             io_type: None,
             io_size: None,
+            io_seek: None,
             io_default_input: None,
             io_default_output: None,
             mm_refs: [0; MM_COUNT],
@@ -1390,6 +1392,9 @@ impl LuaState {
     }
     pub fn set_io_size(&mut self, f: Option<fn(id: u8) -> usize>) {
         self.io_size = f;
+    }
+    pub fn set_io_seek(&mut self, f: Option<fn(id: u8, whence: &str, offset: i64) -> Option<usize>>) {
+        self.io_seek = f;
     }
 
     /// Run the `dhcp` builtin: establish network connectivity and enable the

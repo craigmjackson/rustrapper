@@ -3341,6 +3341,8 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                             ("flush", 61),
                             ("read", 66),
                             ("write", 69),
+                            ("seek", 70),
+                            ("setvbuf", 71),
                         ] {
                             let n = s.intern(nm.as_bytes())?;
                             crate::eval::tset(s, Value::Table(tid), Value::Str(n), Value::Native(nid))?;
@@ -3497,7 +3499,7 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                         let tid = crate::eval::new_table(s)?;
                         let id_key = s.intern(b"id")?;
                         crate::eval::tset(s, Value::Table(tid), Value::Str(id_key), Value::Num(id as i64))?;
-                        for (nm, nid) in [("close", 60u8), ("flush", 61), ("read", 66), ("write", 69), ("lines", 63)] {
+                        for (nm, nid) in [("close", 60u8), ("flush", 61), ("read", 66), ("write", 69), ("seek", 70), ("setvbuf", 71), ("lines", 63)] {
                             let n = s.intern(nm.as_bytes())?;
                             crate::eval::tset(s, Value::Table(tid), Value::Str(n), Value::Native(nid))?;
                         }
@@ -3586,6 +3588,50 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 }
             }
             if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+        }
+        Value::Native(70) => {
+            // file:seek([whence [, offset]])
+            let id = match argc {
+                0 => return Err("seek expects a file".into()),
+                _ => match io_handle(s, argbuf[0]) {
+                    Some(i) => i,
+                    None => return Err("seek expects a file".into()),
+                },
+            };
+            let whence = if argc >= 2 {
+                match argbuf[1] {
+                    Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or("cur"),
+                    _ => return Err("seek expects a string whence".into()),
+                }
+            } else {
+                "cur"
+            };
+            // copy whence into a buffer to avoid borrow issues
+            let mut wbuf = [0u8; 8];
+            let wl = whence.len().min(wbuf.len());
+            wbuf[..wl].copy_from_slice(&whence.as_bytes()[..wl]);
+            let whence = core::str::from_utf8(&wbuf[..wl]).unwrap_or("cur");
+            let offset = if argc >= 3 { to_integer_for_format(argbuf[2])? } else { 0 };
+            match s.io_seek {
+                Some(f) => match f(id, whence, offset) {
+                    Some(pos) => ExecResult::Ret(Value::Num(pos as i64)),
+                    None => ExecResult::Ret(Value::Nil),
+                },
+                None => ExecResult::Ret(Value::Nil),
+            }
+        }
+        Value::Native(71) => {
+            // file:setvbuf(mode [, size])
+            let id = match argc {
+                0 => return Err("setvbuf expects a file".into()),
+                _ => match io_handle(s, argbuf[0]) {
+                    Some(i) => i,
+                    None => return Err("setvbuf expects a file".into()),
+                },
+            };
+            // No-op buffering; just return true.
+            let _ = id;
+            ExecResult::Ret(Value::Bool(true))
         }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is

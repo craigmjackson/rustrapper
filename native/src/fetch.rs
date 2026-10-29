@@ -323,6 +323,21 @@ pub fn io_type(id: u8) -> Option<&'static str> {
     files.get(id as usize).map(|f| if f.closed { "closed file" } else { "file" })
 }
 
+pub fn io_seek(id: u8, whence: &str, offset: i64) -> Option<usize> {
+    let mut files = OPEN_FILES.lock().unwrap();
+    let f = files.get_mut(id as usize)?;
+    if f.closed { return None; }
+    let new_pos = match whence {
+        "set" => offset,
+        "cur" => f.pos as i64 + offset,
+        "end" => f.data.len() as i64 + offset,
+        _ => return None,
+    };
+    if new_pos < 0 || new_pos as usize > f.data.len() { return None; }
+    f.pos = new_pos as usize;
+    Some(f.pos + 1) // Lua returns 1-based position
+}
+
 /// Host `io.tmpfile()` is handled by io_open("", "w+").
 
 /// Host `io.lines` advance: read next line from handle id into buf.
