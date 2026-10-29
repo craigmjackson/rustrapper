@@ -2858,7 +2858,7 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             s.tbls[tid as usize].slots[pos - 1].value = val;
             s.tbls[tid as usize].len += 1;
             // re-key subsequent slots
-            for idx in (pos..s.tbls[tid as usize].len as usize) {
+            for idx in pos..s.tbls[tid as usize].len as usize {
                 s.tbls[tid as usize].slots[idx].key = Value::Num((idx + 1) as i64);
             }
             ExecResult::Normal
@@ -3175,6 +3175,306 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 None => ExecResult::Ret(Value::Nil),
             }
         }
+        Value::Native(60) => {
+            // io.close([file])
+            let id = if argc == 0 {
+                s.io_default_output
+            } else {
+                match argbuf[0] {
+                    Value::Num(n) => Some(n as u8),
+                    _ => return Err("io.close expects a file".into()),
+                }
+            };
+            match id {
+                Some(i) => {
+                    let ok = s.io_close.map(|f| f(i)).unwrap_or(false);
+                    if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+                }
+                None => ExecResult::Ret(Value::Bool(true)),
+            }
+        }
+        Value::Native(61) => {
+            // io.flush([file])
+            let id = if argc == 0 { s.io_default_output } else {
+                match argbuf[0] { Value::Num(n) => Some(n as u8), _ => return Err("io.flush expects a file".into()) }
+            };
+            if let Some(i) = id {
+                if let Some(f) = s.io_flush { let _ = f(i); }
+            }
+            ExecResult::Ret(Value::Bool(true))
+        }
+        Value::Native(62) => {
+            // io.input([file])
+            if argc == 0 {
+                match s.io_default_input {
+                    Some(i) => ExecResult::Ret(Value::Num(i as i64)),
+                    None => ExecResult::Ret(Value::Nil),
+                }
+            } else {
+                match argbuf[0] {
+                    Value::Str(r) => {
+                        let name = core::str::from_utf8(s.str_bytes(r)).unwrap_or("");
+                        match s.io_open {
+                            Some(f) => match f(name, "r") {
+                                Some(id) => { s.io_default_input = Some(id); ExecResult::Ret(Value::Num(id as i64)) }
+                                None => ExecResult::Ret(Value::Nil),
+                            },
+                            None => ExecResult::Ret(Value::Nil),
+                        }
+                    }
+                    Value::Num(n) => {
+                        s.io_default_input = Some(n as u8);
+                        ExecResult::Ret(Value::Num(n))
+                    }
+                    _ => return Err("io.input expects a string or file".into()),
+                }
+            }
+        }
+        Value::Native(63) => {
+            // io.lines([filename])
+            let handle = if argc == 0 {
+                s.io_default_input
+            } else {
+                match argbuf[0] {
+                    Value::Str(r) => {
+                        let name = core::str::from_utf8(s.str_bytes(r)).unwrap_or("");
+                        s.io_open.map(|f| f(name, "r")).flatten()
+                    }
+                    Value::Num(n) => Some(n as u8),
+                    _ => return Err("io.lines expects a string or file".into()),
+                }
+            };
+            match handle {
+                Some(id) => ExecResult::Ret(Value::IoLines(id)),
+                None => ExecResult::Ret(Value::Nil),
+            }
+        }
+        Value::Native(64) => {
+            // io.open(filename [, mode])
+            if argc < 1 || argc > 2 {
+                return Err("io.open expects 1 or 2 arguments".into());
+            }
+            let name = match argbuf[0] {
+                Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or(""),
+                _ => return Err("io.open expects a string filename".into()),
+            };
+            let mode = if argc == 2 {
+                match argbuf[1] {
+                    Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or("r"),
+                    _ => return Err("io.open expects a string mode".into()),
+                }
+            } else {
+                "r"
+            };
+            match s.io_open {
+                Some(f) => match f(name, mode) {
+                    Some(id) => ExecResult::Ret(Value::Num(id as i64)),
+                    None => ExecResult::Ret(Value::Nil),
+                },
+                None => ExecResult::Ret(Value::Nil),
+            }
+        }
+        Value::Native(65) => {
+            // io.output([file])
+            if argc == 0 {
+                match s.io_default_output {
+                    Some(i) => ExecResult::Ret(Value::Num(i as i64)),
+                    None => ExecResult::Ret(Value::Nil),
+                }
+            } else {
+                match argbuf[0] {
+                    Value::Str(r) => {
+                        let name = core::str::from_utf8(s.str_bytes(r)).unwrap_or("");
+                        match s.io_open {
+                            Some(f) => match f(name, "w") {
+                                Some(id) => { s.io_default_output = Some(id); ExecResult::Ret(Value::Num(id as i64)) }
+                                None => ExecResult::Ret(Value::Nil),
+                            },
+                            None => ExecResult::Ret(Value::Nil),
+                        }
+                    }
+                    Value::Num(n) => {
+                        s.io_default_output = Some(n as u8);
+                        ExecResult::Ret(Value::Num(n))
+                    }
+                    _ => return Err("io.output expects a string or file".into()),
+                }
+            }
+        }
+        Value::Native(66) => {
+            // io.read([file], ...)
+            // Determine file handle.
+            let file_id = if argc >= 1 {
+                match argbuf[0] {
+                    Value::Num(n) => Some(n as u8),
+                    _ => None, // first arg is a format string, use default input
+                }
+            } else {
+                None
+            };
+            let id = file_id.or(s.io_default_input);
+            // Collect formats as small integer codes to avoid holding borrows.
+            // code: 0 = all (*a), 1 = line (*l), 2 = N bytes (count in counts[]).
+            let mut codes: [u8; 4] = [1, 1, 1, 1];
+            let mut counts: [usize; 4] = [0, 0, 0, 0];
+            let mut nfmt = 0usize;
+            let start = if file_id.is_some() { 1 } else { 0 };
+            if start >= argc as usize {
+                codes[0] = 1;
+                nfmt = 1;
+            } else {
+                for k in start..argc as usize {
+                    if nfmt >= 4 { break; }
+                    match argbuf[k] {
+                        Value::Str(r) => {
+                            let bytes = s.str_bytes(r);
+                            let st = core::str::from_utf8(bytes).unwrap_or("*l");
+                            let code = if st == "*a" || st == "*A" || st == "*all" {
+                                0u8
+                            } else if st == "*l" || st == "*L" || st == "*line" {
+                                1u8
+                            } else {
+                                // number of bytes
+                                let n: usize = st.parse().unwrap_or(0);
+                                if n > 0 {
+                                    counts[nfmt] = n;
+                                    2u8
+                                } else {
+                                    1u8
+                                }
+                            };
+                            codes[nfmt] = code;
+                            nfmt += 1;
+                        }
+                        Value::Num(n) => {
+                            counts[nfmt] = n as usize;
+                            codes[nfmt] = 2;
+                            nfmt += 1;
+                        }
+                        _ => return Err("io.read expects string or number formats".into()),
+                    }
+                }
+                if nfmt == 0 { codes[0] = 1; nfmt = 1; }
+            }
+            // Now read.
+            let mut nres = 0u8;
+            for fi in 0..nfmt {
+                let code = codes[fi];
+                let cnt = counts[fi];
+                let mut buf = [0u8; 4096];
+                let bytes_read = match code {
+                    0 => s.io_read.map(|f| f(id.unwrap_or(0), 0, 0, &mut buf)).flatten(),
+                    1 => s.io_read.map(|f| f(id.unwrap_or(0), 1, 0, &mut buf)).flatten(),
+                    _ => s.io_read.map(|f| f(id.unwrap_or(0), 2, cnt, &mut buf)).flatten(),
+                };
+                match bytes_read {
+                    None => {
+                        s.push_val(Value::Nil)?;
+                        nres += 1;
+                        break;
+                    }
+                    Some(nr) => {
+                        if code == 2 && cnt > 0 {
+                            // numeric byte count: return as string (bytes)
+                            let v = s.intern(&buf[..nr])?;
+                            s.push_val(Value::Str(v))?;
+                        } else {
+                            // *a or *l: return string
+                            let v = s.intern(&buf[..nr])?;
+                            s.push_val(Value::Str(v))?;
+                        }
+                        nres += 1;
+                    }
+                }
+            }
+            if nres == 0 {
+                ExecResult::Ret(Value::Nil)
+            } else if nres == 1 {
+                ExecResult::Ret(s.vstack[s.vsp as usize - 1])
+            } else {
+                ExecResult::RetN(nres)
+            }
+        }
+        Value::Native(67) => {
+            // io.tmpfile()
+            match s.io_open {
+                Some(f) => match f("", "w+") {
+                    Some(id) => ExecResult::Ret(Value::Num(id as i64)),
+                    None => ExecResult::Ret(Value::Nil),
+                },
+                None => ExecResult::Ret(Value::Nil),
+            }
+        }
+        Value::Native(68) => {
+            // io.type(obj)
+            if argc != 1 { return Err("io.type expects 1 argument".into()); }
+            match argbuf[0] {
+                Value::Num(n) => {
+                    match s.io_type {
+                        Some(f) => match f(n as u8) {
+                            Some(t) => {
+                                let r = s.intern(t.as_bytes())?;
+                                ExecResult::Ret(Value::Str(r))
+                            }
+                            None => ExecResult::Ret(Value::Nil),
+                        },
+                        None => ExecResult::Ret(Value::Nil),
+                    }
+                }
+                _ => ExecResult::Ret(Value::Nil),
+            }
+        }
+        Value::Native(69) => {
+            // io.write(...)
+            let id = s.io_default_output;
+            let mut ok = true;
+            for k in 0..argc as usize {
+                let bytes: &[u8] = match argbuf[k] {
+                    Value::Str(r) => s.str_bytes(r),
+                    Value::Num(n) => {
+                        // convert to string
+                        let (buf, l) = itoa(n);
+                        // intern? just emit directly
+                        // We'll handle by pushing to a temp and writing
+                        // Simpler: write the number string directly via io_write if available
+                        // by converting to a buffer.
+                        // Use a static buffer.
+                        let mut tmp = [0u8; 24];
+                        tmp[..l].copy_from_slice(&buf[..l]);
+                        // write directly
+                        if let Some(f) = s.io_write {
+                            if let Some(i) = id { let _ = f(i, &tmp[..l]); }
+                        } else if let Some(_i) = id {
+                            for b in &tmp[..l] { (s.putc)(*b); }
+                        }
+                        continue;
+                    }
+                    Value::Float(f) => {
+                        let mut fbuf = [0u8; 40];
+                        let fl = fmt_float(f, &mut fbuf);
+                        if let Some(func) = s.io_write {
+                            if let Some(i) = id { let _ = func(i, &fbuf[..fl]); }
+                        } else if let Some(_i) = id {
+                            for b in &fbuf[..fl] { (s.putc)(*b); }
+                        }
+                        continue;
+                    }
+                    _ => return Err("io.write expects string or number".into()),
+                };
+                if let Some(f) = s.io_write {
+                    if let Some(i) = id {
+                        if !f(i, bytes) { ok = false; }
+                    } else {
+                        for b in bytes { (s.putc)(*b); }
+                    }
+                } else if let Some(_i) = id {
+                    for b in bytes { (s.putc)(*b); }
+                } else {
+                    for b in bytes { (s.putc)(*b); }
+                }
+            }
+            if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
@@ -3352,8 +3652,6 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             ExecResult::Ret(Value::Num(n))
         }
         Value::Gmatch(id) => {
-            // Calling a gmatch iterator advances it and yields the next
-            // captures (or the whole match), or nil once exhausted.
             if argc != 0 {
                 return Err("gmatch iterator expects no arguments".into());
             }
@@ -3362,6 +3660,24 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 ExecResult::Ret(Value::Nil)
             } else {
                 ExecResult::RetN(n)
+            }
+        }
+        Value::IoLines(id) => {
+            if argc != 0 {
+                return Err("io.lines iterator expects no arguments".into());
+            }
+            let mut buf = [0u8; 4096];
+            let nr = match s.io_read {
+                Some(f) => f(id, 1, 0, &mut buf),
+                None => None,
+            };
+            match nr {
+                None => ExecResult::Ret(Value::Nil),
+                Some(0) => ExecResult::Ret(Value::Nil),
+                Some(n) => {
+                    let v = s.intern(&buf[..n])?;
+                    ExecResult::Ret(Value::Str(v))
+                }
             }
         }
         Value::Co(_) => return Err("attempt to call a thread value".into()),
@@ -3673,6 +3989,7 @@ pub(crate) fn val_eq(a: Value, b: Value) -> bool {
         (Value::Co(x), Value::Co(y)) => x == y,
         (Value::Wrapped(x), Value::Wrapped(y)) => x == y,
         (Value::Gmatch(x), Value::Gmatch(y)) => x == y,
+        (Value::IoLines(x), Value::IoLines(y)) => x == y,
         (Value::Closure(x), Value::Closure(y)) => x == y,
         // Unit builtins compare equal to themselves.
         (Value::Shell, Value::Shell)
@@ -3853,7 +4170,8 @@ fn type_name(v: Value) -> &'static [u8] {
         | Value::Exit
         | Value::Ls
         | Value::Wrapped(_)
-        | Value::Gmatch(_) => b"function",
+        | Value::Gmatch(_)
+        | Value::IoLines(_) => b"function",
         Value::Co(_) => b"thread",
     }
 }
@@ -3957,6 +4275,7 @@ fn value_to_string(s: &mut LuaState, v: Value) -> Result<super::StrRef, LuaError
         Value::Co(_) => Ok(s.intern(b"thread")?),
         Value::Wrapped(_) => Ok(s.intern(b"function")?),
         Value::Gmatch(_) => Ok(s.intern(b"function")?),
+        Value::IoLines(_) => Ok(s.intern(b"function")?),
     }
 }
 
@@ -4008,6 +4327,7 @@ pub(crate) fn tostring(s: &mut LuaState, v: Value) -> Result<(), LuaError> {
         Value::Co(_) => emit_str(s, b"thread"),
         Value::Wrapped(_) => emit_str(s, b"function"),
         Value::Gmatch(_) => emit_str(s, b"function"),
+        Value::IoLines(_) => emit_str(s, b"function"),
     }
     Ok(())
 }
@@ -4308,7 +4628,7 @@ fn default_less(s: &LuaState, a: Value, b: Value) -> bool {
             Value::Num(_) | Value::Float(_) => 2,
             Value::Str(_) => 3,
             Value::Table(_) => 4,
-            Value::Func(_) | Value::Closure(_) | Value::Native(_) | Value::Wrapped(_) | Value::Gmatch(_) | Value::Shell | Value::Dhcp | Value::Exit | Value::Ls => 5,
+            Value::Func(_) | Value::Closure(_) | Value::Native(_) | Value::Wrapped(_) | Value::Gmatch(_) | Value::IoLines(_) | Value::Shell | Value::Dhcp | Value::Exit | Value::Ls => 5,
             Value::Co(_) => 6,
         }
     }

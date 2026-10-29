@@ -32,6 +32,7 @@ fn run_script(path: &str) -> ! {
     state.set_dhcp(Some(net::dhcp_fn));
     state.set_dhcp_info(Some(fetch::dhcp_info));
     state.set_dhcp_values(Some(fetch::dhcp_values));
+    fetch::set_io_callbacks(&mut state);
     match state.run_with_fetch_load(&src, term::raw_putc, fetch::fetch_file, fetch::load_file) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -57,6 +58,7 @@ fn run_repl() -> ! {
     state.set_load(Some(fetch::load_file));
     state.set_dhcp_info(Some(fetch::dhcp_info));
     state.set_dhcp_values(Some(fetch::dhcp_values));
+    fetch::set_io_callbacks(&mut state);
     lua::repl::repl_loop(&mut state, term::get_key, print::putc, print::puts);
     term::shutdown(0)
 }

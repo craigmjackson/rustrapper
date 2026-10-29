@@ -303,6 +303,9 @@ pub enum Value {
     /// A `string.gmatch` iterator (index into [`LuaState::gmatches`]);
     /// callable, and `type()` is "function".
     Gmatch(u8),
+    /// An `io.lines` iterator (wraps a file handle id); callable, and
+    /// `type()` is "function".
+    IoLines(u8),
     /// A closure (function plus captured upvalue cells), index into
     /// [`LuaState::closures`].
     Closure(u16),
@@ -805,6 +808,17 @@ pub struct LuaState {
     pub ngmatch: u8,
     /// RNG state for `math.random` / `math.randomseed`.
     pub rng_state: u64,
+    /// Host callbacks for the `io` library.
+    pub io_open: Option<fn(name: &str, mode: &str) -> Option<u8>>,
+    pub io_close: Option<fn(id: u8) -> bool>,
+    /// Read into `buf`, return bytes read (0 = EOF). `fmt`: 0=all, 1=line,
+    /// 2=number (not implemented), n=up to n bytes.
+    pub io_read: Option<fn(id: u8, fmt: u8, n: usize, buf: &mut [u8]) -> Option<usize>>,
+    pub io_write: Option<fn(id: u8, data: &[u8]) -> bool>,
+    pub io_flush: Option<fn(id: u8) -> bool>,
+    pub io_type: Option<fn(id: u8) -> Option<&'static str>>,
+    pub io_default_input: Option<u8>,
+    pub io_default_output: Option<u8>,
     /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
     pub mm_refs: [StrRef; MM_COUNT],
     pub mm_ready: bool,
@@ -951,6 +965,14 @@ impl LuaState {
             gmatches: [GmatchState::empty(); MAX_GMATCH],
             ngmatch: 0,
             rng_state: 0x123456789ABCDEF0,
+            io_open: None,
+            io_close: None,
+            io_read: None,
+            io_write: None,
+            io_flush: None,
+            io_type: None,
+            io_default_input: None,
+            io_default_output: None,
             mm_refs: [0; MM_COUNT],
             mm_ready: false,
             mm_depth: 0,
@@ -1211,6 +1233,26 @@ impl LuaState {
         let n = self.intern(b"mininteger").unwrap();
         crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Num(i64::MIN)).unwrap();
         self.set_global(math_name, Value::Table(tid));
+
+        // The `io` library.
+        let io_name = self.intern(b"io").unwrap();
+        let tid = crate::eval::new_table(self).unwrap();
+        for (nm, id) in [
+            ("close", 60u8),
+            ("flush", 61),
+            ("input", 62),
+            ("lines", 63),
+            ("open", 64),
+            ("output", 65),
+            ("read", 66),
+            ("tmpfile", 67),
+            ("type", 68),
+            ("write", 69),
+        ] {
+            let n = self.intern(nm.as_bytes()).unwrap();
+            crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
+        }
+        self.set_global(io_name, Value::Table(tid));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1326,6 +1368,25 @@ impl LuaState {
         self.load = load;
     }
 
+    pub fn set_io_open(&mut self, f: Option<fn(name: &str, mode: &str) -> Option<u8>>) {
+        self.io_open = f;
+    }
+    pub fn set_io_close(&mut self, f: Option<fn(id: u8) -> bool>) {
+        self.io_close = f;
+    }
+    pub fn set_io_read(&mut self, f: Option<fn(id: u8, fmt: u8, n: usize, buf: &mut [u8]) -> Option<usize>>) {
+        self.io_read = f;
+    }
+    pub fn set_io_write(&mut self, f: Option<fn(id: u8, data: &[u8]) -> bool>) {
+        self.io_write = f;
+    }
+    pub fn set_io_flush(&mut self, f: Option<fn(id: u8) -> bool>) {
+        self.io_flush = f;
+    }
+    pub fn set_io_type(&mut self, f: Option<fn(id: u8) -> Option<&'static str>>) {
+        self.io_type = f;
+    }
+
     /// Run the `dhcp` builtin: establish network connectivity and enable the
     /// `fetch` callback. Returns `true` on success, `false` if the network
     /// setup failed, or an error if no host callback is registered.
@@ -1414,6 +1475,8 @@ impl LuaState {
         self.nclosures = 0;
         self.ngmatch = 0;
         self.rng_state = 0x123456789ABCDEF0;
+        self.io_default_input = None;
+        self.io_default_output = None;
         for c in self.cos.iter_mut() {
             c.status = CO_DEAD;
         }
@@ -3534,6 +3597,18 @@ mod tests {
         // Errors.
         assert!(exec("print(table.concat())").is_err());
         assert!(exec("print(table.insert())").is_err());
+    }
+
+    #[test]
+    fn io_lib() {
+        assert_eq!(exec("io.write(\"hi\")\n").unwrap(), "hi");
+        assert_eq!(exec("io.write(\"a\", \"b\")\n").unwrap(), "ab");
+        assert_eq!(exec("print(io.type(123))").unwrap(), "nil\n");
+        assert_eq!(exec("print(io.flush())").unwrap(), "true\n");
+        assert_eq!(exec("print(io.open(\"x.txt\", \"r\"))").unwrap(), "nil\n");
+        assert_eq!(exec("print(io.tmpfile())").unwrap(), "nil\n");
+        // io.read with no input returns nil (not an error).
+        assert_eq!(exec("print(io.read())").unwrap(), "nil\n");
     }
 
     #[test]

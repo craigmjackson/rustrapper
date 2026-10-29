@@ -228,6 +228,7 @@ fn pxe_boot(base: u64, mac: &[u8; 6], cfg: &DhcpConfig) {
                     core::slice::from_raw_parts(sink.buffer_addr() as *const u8, size)
                 };
                 let mut state = lua::LuaState::new();
+                crate::fetch::set_io_callbacks(&mut state);
                 match state.run_with_fetch_load(
                     data,
                     putc,

@@ -1280,6 +1280,11 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
                         s.frames[f].ctrl[1] = Value::Nil;
                         s.frames[f].ctrl[2] = Value::Nil;
                     }
+                    (Value::IoLines(id), _) => {
+                        s.frames[f].ctrl[0] = Value::IoLines(id);
+                        s.frames[f].ctrl[1] = Value::Nil;
+                        s.frames[f].ctrl[2] = Value::Nil;
+                    }
                     (Value::Table(i), _) | (Value::Native(3), Value::Table(i)) => {
                         s.frames[f].ctrl[0] = Value::Num(i as i64);
                         s.frames[f].ctrl[1] = Value::Num(0);
@@ -1295,8 +1300,6 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
             InstrOp::ForInNext => {
                 let f = (s.fsp - 1) as usize;
                 if let Value::Gmatch(id) = s.frames[f].ctrl[0] {
-                    // A gmatch iterator: advance it, keeping up to two results
-                    // (a nil-padded second result for a single capture).
                     let n = crate::eval::gmatch_advance(s, id)?;
                     if n == 0 {
                         ip = ins.a;
@@ -1305,6 +1308,19 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
                         let keep = (n as usize).min(2);
                         s.vsp = (base + keep) as u32;
                         for _ in keep..2 {
+                            s.push_val(Value::Nil)?;
+                        }
+                    }
+                } else if let Value::IoLines(id) = s.frames[f].ctrl[0] {
+                    let mut buf = [0u8; 4096];
+                    let nr = s.io_read.and_then(|f| f(id, 1, 0, &mut buf));
+                    match nr {
+                        None | Some(0) => {
+                            ip = ins.a;
+                        }
+                        Some(n) => {
+                            let v = s.intern(&buf[..n])?;
+                            s.push_val(Value::Str(v))?;
                             s.push_val(Value::Nil)?;
                         }
                     }
@@ -1330,7 +1346,7 @@ pub fn run_at(s: &mut LuaState, entry: u16, floor: usize) -> Result<ExecResult, 
             }
             InstrOp::ForInAdvance => {
                 let f = (s.fsp - 1) as usize;
-                if matches!(s.frames[f].ctrl[0], Value::Gmatch(_)) {
+                if matches!(s.frames[f].ctrl[0], Value::Gmatch(_) | Value::IoLines(_)) {
                     ip = ins.a;
                 } else {
                     let tid = match s.frames[f].ctrl[0] {

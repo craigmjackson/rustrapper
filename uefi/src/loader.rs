@@ -92,6 +92,7 @@ pub fn execute_pxe_file(
         puts("Executing Lua script\n");
         let data = unsafe { core::slice::from_raw_parts(buffer, size) };
         let mut state = lua::LuaState::new();
+        crate::fetch::set_io_callbacks(&mut state);
         match state.run_with_fetch_load(
             data,
             crate::u16_putc,

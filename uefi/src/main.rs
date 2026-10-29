@@ -212,6 +212,7 @@ fn boot_loop(image_handle: EFI_HANDLE, system_table: &'static EFI_SYSTEM_TABLE) 
                 state.set_load(Some(crate::fetch::load_file));
                 state.set_dhcp_info(Some(crate::fetch::dhcp_info));
                 state.set_dhcp_values(Some(crate::fetch::dhcp_values));
+                crate::fetch::set_io_callbacks(&mut state);
                 lua::repl::repl_loop(&mut state, get_key, u16_putc, u16_puts);
             }
         }

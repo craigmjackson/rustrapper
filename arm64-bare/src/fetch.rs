@@ -227,3 +227,104 @@ pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
     let mut sink = LoadSink { buf, offset: 0 };
     crate::net::tftp_download(base, &mac, &src_ip, &server_ip, name, &mut sink)
 }
+
+// ── io library support (read-only pseudo-filesystem) ────────────────────────
+static mut IO_OPEN: [bool; MAX_FETCH_FILES] = [false; MAX_FETCH_FILES];
+static mut IO_POS: [usize; MAX_FETCH_FILES] = [0; MAX_FETCH_FILES];
+static mut IO_CLOSED: [bool; MAX_FETCH_FILES] = [false; MAX_FETCH_FILES];
+
+fn find_fetched_slot(name: &str) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_FETCH_FILES {
+            if FETCH_FILES[i].used {
+                let nlen = FETCH_FILES[i].name.iter().position(|&b| b == 0).unwrap_or(64);
+                if &FETCH_FILES[i].name[..nlen] == name.as_bytes() {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn io_open(name: &str, mode: &str) -> Option<u8> {
+    if !mode.contains('r') { return None; }
+    let slot = find_fetched_slot(name)?;
+    unsafe {
+        IO_POS[slot] = 0;
+        IO_CLOSED[slot] = false;
+        IO_OPEN[slot] = true;
+    }
+    Some(slot as u8)
+}
+
+pub fn io_close(id: u8) -> bool {
+    let i = id as usize;
+    if i >= MAX_FETCH_FILES { return false; }
+    unsafe {
+        if !IO_OPEN[i] { return false; }
+        IO_CLOSED[i] = true;
+        IO_OPEN[i] = false;
+        true
+    }
+}
+
+pub fn io_read(id: u8, fmt: u8, n: usize, buf: &mut [u8]) -> Option<usize> {
+    let i = id as usize;
+    if i >= MAX_FETCH_FILES { return None; }
+    unsafe {
+        if !IO_OPEN[i] || IO_CLOSED[i] { return None; }
+        let base = FETCH_FILES[i].base;
+        let len = FETCH_FILES[i].len;
+        let pos = IO_POS[i];
+        if pos >= len { return None; }
+        match fmt {
+            0 => {
+                let nr = (len - pos).min(buf.len());
+                if nr == 0 { return None; }
+                core::ptr::copy_nonoverlapping(base.add(pos), buf.as_mut_ptr(), nr);
+                IO_POS[i] = pos + nr;
+                Some(nr)
+            }
+            1 => {
+                let mut end = pos;
+                while end < len && *base.add(end) != b'\n' { end += 1; }
+                let nr = (end - pos).min(buf.len());
+                if nr == 0 && pos >= len { return None; }
+                if nr > 0 {
+                    core::ptr::copy_nonoverlapping(base.add(pos), buf.as_mut_ptr(), nr);
+                }
+                IO_POS[i] = if end < len { end + 1 } else { end };
+                if nr == 0 { None } else { Some(nr) }
+            }
+            _ => {
+                let want = if n == 0 { buf.len() } else { n };
+                let nr = (len - pos).min(want).min(buf.len());
+                if nr == 0 { return None; }
+                core::ptr::copy_nonoverlapping(base.add(pos), buf.as_mut_ptr(), nr);
+                IO_POS[i] = pos + nr;
+                Some(nr)
+            }
+        }
+    }
+}
+
+pub fn io_write(_id: u8, _data: &[u8]) -> bool { false }
+pub fn io_flush(_id: u8) -> bool { true }
+pub fn io_type(id: u8) -> Option<&'static str> {
+    let i = id as usize;
+    if i >= MAX_FETCH_FILES { return None; }
+    unsafe {
+        if !IO_OPEN[i] { return None; }
+        if IO_CLOSED[i] { Some("closed file") } else { Some("file") }
+    }
+}
+
+pub fn set_io_callbacks(state: &mut lua::LuaState) {
+    state.set_io_open(Some(io_open));
+    state.set_io_close(Some(io_close));
+    state.set_io_read(Some(io_read));
+    state.set_io_write(Some(io_write));
+    state.set_io_flush(Some(io_flush));
+    state.set_io_type(Some(io_type));
+}

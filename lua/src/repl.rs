@@ -1174,6 +1174,79 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: math.type(3) -> integer\n",
     },
     HelpEntry {
+        name: "io.close",
+        short: "Close a file",
+        detail: "io.close([file])\n\
+                  Closes `file` (or the default output file). Returns true.\n\
+                  Example: io.close(f) -> true\n",
+    },
+    HelpEntry {
+        name: "io.flush",
+        short: "Flush a file",
+        detail: "io.flush([file])\n\
+                  Flushes buffered output for `file` (or the default output).\n\
+                  Example: io.flush() -> true\n",
+    },
+    HelpEntry {
+        name: "io.input",
+        short: "Set/get the default input file",
+        detail: "io.input([file])\n\
+                  Sets (or returns) the default input file handle.\n\
+                  Example: io.input(f)\n",
+    },
+    HelpEntry {
+        name: "io.lines",
+        short: "Iterate over lines of a file",
+        detail: "io.lines([filename])\n\
+                  Returns an iterator over the lines of `filename` (or the\n\
+                  default input). Each call yields one line.\n\
+                  Example: for l in io.lines(\"f.txt\") do print(l) end\n",
+    },
+    HelpEntry {
+        name: "io.open",
+        short: "Open a file",
+        detail: "io.open(filename [, mode])\n\
+                  Opens `filename` in `mode` (\"r\",\"w\",\"a\",...\") and returns\n\
+                  a file handle, or nil on failure. Operates on the pseudo-fs.\n\
+                  Example: io.open(\"x.txt\", \"r\")\n",
+    },
+    HelpEntry {
+        name: "io.output",
+        short: "Set/get the default output file",
+        detail: "io.output([file])\n\
+                  Sets (or returns) the default output file handle.\n\
+                  Example: io.output(f)\n",
+    },
+    HelpEntry {
+        name: "io.read",
+        short: "Read from a file",
+        detail: "io.read([file], ...)\n\
+                  Reads from `file` (or the default input) using the given\n\
+                  formats (*a, *l, *n, or a byte count).\n\
+                  Example: io.read(\"*a\")\n",
+    },
+    HelpEntry {
+        name: "io.tmpfile",
+        short: "Create a temporary file",
+        detail: "io.tmpfile()\n\
+                  Creates a temporary in-memory file and returns a handle.\n\
+                  Example: local f = io.tmpfile()\n",
+    },
+    HelpEntry {
+        name: "io.type",
+        short: "Type of a file handle",
+        detail: "io.type(obj)\n\
+                  Returns \"file\", \"closed file\", or nil.\n\
+                  Example: io.type(f) -> file\n",
+    },
+    HelpEntry {
+        name: "io.write",
+        short: "Write to a file",
+        detail: "io.write(...)\n\
+                  Writes the string/number arguments to the default output.\n\
+                  Example: io.write(\"hi\")\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1658,6 +1731,8 @@ mod tests {
             "table.remove", "table.sort", "table.unpack",
             "math.ceil", "math.floor", "math.maxinteger", "math.mininteger", "math.random",
             "math.randomseed", "math.tointeger", "math.type",
+            "io.close", "io.flush", "io.input", "io.lines", "io.open", "io.output",
+            "io.read", "io.tmpfile", "io.type", "io.write",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

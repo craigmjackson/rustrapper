@@ -127,6 +127,139 @@ pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
     Some(data.len())
 }
 
+/// An open file handle in the pseudo-filesystem.
+struct OpenFile {
+    name: String,
+    data: Vec<u8>,
+    pos: usize,
+    closed: bool,
+    writable: bool,
+}
+
+static OPEN_FILES: Mutex<Vec<OpenFile>> = Mutex::new(Vec::new());
+
+/// Host `io.open()` callback.
+pub fn io_open(name: &str, mode: &str) -> Option<u8> {
+    let mut files = OPEN_FILES.lock().unwrap();
+    let writable = mode.contains('w') || mode.contains('a') || mode.contains('+');
+    let data = if mode.contains('r') && !mode.contains('+') {
+        // read-only: find in fetched files
+        let fl = FILES.lock().unwrap();
+        fl.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone())?
+    } else {
+        Vec::new()
+    };
+    // append mode
+    let data = if mode.contains('a') {
+        let fl = FILES.lock().unwrap();
+        fl.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone()).unwrap_or(data)
+    } else {
+        data
+    };
+    let id = files.len() as u8;
+    if id == u8::MAX { return None; }
+    files.push(OpenFile {
+        name: name.to_string(),
+        data,
+        pos: 0,
+        closed: false,
+        writable,
+    });
+    Some(id)
+}
+
+/// Host `io.close()` callback.
+pub fn io_close(id: u8) -> bool {
+    let mut files = OPEN_FILES.lock().unwrap();
+    if let Some(f) = files.get_mut(id as usize) {
+        f.closed = true;
+        true
+    } else {
+        false
+    }
+}
+
+/// Host `io.read()` callback. fmt: 0=all, 1=line, 2=N bytes.
+pub fn io_read(id: u8, fmt: u8, n: usize, buf: &mut [u8]) -> Option<usize> {
+    let mut files = OPEN_FILES.lock().unwrap();
+    let f = files.get_mut(id as usize)?;
+    if f.closed { return None; }
+    match fmt {
+        0 => {
+            // read all remaining
+            let remaining = &f.data[f.pos..];
+            let nr = remaining.len().min(buf.len());
+            if nr == 0 { return None; } // EOF
+            buf[..nr].copy_from_slice(&remaining[..nr]);
+            f.pos += nr;
+            Some(nr)
+        }
+        1 => {
+            // read one line (up to \n, not including \n)
+            if f.pos >= f.data.len() { return None; } // EOF
+            let start = f.pos;
+            let mut end = start;
+            while end < f.data.len() && f.data[end] != b'\n' {
+                end += 1;
+            }
+            let nr = (end - start).min(buf.len());
+            buf[..nr].copy_from_slice(&f.data[start..start + nr]);
+            f.pos = if end < f.data.len() { end + 1 } else { end };
+            if nr == 0 && start == f.data.len() { return None; }
+            Some(nr)
+        }
+        _ => {
+            // read up to n bytes
+            let n = if n == 0 { buf.len() } else { n };
+            let remaining = &f.data[f.pos..];
+            let nr = remaining.len().min(n).min(buf.len());
+            if nr == 0 { return None; }
+            buf[..nr].copy_from_slice(&remaining[..nr]);
+            f.pos += nr;
+            Some(nr)
+        }
+    }
+}
+
+/// Host `io.write()` callback.
+pub fn io_write(id: u8, data: &[u8]) -> bool {
+    let mut files = OPEN_FILES.lock().unwrap();
+    if let Some(f) = files.get_mut(id as usize) {
+        if f.closed || !f.writable { return false; }
+        f.data.extend_from_slice(data);
+        true
+    } else {
+        false
+    }
+}
+
+/// Host `io.flush()` callback.
+pub fn io_flush(id: u8) -> bool {
+    let files = OPEN_FILES.lock().unwrap();
+    files.get(id as usize).map(|f| !f.closed).unwrap_or(false)
+}
+
+/// Host `io.type()` callback.
+pub fn io_type(id: u8) -> Option<&'static str> {
+    let files = OPEN_FILES.lock().unwrap();
+    files.get(id as usize).map(|f| if f.closed { "closed file" } else { "file" })
+}
+
+/// Host `io.tmpfile()` is handled by io_open("", "w+").
+
+/// Host `io.lines` advance: read next line from handle id into buf.
+/// (io.lines iterator calls io_read with fmt=1.)
+
+/// Wire up io callbacks (called from cli/main after creating state).
+pub fn set_io_callbacks(state: &mut lua::LuaState) {
+    state.set_io_open(Some(io_open));
+    state.set_io_close(Some(io_close));
+    state.set_io_read(Some(io_read));
+    state.set_io_write(Some(io_write));
+    state.set_io_flush(Some(io_flush));
+    state.set_io_type(Some(io_type));
+}
+
 /// Host `dofile()` callback: download `name` from the TFTP server into the
 /// interpreter's buffer and return its length (or `None` on failure).
 pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
