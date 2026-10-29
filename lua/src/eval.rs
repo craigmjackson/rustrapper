@@ -2709,6 +2709,352 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
                 ExecResult::RetN(nres)
             }
         }
+        Value::Native(44) => {
+            // table.concat(list [, sep [, i [, j]]])
+            if argc < 1 || argc > 4 {
+                return Err("table.concat expects 1 to 4 arguments".into());
+            }
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("table.concat expects a table".into()),
+            };
+            let len = s.tbls[tid as usize].len as usize;
+            let sep: &[u8] = if argc >= 2 {
+                match argbuf[1] {
+                    Value::Str(r) => s.str_bytes(r),
+                    _ => return Err("table.concat expects a string separator".into()),
+                }
+            } else {
+                b""
+            };
+            let mut i = if argc >= 3 { to_integer_for_format(argbuf[2])? } else { 1 };
+            let mut j = if argc >= 4 { to_integer_for_format(argbuf[3])? } else { len as i64 };
+            if i < 1 { i = 1; }
+            if j > len as i64 { j = len as i64; }
+            if i > j {
+                let r = s.intern(b"")?;
+                return Ok(ExecResult::Ret(Value::Str(r)));
+            }
+            // Build result.
+            let mut out = [0u8; 4096];
+            let mut out_len = 0usize;
+            for k in (i as usize)..=(j as usize) {
+                // get list[k]
+                let key = Value::Num(k as i64);
+                let v = raw_get(s, tid, key);
+                let bytes = match v {
+                    Value::Str(r) => {
+                        let _ = r;
+                        &[] as &[u8] // placeholder, unused
+                    }
+                    Value::Num(n) => {
+                        // convert to string via itoa
+                        let (buf, l) = itoa(n);
+                        // copy into a temp
+                        let mut tmp = [0u8; 24];
+                        tmp[..l].copy_from_slice(&buf[..l]);
+                        // We'll handle below by pushing to a small buffer.
+                        // Use a sentinel: store in a static? Instead, handle inline.
+                        // Simpler: convert number to string and append.
+                        // We'll just append directly here.
+                        if k > i as usize && !sep.is_empty() {
+                            if out_len + sep.len() > out.len() { return Err("result too long".into()); }
+                            out[out_len..out_len+sep.len()].copy_from_slice(sep);
+                            out_len += sep.len();
+                        }
+                        let (b2, l2) = itoa(n);
+                        if out_len + l2 > out.len() { return Err("result too long".into()); }
+                        out[out_len..out_len+l2].copy_from_slice(&b2[..l2]);
+                        out_len += l2;
+                        continue;
+                    }
+                    Value::Float(f) => {
+                        if k > i as usize && !sep.is_empty() {
+                            if out_len + sep.len() > out.len() { return Err("result too long".into()); }
+                            out[out_len..out_len+sep.len()].copy_from_slice(sep);
+                            out_len += sep.len();
+                        }
+                        let mut fbuf = [0u8; 40];
+                        let fl = fmt_float(f, &mut fbuf);
+                        if out_len + fl > out.len() { return Err("result too long".into()); }
+                        out[out_len..out_len+fl].copy_from_slice(&fbuf[..fl]);
+                        out_len += fl;
+                        continue;
+                    }
+                    _ => return Err("invalid value in table for concat".into()),
+                };
+                // bytes is &[u8] for Str case; handle below
+                let _ = bytes;
+                if k > i as usize && !sep.is_empty() {
+                    if out_len + sep.len() > out.len() { return Err("result too long".into()); }
+                    out[out_len..out_len+sep.len()].copy_from_slice(sep);
+                    out_len += sep.len();
+                }
+                // bytes placeholder not used; re-get
+                let v2 = raw_get(s, tid, Value::Num(k as i64));
+                if let Value::Str(r) = v2 {
+                    let b = s.str_bytes(r);
+                    if out_len + b.len() > out.len() { return Err("result too long".into()); }
+                    out[out_len..out_len+b.len()].copy_from_slice(b);
+                    out_len += b.len();
+                }
+            }
+            let r = s.intern(&out[..out_len])?;
+            ExecResult::Ret(Value::Str(r))
+        }
+        Value::Native(45) => {
+            // table.create(n [, m])
+            if argc < 1 || argc > 2 {
+                return Err("table.create expects 1 or 2 arguments".into());
+            }
+            let _ = to_integer_for_format(argbuf[0])?;
+            let tid = new_table(s)?;
+            ExecResult::Ret(Value::Table(tid))
+        }
+        Value::Native(46) => {
+            // table.insert(list, [pos,] value)
+            if argc < 2 || argc > 3 {
+                return Err("table.insert expects 2 or 3 arguments".into());
+            }
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("table.insert expects a table".into()),
+            };
+            let (pos, val) = if argc == 2 {
+                (s.tbls[tid as usize].len as i64 + 1, argbuf[1])
+            } else {
+                (to_integer_for_format(argbuf[1])?, argbuf[2])
+            };
+            let len = s.tbls[tid as usize].len as usize;
+            if pos < 1 || pos as usize > len + 1 {
+                return Err("wrong position for insert".into());
+            }
+            if len >= super::TABLE_SLOTS {
+                return Err("table full".into());
+            }
+            let pos = pos as usize;
+            // shift slots right by one:
+            for idx in (pos - 1..len).rev() {
+                s.tbls[tid as usize].slots[idx + 1] = s.tbls[tid as usize].slots[idx];
+            }
+            s.tbls[tid as usize].slots[pos - 1].key = Value::Num(pos as i64);
+            s.tbls[tid as usize].slots[pos - 1].value = val;
+            s.tbls[tid as usize].len += 1;
+            // re-key subsequent slots
+            for idx in (pos..s.tbls[tid as usize].len as usize) {
+                s.tbls[tid as usize].slots[idx].key = Value::Num((idx + 1) as i64);
+            }
+            ExecResult::Normal
+        }
+        Value::Native(47) => {
+            // table.move(a1, f, e, t [, a2])
+            if argc < 4 || argc > 5 {
+                return Err("table.move expects 4 or 5 arguments".into());
+            }
+            let a1 = match argbuf[0] { Value::Table(i) => i, _ => return Err("table expected".into()) };
+            let f = to_integer_for_format(argbuf[1])? as usize;
+            let e = to_integer_for_format(argbuf[2])? as usize;
+            let t = to_integer_for_format(argbuf[3])? as usize;
+            let a2 = if argc == 5 {
+                match argbuf[4] { Value::Table(i) => i, _ => return Err("table expected".into()) }
+            } else { a1 };
+            if f > e {
+                // nothing to move
+                if a1 == a2 {
+                    return Ok(ExecResult::Ret(Value::Table(a2)));
+                }
+                return Ok(ExecResult::Ret(Value::Table(a2)));
+            }
+            let n = e - f + 1;
+            // determine direction
+            if a1 == a2 && t > f {
+                // move backwards
+                for k in (0..n).rev() {
+                    let src_idx = f + k - 1;
+                    let dst_idx = t + k - 1;
+                    let v = if src_idx < s.tbls[a1 as usize].len as usize {
+                        s.tbls[a1 as usize].slots[src_idx].value
+                    } else {
+                        Value::Nil
+                    };
+                    let key = s.tbls[a1 as usize].slots[src_idx].key;
+                    if dst_idx >= s.tbls[a2 as usize].len as usize {
+                        // extend? tables fixed; just set if within slots
+                        if dst_idx < super::TABLE_SLOTS {
+                            s.tbls[a2 as usize].slots[dst_idx].key = Value::Num((dst_idx + 1) as i64);
+                            s.tbls[a2 as usize].slots[dst_idx].value = v;
+                            if dst_idx + 1 > s.tbls[a2 as usize].len as usize {
+                                s.tbls[a2 as usize].len = (dst_idx + 1) as u8;
+                            }
+                        }
+                    } else {
+                        s.tbls[a2 as usize].slots[dst_idx].value = v;
+                    }
+                    let _ = key;
+                }
+            } else {
+                for k in 0..n {
+                    let src_idx = f + k - 1;
+                    let dst_idx = t + k - 1;
+                    let v = if src_idx < s.tbls[a1 as usize].len as usize {
+                        s.tbls[a1 as usize].slots[src_idx].value
+                    } else {
+                        Value::Nil
+                    };
+                    if dst_idx >= s.tbls[a2 as usize].len as usize {
+                        if dst_idx < super::TABLE_SLOTS {
+                            s.tbls[a2 as usize].slots[dst_idx].key = Value::Num((dst_idx + 1) as i64);
+                            s.tbls[a2 as usize].slots[dst_idx].value = v;
+                            if dst_idx + 1 > s.tbls[a2 as usize].len as usize {
+                                s.tbls[a2 as usize].len = (dst_idx + 1) as u8;
+                            }
+                        }
+                    } else {
+                        s.tbls[a2 as usize].slots[dst_idx].value = v;
+                    }
+                }
+            }
+            ExecResult::Ret(Value::Table(a2))
+        }
+        Value::Native(48) => {
+            // table.pack(...)
+            // argc is the number of values. Create table with 1..argc and n.
+            if argc as usize + 1 > super::TABLE_SLOTS {
+                return Err("too many arguments".into());
+            }
+            let tid = new_table(s)?;
+            for k in 0..argc as usize {
+                let v = argbuf[k];
+                s.tbls[tid as usize].slots[k].key = Value::Num((k + 1) as i64);
+                s.tbls[tid as usize].slots[k].value = v;
+            }
+            s.tbls[tid as usize].len = argc;
+            // set n
+            let nkey = s.intern(b"n")?;
+            // append n field
+            let len = s.tbls[tid as usize].len as usize;
+            if len < super::TABLE_SLOTS {
+                s.tbls[tid as usize].slots[len].key = Value::Str(nkey);
+                s.tbls[tid as usize].slots[len].value = Value::Num(argc as i64);
+                s.tbls[tid as usize].len += 1;
+            }
+            ExecResult::Ret(Value::Table(tid))
+        }
+        Value::Native(49) => {
+            // table.remove(list [, pos])
+            if argc < 1 || argc > 2 {
+                return Err("table.remove expects 1 or 2 arguments".into());
+            }
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("table.remove expects a table".into()),
+            };
+            let len = s.tbls[tid as usize].len as usize;
+            if len == 0 {
+                return Ok(ExecResult::Ret(Value::Nil));
+            }
+            let pos = if argc == 2 {
+                to_integer_for_format(argbuf[1])?
+            } else {
+                len as i64
+            } as usize;
+            if pos < 1 || pos > len {
+                return Err("position out of bounds".into());
+            }
+            let removed = s.tbls[tid as usize].slots[pos - 1].value;
+            // shift
+            for k in pos..len {
+                s.tbls[tid as usize].slots[k - 1] = s.tbls[tid as usize].slots[k];
+                s.tbls[tid as usize].slots[k - 1].key = Value::Num(k as i64);
+            }
+            s.tbls[tid as usize].len -= 1;
+            // clear last
+            let newlen = s.tbls[tid as usize].len as usize;
+            s.tbls[tid as usize].slots[newlen].key = Value::Nil;
+            s.tbls[tid as usize].slots[newlen].value = Value::Nil;
+            ExecResult::Ret(removed)
+        }
+        Value::Native(50) => {
+            // table.sort(list [, comp])
+            if argc < 1 || argc > 2 {
+                return Err("table.sort expects 1 or 2 arguments".into());
+            }
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("table.sort expects a table".into()),
+            };
+            let comp = if argc == 2 { Some(argbuf[1]) } else { None };
+            let len = s.tbls[tid as usize].len as usize;
+            // insertion sort (stable enough for small tables)
+            for i in 1..len {
+                let val_i = s.tbls[tid as usize].slots[i].value;
+                let mut j = i;
+                while j > 0 {
+                    let val_j = s.tbls[tid as usize].slots[j - 1].value;
+                    let less = if let Some(c) = comp {
+                        let base = s.vsp as usize;
+                        enter_mm(s)?;
+                        s.push_val(val_i)?;
+                        s.push_val(val_j)?;
+                        let r = crate::vm::call_value(s, c, 2);
+                        leave_mm(s);
+                        let r = r?;
+                        let res = match r {
+                            ExecResult::Ret(v) => v,
+                            ExecResult::Ret2(a, _) => a,
+                            ExecResult::RetN(n) if n > 0 => {
+                                let v = s.vstack[base];
+                                v
+                            }
+                            _ => Value::Nil,
+                        };
+                        // reset vsp
+                        s.vsp = base as u32;
+                        truthy(res)
+                    } else {
+                        default_less(s, val_i, val_j)
+                    };
+                    if less {
+                        s.tbls[tid as usize].slots[j].value = s.tbls[tid as usize].slots[j - 1].value;
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                s.tbls[tid as usize].slots[j].value = val_i;
+            }
+            // Re-key the array part so keys stay 1..len.
+            for k in 0..len {
+                s.tbls[tid as usize].slots[k].key = Value::Num((k + 1) as i64);
+            }
+            ExecResult::Normal
+        }
+        Value::Native(51) => {
+            // table.unpack(list [, i [, j]])
+            if argc < 1 || argc > 3 {
+                return Err("table.unpack expects 1 to 3 arguments".into());
+            }
+            let tid = match argbuf[0] {
+                Value::Table(i) => i,
+                _ => return Err("table.unpack expects a table".into()),
+            };
+            let len = s.tbls[tid as usize].len as usize;
+            let i = if argc >= 2 { to_integer_for_format(argbuf[1])? } else { 1 };
+            let j = if argc >= 3 { to_integer_for_format(argbuf[2])? } else { len as i64 };
+            let mut ii = i;
+            let mut jj = j;
+            if ii < 1 { ii = 1; }
+            if jj > len as i64 { jj = len as i64; }
+            if ii > jj {
+                return Ok(ExecResult::Normal);
+            }
+            for k in (ii as usize)..=(jj as usize) {
+                let v = raw_get(s, tid, Value::Num(k as i64));
+                s.push_val(v)?;
+            }
+            let n = (jj - ii + 1) as u8;
+            ExecResult::RetN(n)
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
@@ -3825,6 +4171,41 @@ fn parse_format_spec(fmt: &[u8], start: usize) -> Result<(FormatSpec, usize), Lu
 
 /// Convert a value to an integer for integer/`%c` conversions, accepting
 /// integers and finite whole floats.
+/// Default ordering for `table.sort`: nil < bool < number < string < table <
+/// function < thread (matching Lua's `<` ordering for these types).
+fn default_less(s: &LuaState, a: Value, b: Value) -> bool {
+    // Type rank.
+    fn rank(v: Value) -> u8 {
+        match v {
+            Value::Nil => 0,
+            Value::Bool(_) => 1,
+            Value::Num(_) | Value::Float(_) => 2,
+            Value::Str(_) => 3,
+            Value::Table(_) => 4,
+            Value::Func(_) | Value::Closure(_) | Value::Native(_) | Value::Wrapped(_) | Value::Gmatch(_) | Value::Shell | Value::Dhcp | Value::Exit | Value::Ls => 5,
+            Value::Co(_) => 6,
+        }
+    }
+    let ra = rank(a);
+    let rb = rank(b);
+    if ra != rb {
+        return ra < rb;
+    }
+    match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => x < y, // false < true
+        (Value::Num(x), Value::Num(y)) => x < y,
+        (Value::Num(x), Value::Float(y)) => (x as f64) < y,
+        (Value::Float(x), Value::Num(y)) => x < (y as f64),
+        (Value::Float(x), Value::Float(y)) => x < y,
+        (Value::Str(x), Value::Str(y)) => {
+            let bx = s.str_bytes(x);
+            let by = s.str_bytes(y);
+            bx < by
+        }
+        _ => false,
+    }
+}
+
 fn to_integer_for_format(v: Value) -> Result<i64, LuaError> {
     match v {
         Value::Num(n) => Ok(n),

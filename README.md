@@ -141,6 +141,12 @@ Builtins:
 - `string.len(s)` — return the number of bytes in `s` (same as `#s`)
 - `string.lower(s)` — return a copy of `s` with ASCII uppercase letters converted to lowercase
 - `string.match(s, pattern [, init])` — return the captures of the first match of `pattern` in `s` (or the whole match), or `nil`; `init` defaults to 1
+- `string.pack(fmt, v1, ...)` / `string.packsize(fmt)` / `string.unpack(fmt, s [, pos])` — pack/unpack binary data according to a format string (see `help format-strings`)
+- `string.rep(s, n [, sep])` — return `s` repeated `n` times, optionally separated by `sep`
+- `string.reverse(s)` — return a reversed copy of `s`
+- `string.sub(s, i [, j])` — return the substring `s[i..j]` (1-based, negative indices count from the end)
+- `string.upper(s)` — return a copy of `s` with ASCII lowercase letters converted to uppercase
+- `table.concat(list [, sep [, i [, j]]])` / `table.create(n [, m])` / `table.insert(list, [pos,] value)` / `table.move(a1, f, e, t [, a2])` / `table.pack(...)` / `table.remove(list [, pos])` / `table.sort(list [, comp])` / `table.unpack(list [, i [, j]])` — the table library (concatenate, create, insert, move, pack, remove, sort, unpack)
 - `setmetatable(table, metatable|nil)` — store/remove a table's metatable and return the table; dispatched metamethods: `__index`, `__newindex`, `__eq`, `__lt`, `__le`, `__concat`, `__add`/`__sub`/`__mul`/`__div`/`__mod`, `__unm`, `__call`, `__tostring`, `__pairs`; a `__metatable` field protects it
 - `rawequal(v1, v2)` — primitive equality, never `__eq`
 - `rawget(table, index)` — the real `table[index]` without `__index` (agrees with `table[index]`)
@@ -283,7 +289,7 @@ cargo test --workspace   # 309 tests across all crates
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 124   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `string.gmatch`, `string.gsub`, `string.len`, `string.lower`, `string.match`, `string.pack`/`unpack`, `string.rep`/`reverse`/`sub`/`upper`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
+| `lua`        | 125   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `string.gmatch`, `string.gsub`, `string.len`, `string.lower`, `string.match`, `string.pack`/`unpack`, `string.rep`/`reverse`/`sub`/`upper`, `table.*`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |

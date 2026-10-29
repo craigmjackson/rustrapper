@@ -1062,6 +1062,63 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   See the Lua 5.5 manual section 6.5.2 for full details.\n",
     },
     HelpEntry {
+        name: "table.concat",
+        short: "Concatenate table elements into a string",
+        detail: "table.concat(list [, sep [, i [, j]]])\n\
+                  Concatenates list[i..j] into a string, separated by `sep`.\n\
+                  Example: table.concat({\"a\",\"b\",\"c\"}, \"-\") -> a-b-c\n",
+    },
+    HelpEntry {
+        name: "table.create",
+        short: "Create a new table",
+        detail: "table.create(n [, m])\n\
+                  Creates a new table (size hints are ignored in this subset).\n\
+                  Example: table.create(4) -> table\n",
+    },
+    HelpEntry {
+        name: "table.insert",
+        short: "Insert an element into a table",
+        detail: "table.insert(list, [pos,] value)\n\
+                  Inserts `value` at `pos` (default: end), shifting elements.\n\
+                  Example: table.insert({1,3}, 2, 2) -> {1,2,3}\n",
+    },
+    HelpEntry {
+        name: "table.move",
+        short: "Move elements between tables",
+        detail: "table.move(a1, f, e, t [, a2])\n\
+                  Moves a1[f..e] to a2[t..] (a2 defaults to a1).\n\
+                  Example: table.move({1,2,3,4}, 1, 2, 3) -> {1,2,1,2}\n",
+    },
+    HelpEntry {
+        name: "table.pack",
+        short: "Pack values into a table",
+        detail: "table.pack(...)\n\
+                  Packs all arguments into a table with an `n` field.\n\
+                  Example: table.pack(10, 20).n -> 2\n",
+    },
+    HelpEntry {
+        name: "table.remove",
+        short: "Remove an element from a table",
+        detail: "table.remove(list [, pos])\n\
+                  Removes and returns the element at `pos` (default: last).\n\
+                  Example: table.remove({1,2,3}, 2) -> 2\n",
+    },
+    HelpEntry {
+        name: "table.sort",
+        short: "Sort a table in place",
+        detail: "table.sort(list [, comp])\n\
+                  Sorts the array part of `list` in place. `comp(a,b)` returns\n\
+                  true if a < b. Default ordering is used when omitted.\n\
+                  Example: table.sort({3,1,2}) -> {1,2,3}\n",
+    },
+    HelpEntry {
+        name: "table.unpack",
+        short: "Unpack a table into values",
+        detail: "table.unpack(list [, i [, j]])\n\
+                  Returns list[i..j] as multiple values (defaults 1..#list).\n\
+                  Example: table.unpack({7,8,9}) -> 7 8 9\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1540,6 +1597,8 @@ mod tests {
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
             "string.format", "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
+            "table.concat", "table.create", "table.insert", "table.move", "table.pack",
+            "table.remove", "table.sort", "table.unpack",
             "string.pack", "string.packsize", "string.rep", "string.reverse", "string.sub",
             "string.unpack", "string.upper", "patterns", "format-strings",
             "fetch", "dofile", "ls", "dhcp",

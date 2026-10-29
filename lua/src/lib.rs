@@ -279,7 +279,10 @@ pub enum Value {
     /// `Native(36)`, `string.pack` is `Native(37)`, `string.packsize` is
     /// `Native(38)`, `string.rep` is `Native(39)`, `string.reverse` is
     /// `Native(40)`, `string.sub` is `Native(41)`, `string.unpack` is
-    /// `Native(42)`, and `string.upper` is `Native(43)`.
+    /// `Native(42)`, and `string.upper` is `Native(43)`. The `table`
+    /// library uses `Native(44..=51)`: `concat`(44), `create`(45),
+    /// `insert`(46), `move`(47), `pack`(48), `remove`(49), `sort`(50),
+    /// `unpack`(51).
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -1164,6 +1167,24 @@ impl LuaState {
             crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
         }
         self.set_global(string_name, Value::Table(tid));
+
+        // The `table` library.
+        let table_name = self.intern(b"table").unwrap();
+        let tid = crate::eval::new_table(self).unwrap();
+        for (nm, id) in [
+            ("concat", 44u8),
+            ("create", 45),
+            ("insert", 46),
+            ("move", 47),
+            ("pack", 48),
+            ("remove", 49),
+            ("sort", 50),
+            ("unpack", 51),
+        ] {
+            let n = self.intern(nm.as_bytes()).unwrap();
+            crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
+        }
+        self.set_global(table_name, Value::Table(tid));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -3424,6 +3445,22 @@ mod tests {
         assert!(exec("print(string.pack())").is_err());
         assert!(exec("print(string.packsize())").is_err());
         assert!(exec("print(string.unpack(\"<i4\", \"ab\"))").is_err());
+    }
+
+    #[test]
+    fn table_lib() {
+        assert_eq!(exec("print(table.concat({\"a\",\"b\",\"c\"}, \"-\"))").unwrap(), "a-b-c\n");
+        assert_eq!(exec("local t = table.create(4)\nt[1] = \"x\"\nprint(t[1])").unwrap(), "x\n");
+        assert_eq!(exec("local t = {1, 3}\ntable.insert(t, 2, 2)\nprint(table.concat(t, \",\"))").unwrap(), "1,2,3\n");
+        assert_eq!(exec("local t = {1,2,3,4}\ntable.move(t, 1, 2, 3)\nprint(table.concat(t, \",\"))").unwrap(), "1,2,1,2\n");
+        assert_eq!(exec("local p = table.pack(10, 20, 30)\nprint(p.n, p[1], p[2], p[3])").unwrap(), "3\t10\t20\t30\n");
+        assert_eq!(exec("local t = {1,2,3}\nprint(table.remove(t, 2))\nprint(table.concat(t, \",\"))").unwrap(), "2\n1,3\n");
+        assert_eq!(exec("local t = {3,1,2}\ntable.sort(t)\nprint(table.concat(t, \",\"))").unwrap(), "1,2,3\n");
+        assert_eq!(exec("local a, b, c = table.unpack({7,8,9})\nprint(a, b, c)").unwrap(), "7\t8\t9\n");
+        assert_eq!(exec("local t = {3,1,2}\ntable.sort(t, function(a,b) return a > b end)\nprint(table.concat(t, \",\"))").unwrap(), "3,2,1\n");
+        // Errors.
+        assert!(exec("print(table.concat())").is_err());
+        assert!(exec("print(table.insert())").is_err());
     }
 
     #[test]
