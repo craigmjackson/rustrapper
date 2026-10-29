@@ -38,6 +38,23 @@ pub(crate) fn float_of(v: Value) -> Option<f64> {
 
 /// `f64::floor` without libm: truncate toward zero via an `i64` cast, then step
 /// down when the truncation rounded up. Exact for `|x| < 2^63`.
+fn ceil_f64(x: f64) -> f64 {
+    if x >= 0.0 {
+        // truncation toward zero + 1 if fractional
+        let t = x as i64;
+        let tf = t as f64;
+        if tf < x { tf + 1.0 } else { tf }
+    } else {
+        // for negative, truncation toward zero is ceil (e.g. -2.3 -> -2)
+        let t = x as i64;
+        t as f64
+    }
+}
+
+fn floor_f64(x: f64) -> f64 {
+    float_floor(x)
+}
+
 fn float_floor(x: f64) -> f64 {
     let t = x as i64;
     let tf = t as f64;
@@ -3055,6 +3072,109 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let n = (jj - ii + 1) as u8;
             ExecResult::RetN(n)
         }
+        Value::Native(52) => {
+            // math.ceil(x)
+            if argc != 1 { return Err("math.ceil expects 1 argument".into()); }
+            let f = match argbuf[0] {
+                Value::Num(n) => n as f64,
+                Value::Float(x) => x,
+                _ => return Err("math.ceil expects a number".into()),
+            };
+            let cf = ceil_f64(f);
+            if cf.is_finite() && cf >= i64::MIN as f64 && cf <= i64::MAX as f64 && cf == (cf as i64) as f64 {
+                ExecResult::Ret(Value::Num(cf as i64))
+            } else {
+                ExecResult::Ret(Value::Float(cf))
+            }
+        }
+        Value::Native(53) => {
+            // math.floor(x)
+            if argc != 1 { return Err("math.floor expects 1 argument".into()); }
+            let f = match argbuf[0] {
+                Value::Num(n) => n as f64,
+                Value::Float(x) => x,
+                _ => return Err("math.floor expects a number".into()),
+            };
+            let ff = floor_f64(f);
+            if ff.is_finite() && ff >= i64::MIN as f64 && ff <= i64::MAX as f64 && ff == (ff as i64) as f64 {
+                ExecResult::Ret(Value::Num(ff as i64))
+            } else {
+                ExecResult::Ret(Value::Float(ff))
+            }
+        }
+        Value::Native(54) => {
+            if argc != 0 { return Err("math.maxinteger expects no arguments".into()); }
+            ExecResult::Ret(Value::Num(i64::MAX))
+        }
+        Value::Native(55) => {
+            if argc != 0 { return Err("math.mininteger expects no arguments".into()); }
+            ExecResult::Ret(Value::Num(i64::MIN))
+        }
+        Value::Native(56) => {
+            // math.random([m [, n]])
+            match argc {
+                0 => {
+                    let x = s.next_random();
+                    ExecResult::Ret(Value::Float(x))
+                }
+                1 => {
+                    let m = to_integer_for_format(argbuf[0])?;
+                    if m < 1 { return Err("math.random: interval is empty".into()); }
+                    let r = (s.next_random_int(m as u64) % m as u64) as i64 + 1;
+                    ExecResult::Ret(Value::Num(r))
+                }
+                2 => {
+                    let m = to_integer_for_format(argbuf[0])?;
+                    let n = to_integer_for_format(argbuf[1])?;
+                    if m > n { return Err("math.random: interval is empty".into()); }
+                    let range = (n - m + 1) as u64;
+                    let r = (s.next_random_int(range) % range) as i64 + m;
+                    ExecResult::Ret(Value::Num(r))
+                }
+                _ => return Err("math.random expects 0 to 2 arguments".into()),
+            }
+        }
+        Value::Native(57) => {
+            // math.randomseed(x [, y])
+            if argc < 1 || argc > 2 {
+                return Err("math.randomseed expects 1 or 2 arguments".into());
+            }
+            let seed = match argbuf[0] {
+                Value::Num(n) => n as u64,
+                Value::Float(f) => f.to_bits(),
+                _ => return Err("math.randomseed expects a number".into()),
+            };
+            s.rng_state = seed;
+            if seed == 0 { s.rng_state = 1; }
+            ExecResult::Normal
+        }
+        Value::Native(58) => {
+            // math.tointeger(x)
+            if argc != 1 { return Err("math.tointeger expects 1 argument".into()); }
+            match argbuf[0] {
+                Value::Num(n) => ExecResult::Ret(Value::Num(n)),
+                Value::Float(f) if f.is_finite() && f == float_floor(f) && f >= i64::MIN as f64 && f <= i64::MAX as f64 => {
+                    ExecResult::Ret(Value::Num(f as i64))
+                }
+                _ => ExecResult::Ret(Value::Nil),
+            }
+        }
+        Value::Native(59) => {
+            // math.type(x)
+            if argc != 1 { return Err("math.type expects 1 argument".into()); }
+            let name = match argbuf[0] {
+                Value::Num(_) => Some("integer"),
+                Value::Float(_) => Some("float"),
+                _ => None,
+            };
+            match name {
+                Some(n) => {
+                    let r = s.intern(n.as_bytes())?;
+                    ExecResult::Ret(Value::Str(r))
+                }
+                None => ExecResult::Ret(Value::Nil),
+            }
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
@@ -3224,6 +3344,12 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
         Value::Wrapped(id) => {
             // Calling a wrapped coroutine resumes it and re-raises errors.
             crate::vm::co_wrap_call(s, id, argc)?
+        }
+        // `math.maxinteger` / `math.mininteger` are constants in real Lua,
+        // but allow calling them with no arguments (returns the constant) so
+        // both `math.maxinteger` and `math.maxinteger()` work.
+        Value::Num(n) if argc == 0 && (n == i64::MAX || n == i64::MIN) => {
+            ExecResult::Ret(Value::Num(n))
         }
         Value::Gmatch(id) => {
             // Calling a gmatch iterator advances it and yields the next

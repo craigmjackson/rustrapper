@@ -1119,6 +1119,61 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: table.unpack({7,8,9}) -> 7 8 9\n",
     },
     HelpEntry {
+        name: "math.ceil",
+        short: "Smallest integer >= x",
+        detail: "math.ceil(x)\n\
+                  Returns the smallest integer larger than or equal to x.\n\
+                  Example: math.ceil(2.3) -> 3\n",
+    },
+    HelpEntry {
+        name: "math.floor",
+        short: "Largest integer <= x",
+        detail: "math.floor(x)\n\
+                  Returns the largest integer smaller than or equal to x.\n\
+                  Example: math.floor(2.7) -> 2\n",
+    },
+    HelpEntry {
+        name: "math.maxinteger",
+        short: "Maximum integer value",
+        detail: "math.maxinteger\n\
+                  The maximum value for an integer (2^63-1).\n",
+    },
+    HelpEntry {
+        name: "math.mininteger",
+        short: "Minimum integer value",
+        detail: "math.mininteger\n\
+                  The minimum value for an integer (-2^63).\n",
+    },
+    HelpEntry {
+        name: "math.random",
+        short: "Pseudo-random number",
+        detail: "math.random([m [, n]])\n\
+                  With no args: float in [0,1). With one arg m: int in [1,m].\n\
+                  With two args: int in [m,n].\n\
+                  Example: math.random(1, 6) -> 4\n",
+    },
+    HelpEntry {
+        name: "math.randomseed",
+        short: "Set the random seed",
+        detail: "math.randomseed(x)\n\
+                  Sets the seed for math.random.\n\
+                  Example: math.randomseed(42)\n",
+    },
+    HelpEntry {
+        name: "math.tointeger",
+        short: "Convert to integer",
+        detail: "math.tointeger(x)\n\
+                  Returns x as an integer if it is (or can be) one, else nil.\n\
+                  Example: math.tointeger(3.0) -> 3\n",
+    },
+    HelpEntry {
+        name: "math.type",
+        short: "Type of a number",
+        detail: "math.type(x)\n\
+                  Returns \"integer\" or \"float\" if x is a number, else nil.\n\
+                  Example: math.type(3) -> integer\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1597,10 +1652,12 @@ mod tests {
             "pcall", "xpcall", "error", "assert", "coroutine",
             "string.byte", "string.char", "string.dump", "string.find",
             "string.format", "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
-            "table.concat", "table.create", "table.insert", "table.move", "table.pack",
-            "table.remove", "table.sort", "table.unpack",
             "string.pack", "string.packsize", "string.rep", "string.reverse", "string.sub",
             "string.unpack", "string.upper", "patterns", "format-strings",
+            "table.concat", "table.create", "table.insert", "table.move", "table.pack",
+            "table.remove", "table.sort", "table.unpack",
+            "math.ceil", "math.floor", "math.maxinteger", "math.mininteger", "math.random",
+            "math.randomseed", "math.tointeger", "math.type",
             "fetch", "dofile", "ls", "dhcp",
         ] {
             assert!(out.contains(cmd), "missing '{}' in:\n{}", cmd, out);

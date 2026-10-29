@@ -282,7 +282,9 @@ pub enum Value {
     /// `Native(42)`, and `string.upper` is `Native(43)`. The `table`
     /// library uses `Native(44..=51)`: `concat`(44), `create`(45),
     /// `insert`(46), `move`(47), `pack`(48), `remove`(49), `sort`(50),
-    /// `unpack`(51).
+    /// `unpack`(51). The `math` library uses `Native(52..=59)`:
+    /// `ceil`(52), `floor`(53), `maxinteger`(54), `mininteger`(55),
+    /// `random`(56), `randomseed`(57), `tointeger`(58), `type`(59).
     Native(u8),
     /// Builtin: `shell()` — enters the interactive Lua REPL.
     Shell,
@@ -801,6 +803,8 @@ pub struct LuaState {
     /// Live `string.gmatch` iterators.
     pub gmatches: [GmatchState; MAX_GMATCH],
     pub ngmatch: u8,
+    /// RNG state for `math.random` / `math.randomseed`.
+    pub rng_state: u64,
     /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
     pub mm_refs: [StrRef; MM_COUNT],
     pub mm_ready: bool,
@@ -946,6 +950,7 @@ impl LuaState {
             nclosures: 0,
             gmatches: [GmatchState::empty(); MAX_GMATCH],
             ngmatch: 0,
+            rng_state: 0x123456789ABCDEF0,
             mm_refs: [0; MM_COUNT],
             mm_ready: false,
             mm_depth: 0,
@@ -1185,6 +1190,27 @@ impl LuaState {
             crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
         }
         self.set_global(table_name, Value::Table(tid));
+
+        // The `math` library.
+        let math_name = self.intern(b"math").unwrap();
+        let tid = crate::eval::new_table(self).unwrap();
+        for (nm, id) in [
+            ("ceil", 52u8),
+            ("floor", 53),
+            ("random", 56),
+            ("randomseed", 57),
+            ("tointeger", 58),
+            ("type", 59),
+        ] {
+            let n = self.intern(nm.as_bytes()).unwrap();
+            crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
+        }
+        // maxinteger / mininteger are constants (numbers), not functions.
+        let n = self.intern(b"maxinteger").unwrap();
+        crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Num(i64::MAX)).unwrap();
+        let n = self.intern(b"mininteger").unwrap();
+        crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Num(i64::MIN)).unwrap();
+        self.set_global(math_name, Value::Table(tid));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1387,6 +1413,7 @@ impl LuaState {
         self.ncells = 0;
         self.nclosures = 0;
         self.ngmatch = 0;
+        self.rng_state = 0x123456789ABCDEF0;
         for c in self.cos.iter_mut() {
             c.status = CO_DEAD;
         }
@@ -1714,6 +1741,28 @@ impl LuaState {
         };
         self.nclosures += 1;
         Ok(i)
+    }
+
+    /// Advance the RNG (xorshift64) and return a float in [0, 1).
+    pub fn next_random(&mut self) -> f64 {
+        // xorshift64
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        // convert to [0,1)
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Advance the RNG and return a raw u64 (for integer ranges).
+    pub fn next_random_int(&mut self, _n: u64) -> u64 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        x
     }
 
     /// Allocate a `string.gmatch` iterator slot.
@@ -3445,6 +3494,30 @@ mod tests {
         assert!(exec("print(string.pack())").is_err());
         assert!(exec("print(string.packsize())").is_err());
         assert!(exec("print(string.unpack(\"<i4\", \"ab\"))").is_err());
+    }
+
+    #[test]
+    fn math_lib() {
+        assert_eq!(exec("print(math.ceil(2.3))").unwrap(), "3\n");
+        assert_eq!(exec("print(math.ceil(2.0))").unwrap(), "2\n");
+        assert_eq!(exec("print(math.floor(2.7))").unwrap(), "2\n");
+        assert_eq!(exec("print(math.floor(2.0))").unwrap(), "2\n");
+        assert_eq!(exec("print(math.maxinteger > 0)").unwrap(), "true\n");
+        assert_eq!(exec("print(math.mininteger < 0)").unwrap(), "true\n");
+        assert_eq!(exec("print(math.tointeger(3.0))").unwrap(), "3\n");
+        assert_eq!(exec("print(math.tointeger(3.5))").unwrap(), "nil\n");
+        assert_eq!(exec("print(math.type(3))").unwrap(), "integer\n");
+        assert_eq!(exec("print(math.type(3.0))").unwrap(), "float\n");
+        assert_eq!(exec("print(math.type(\"x\"))").unwrap(), "nil\n");
+        assert_eq!(exec("math.randomseed(42)\nlocal r = math.random(1, 10)\nprint(r >= 1 and r <= 10)").unwrap(), "true\n");
+        assert!(exec("print(math.random())").unwrap().len() > 0);
+        assert!(exec("print(math.ceil())").is_err());
+        assert!(exec("print(math.ceil(\"x\"))").is_err());
+        assert!(exec("print(math.floor())").is_err());
+        assert!(exec("print(math.random(0))").is_err());
+        assert!(exec("print(math.random(5, 3))").is_err());
+        assert!(exec("print(math.tointeger())").is_err());
+        assert!(exec("print(math.type())").is_err());
     }
 
     #[test]
