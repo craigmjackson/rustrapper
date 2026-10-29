@@ -819,6 +819,8 @@ pub struct LuaState {
     pub io_type: Option<fn(id: u8) -> Option<&'static str>>,
     pub io_size: Option<fn(id: u8) -> usize>,
     pub io_seek: Option<fn(id: u8, whence: &str, offset: i64) -> Option<usize>>,
+    pub os_remove: Option<fn(name: &str) -> bool>,
+    pub os_rename: Option<fn(old: &str, new: &str) -> bool>,
     pub io_default_input: Option<u8>,
     pub io_default_output: Option<u8>,
     /// Interned metamethod names (`__index`, `__add`, ...), filled lazily.
@@ -975,6 +977,8 @@ impl LuaState {
             io_type: None,
             io_size: None,
             io_seek: None,
+            os_remove: None,
+            os_rename: None,
             io_default_input: None,
             io_default_output: None,
             mm_refs: [0; MM_COUNT],
@@ -1257,6 +1261,19 @@ impl LuaState {
             crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
         }
         self.set_global(io_name, Value::Table(tid));
+
+        // The `os` library.
+        let os_name = self.intern(b"os").unwrap();
+        let tid = crate::eval::new_table(self).unwrap();
+        for (nm, id) in [
+            ("exit", 72u8),
+            ("remove", 73),
+            ("rename", 74),
+        ] {
+            let n = self.intern(nm.as_bytes()).unwrap();
+            crate::eval::tset(self, Value::Table(tid), Value::Str(n), Value::Native(id)).unwrap();
+        }
+        self.set_global(os_name, Value::Table(tid));
     }
 
     /// Parse and execute a Lua script. `source` must remain valid for the
@@ -1395,6 +1412,12 @@ impl LuaState {
     }
     pub fn set_io_seek(&mut self, f: Option<fn(id: u8, whence: &str, offset: i64) -> Option<usize>>) {
         self.io_seek = f;
+    }
+    pub fn set_os_remove(&mut self, f: Option<fn(name: &str) -> bool>) {
+        self.os_remove = f;
+    }
+    pub fn set_os_rename(&mut self, f: Option<fn(old: &str, new: &str) -> bool>) {
+        self.os_rename = f;
     }
 
     /// Run the `dhcp` builtin: establish network connectivity and enable the
@@ -3553,6 +3576,15 @@ mod tests {
         assert!(exec("print(string.match(\"x\"))").is_err());
         assert!(exec("print(string.match(42, \"x\"))").is_err());
         assert!(exec("print(string.match(\"x\", \"(abc\"))").is_err());
+    }
+
+    #[test]
+    fn os_lib() {
+        assert_eq!(exec("print(os.remove(\"nope.txt\"))").unwrap(), "nil\n");
+        assert_eq!(exec("print(os.rename(\"a\", \"b\"))").unwrap(), "nil\n");
+        assert!(exec("os.exit()").is_ok());
+        assert!(exec("print(os.remove())").is_err());
+        assert!(exec("print(os.rename(\"a\"))").is_err());
     }
 
     #[test]

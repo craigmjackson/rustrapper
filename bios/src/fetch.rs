@@ -333,6 +333,41 @@ pub fn io_type(id: u8) -> Option<&'static str> {
 
 pub fn io_size(_id: u8) -> usize { 0 }
 
+
+pub fn os_remove(name: &str) -> bool {
+    // Remove a fetched file from the pseudo-filesystem by name.
+    unsafe {
+        for i in 0..MAX_FETCH_FILES {
+            if FETCH_FILES[i].used {
+                let nlen = FETCH_FILES[i].name.iter().position(|&b| b == 0).unwrap_or(64);
+                if &FETCH_FILES[i].name[..nlen] == name.as_bytes() {
+                    FETCH_FILES[i].used = false;
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn os_rename(old: &str, new: &str) -> bool {
+    unsafe {
+        for i in 0..MAX_FETCH_FILES {
+            if FETCH_FILES[i].used {
+                let nlen = FETCH_FILES[i].name.iter().position(|&b| b == 0).unwrap_or(64);
+                if &FETCH_FILES[i].name[..nlen] == old.as_bytes() {
+                    let nb = new.as_bytes();
+                    if nb.len() >= 64 { return false; }
+                    FETCH_FILES[i].name = [0; 64];
+                    FETCH_FILES[i].name[..nb.len()].copy_from_slice(nb);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn set_io_callbacks(state: &mut lua::LuaState) {
     state.set_io_open(Some(io_open));
     state.set_io_close(Some(io_close));
@@ -342,4 +377,6 @@ pub fn set_io_callbacks(state: &mut lua::LuaState) {
     state.set_io_type(Some(io_type));
     state.set_io_size(Some(io_size));
     state.set_io_seek(Some(io_seek));
+    state.set_os_remove(Some(os_remove));
+    state.set_os_rename(Some(os_rename));
 }

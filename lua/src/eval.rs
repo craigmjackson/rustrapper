@@ -3633,6 +3633,105 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let _ = id;
             ExecResult::Ret(Value::Bool(true))
         }
+        Value::Native(72) => {
+            // os.exit([code [, close]])
+            // Ignore code/close; just exit.
+            ExecResult::Exit
+        }
+        Value::Native(73) => {
+            // os.remove(filename)
+            if argc != 1 {
+                return Err("os.remove expects 1 argument".into());
+            }
+            let name = match argbuf[0] {
+                Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or(""),
+                _ => return Err("os.remove expects a string".into()),
+            };
+            // copy name
+            let mut buf = [0u8; 128];
+            let nl = name.len().min(buf.len());
+            buf[..nl].copy_from_slice(&name.as_bytes()[..nl]);
+            let name = core::str::from_utf8(&buf[..nl]).unwrap_or("");
+            let ok = s.os_remove.map(|f| f(name)).unwrap_or(false);
+            if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+        }
+        Value::Native(74) => {
+            // os.rename(oldname, newname)
+            if argc != 2 {
+                return Err("os.rename expects 2 arguments".into());
+            }
+            let oldname = match argbuf[0] {
+                Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or(""),
+                _ => return Err("os.rename expects a string".into()),
+            };
+            let newname = match argbuf[1] {
+                Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or(""),
+                _ => return Err("os.rename expects a string".into()),
+            };
+            let mut obuf = [0u8; 128];
+            let mut nbuf = [0u8; 128];
+            let ol = oldname.len().min(obuf.len());
+            let nl = newname.len().min(nbuf.len());
+            obuf[..ol].copy_from_slice(&oldname.as_bytes()[..ol]);
+            nbuf[..nl].copy_from_slice(&newname.as_bytes()[..nl]);
+            let oldname = core::str::from_utf8(&obuf[..ol]).unwrap_or("");
+            let newname = core::str::from_utf8(&nbuf[..nl]).unwrap_or("");
+            let ok = s.os_rename.map(|f| f(oldname, newname)).unwrap_or(false);
+            if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+        }
+        Value::Native(72) => {
+            // os.exit([code [, close]])
+            ExecResult::Exit
+        }
+        Value::Native(73) => {
+            // os.remove(filename)
+            if argc != 1 {
+                return Err("os.remove expects 1 argument".into());
+            }
+            let mut name_buf = [0u8; 128];
+            let name_len = match argbuf[0] {
+                Value::Str(r) => {
+                    let b = s.str_bytes(r);
+                    let l = b.len().min(name_buf.len());
+                    name_buf[..l].copy_from_slice(&b[..l]);
+                    l
+                }
+                _ => return Err("os.remove expects a string".into()),
+            };
+            let name = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("");
+            let ok = s.os_remove.map(|f| f(name)).unwrap_or(false);
+            if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+        }
+        Value::Native(74) => {
+            // os.rename(oldname, newname)
+            if argc != 2 {
+                return Err("os.rename expects 2 arguments".into());
+            }
+            let mut obuf = [0u8; 128];
+            let mut nbuf = [0u8; 128];
+            let ol = match argbuf[0] {
+                Value::Str(r) => {
+                    let b = s.str_bytes(r);
+                    let l = b.len().min(obuf.len());
+                    obuf[..l].copy_from_slice(&b[..l]);
+                    l
+                }
+                _ => return Err("os.rename expects a string".into()),
+            };
+            let nl = match argbuf[1] {
+                Value::Str(r) => {
+                    let b = s.str_bytes(r);
+                    let l = b.len().min(nbuf.len());
+                    nbuf[..l].copy_from_slice(&b[..l]);
+                    l
+                }
+                _ => return Err("os.rename expects a string".into()),
+            };
+            let oldname = core::str::from_utf8(&obuf[..ol]).unwrap_or("");
+            let newname = core::str::from_utf8(&nbuf[..nl]).unwrap_or("");
+            let ok = s.os_rename.map(|f| f(oldname, newname)).unwrap_or(false);
+            if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source

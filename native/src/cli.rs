@@ -35,6 +35,8 @@ fn run_script(path: &str) -> ! {
     fetch::set_io_callbacks(&mut state);
     state.set_io_size(Some(fetch::io_size));
     state.set_io_seek(Some(fetch::io_seek));
+    state.set_os_remove(Some(fetch::os_remove));
+    state.set_os_rename(Some(fetch::os_rename));
     match state.run_with_fetch_load(&src, term::raw_putc, fetch::fetch_file, fetch::load_file) {
         Ok(()) => std::process::exit(0),
         Err(e) => {
@@ -63,6 +65,8 @@ fn run_repl() -> ! {
     fetch::set_io_callbacks(&mut state);
     state.set_io_size(Some(fetch::io_size));
     state.set_io_seek(Some(fetch::io_seek));
+    state.set_os_remove(Some(fetch::os_remove));
+    state.set_os_rename(Some(fetch::os_rename));
     lua::repl::repl_loop(&mut state, term::get_key, print::putc, print::puts);
     term::shutdown(0)
 }

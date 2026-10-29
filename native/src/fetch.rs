@@ -377,3 +377,29 @@ pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
     buf[..data.len()].copy_from_slice(&data);
     Some(data.len())
 }
+
+pub fn os_remove(name: &str) -> bool {
+    let mut fl = FILES.lock().unwrap();
+    if let Some(i) = fl.iter().position(|(n, _)| n == name) {
+        fl.remove(i);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn os_rename(old: &str, new: &str) -> bool {
+    let mut fl = FILES.lock().unwrap();
+    if let Some(i) = fl.iter().position(|(n, _)| n == old) {
+        let data = fl[i].1.clone();
+        fl.remove(i);
+        if let Some(j) = fl.iter().position(|(n, _)| n == new) {
+            fl[j].1 = data;
+        } else {
+            fl.push((new.to_string(), data));
+        }
+        true
+    } else {
+        false
+    }
+}

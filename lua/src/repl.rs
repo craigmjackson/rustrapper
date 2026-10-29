@@ -1313,6 +1313,29 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Example: f:setvbuf(\"no\")\n",
     },
     HelpEntry {
+        name: "os.exit",
+        short: "Exit the interpreter",
+        detail: "os.exit([code [, close]])\n\
+                  Terminates the interpreter.\n\
+                  Example: os.exit()\n",
+    },
+    HelpEntry {
+        name: "os.remove",
+        short: "Delete a file",
+        detail: "os.remove(filename)\n\
+                  Deletes `filename` from the pseudo-filesystem.\n\
+                  Returns true on success, or nil on failure.\n\
+                  Example: os.remove(\"x.txt\")\n",
+    },
+    HelpEntry {
+        name: "os.rename",
+        short: "Rename a file",
+        detail: "os.rename(oldname, newname)\n\
+                  Renames `oldname` to `newname` in the pseudo-filesystem.\n\
+                  Returns true on success, or nil on failure.\n\
+                  Example: os.rename(\"a.txt\", \"b.txt\")\n",
+    },
+    HelpEntry {
         name: "coroutine",
         short: "Coroutine library",
         detail: "coroutine.create(f), coroutine.resume(co, ...),\n\
@@ -1798,6 +1821,7 @@ mod tests {
             "table.remove", "table.sort", "table.unpack",
             "math.ceil", "math.floor", "math.maxinteger", "math.mininteger", "math.random",
             "math.randomseed", "math.tointeger", "math.type",
+            "os.exit", "os.remove", "os.rename",
             "io.close", "io.flush", "io.input", "io.lines", "io.open", "io.output",
             "io.read", "io.tmpfile", "io.type", "io.write",
             "fetch", "dofile", "ls", "dhcp",
