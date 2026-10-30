@@ -15,6 +15,8 @@ mod mem;
 mod loader;
 #[cfg(not(test))]
 mod fetch;
+#[cfg(not(test))]
+mod http;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;

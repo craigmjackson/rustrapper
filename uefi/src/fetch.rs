@@ -177,83 +177,115 @@ pub fn dhcp_values(v: &mut lua::DhcpValues) {
 /// Host `fetch()` callback: download `name` from the TFTP server, record it
 /// in a slot, and return the byte count (or `None` on failure).
 pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
-    if name.starts_with("http://") { return None; }
-    let name = name.strip_prefix("tftp://").unwrap_or(name);
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() >= 64 {
-        return None;
-    }
-    let save = save_as.as_bytes();
-    if save.is_empty() || save.len() >= 64 {
-        return None;
-    }
-
-    let (st, base, mac, src_ip, server_ip) = unsafe {
-        (
-            FETCH_CTX.system_table,
-            FETCH_CTX.base,
-            FETCH_CTX.mac,
-            FETCH_CTX.src_ip,
-            FETCH_CTX.server_ip,
-        )
-    };
-    if st.is_null() || base == 0 || server_ip == [0; 4] {
-        return None;
-    }
-
-    // Pick the first free slot.
-    let mut idx = None;
-    for i in 0..MAX_FETCH_FILES {
-        if !unsafe { FETCH_FILES[i].used } {
-            idx = Some(i);
-            break;
-        }
-    }
-    let idx = idx?;
-
-    // Lazily allocate the shared buffer once.
-    unsafe {
-        if FETCH_BUFFER.is_null() {
-            let gbs = (*st).boot_services;
-            let allocate_pool: AllocatePoolFn = read_boot_svc_fn(gbs, BOOT_SVC_ALLOCATE_POOL);
-            let mut buf: *mut c_void = core::ptr::null_mut();
-            let status = allocate_pool(EFI_LOADER_DATA, FETCH_TOTAL_CAP as u64, &mut buf);
-            if status != EFI_SUCCESS {
-                return None;
-            }
-            FETCH_BUFFER = buf as *mut u8;
-        }
-    }
-
-    let slot_base = unsafe { FETCH_BUFFER.add(idx * PER_FILE_CAP) };
-    let mut sink = FetchSink {
-        base: slot_base,
-        offset: 0,
-        capacity: PER_FILE_CAP,
-    };
-
-    let e1000 = crate::net::DirectMmioE1000::new(base);
-    let con_out = unsafe { &*(*st).con_out };
-    let size =
-        crate::net::tftp_download_e1000(con_out, &e1000, &mac, &src_ip, &server_ip, name, &mut sink)?;
-
-    unsafe {
-        let mut n = [0u8; 64];
-        n[..save.len()].copy_from_slice(save);
-        FETCH_FILES[idx] = FetchFile {
-            name: n,
-            base: slot_base,
-            len: size,
-            used: true,
+    let is_http = name.starts_with("http://") || name.starts_with("https://");
+    if is_http {
+        let (st, con_out) = unsafe {
+            (FETCH_CTX.system_table, (*FETCH_CTX.system_table).con_out)
         };
+        if st.is_null() { return None; }
+        let con_out = unsafe { &*con_out };
+
+        let mut idx = None;
+        for i in 0..MAX_FETCH_FILES {
+            if !unsafe { FETCH_FILES[i].used } { idx = Some(i); break; }
+        }
+        let idx = idx?;
+
+        let gbs = unsafe { (*st).boot_services };
+        let allocate_pool: AllocatePoolFn = read_boot_svc_fn(gbs, BOOT_SVC_ALLOCATE_POOL);
+        let mut buf: *mut c_void = core::ptr::null_mut();
+        let status = unsafe { allocate_pool(EFI_LOADER_DATA, PER_FILE_CAP as u64, &mut buf) };
+        if status != EFI_SUCCESS { return None; }
+        let slot_base = buf as *mut u8;
+
+        let https = name.starts_with("https://");
+        let size = crate::http::http_download_uefi(con_out, unsafe { &*st }, name, https, slot_base, PER_FILE_CAP)?;
+
+        unsafe {
+            let mut n = [0u8; 64];
+            let slen = save_as.len().min(63);
+            n[..slen].copy_from_slice(&save_as.as_bytes()[..slen]);
+            FETCH_FILES[idx] = FetchFile {
+                name: n,
+                base: slot_base,
+                len: size,
+                used: true,
+            };
+        }
+        Some(size)
+    } else {
+        let name = name.strip_prefix("tftp://").unwrap_or(name);
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.len() >= 64 {
+            return None;
+        }
+        let save = save_as.as_bytes();
+        if save.is_empty() || save.len() >= 64 {
+            return None;
+        }
+
+        let (st, base, mac, src_ip, server_ip) = unsafe {
+            (
+                FETCH_CTX.system_table,
+                FETCH_CTX.base,
+                FETCH_CTX.mac,
+                FETCH_CTX.src_ip,
+                FETCH_CTX.server_ip,
+            )
+        };
+        if st.is_null() || base == 0 || server_ip == [0; 4] {
+            return None;
+        }
+
+        let mut idx = None;
+        for i in 0..MAX_FETCH_FILES {
+            if !unsafe { FETCH_FILES[i].used } { idx = Some(i); break; }
+        }
+        let idx = idx?;
+
+        unsafe {
+            if FETCH_BUFFER.is_null() {
+                let gbs = (*st).boot_services;
+                let allocate_pool: AllocatePoolFn = read_boot_svc_fn(gbs, BOOT_SVC_ALLOCATE_POOL);
+                let mut buf: *mut c_void = core::ptr::null_mut();
+                let status = allocate_pool(EFI_LOADER_DATA, FETCH_TOTAL_CAP as u64, &mut buf);
+                if status != EFI_SUCCESS {
+                    return None;
+                }
+                FETCH_BUFFER = buf as *mut u8;
+            }
+        }
+
+        let slot_base = unsafe { FETCH_BUFFER.add(idx * PER_FILE_CAP) };
+        let mut sink = FetchSink {
+            base: slot_base,
+            offset: 0,
+            capacity: PER_FILE_CAP,
+        };
+
+        let e1000 = crate::net::DirectMmioE1000::new(base);
+        let con_out = unsafe { &*(*st).con_out };
+        let size =
+            crate::net::tftp_download_e1000(con_out, &e1000, &mac, &src_ip, &server_ip, name, &mut sink)?;
+
+        unsafe {
+            let mut n = [0u8; 64];
+            n[..save.len()].copy_from_slice(save);
+            FETCH_FILES[idx] = FetchFile {
+                name: n,
+                base: slot_base,
+                len: size,
+                used: true,
+            };
+        }
+        Some(size)
     }
-    Some(size)
 }
 
 /// Host `dofile()` callback: download `name` from the TFTP server into the
 /// interpreter's buffer and return its length (or `None` on failure).
 pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
-    if name.starts_with("http://") { return None; }
+    if name.starts_with("http://") || name.starts_with("https://") { return None; }
     let name = name.strip_prefix("tftp://").unwrap_or(name);
     let (st, base, mac, src_ip, server_ip) = unsafe {
         (

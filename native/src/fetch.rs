@@ -115,7 +115,16 @@ impl TftpSink for FileSink<'_> {
 /// `None` on failure). `name` may be prefixed with `tftp://` or `http://`;
 /// a missing prefix defaults to `tftp://`.
 pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
-    let data = if let Some(rest) = name.strip_prefix("http://") {
+    let data = if name.starts_with("https://") {
+        #[cfg(feature = "https")]
+        {
+            https_download(&name["https://".len()..])?
+        }
+        #[cfg(not(feature = "https"))]
+        {
+            return None;
+        }
+    } else if let Some(rest) = name.strip_prefix("http://") {
         http_download(rest)?
     } else {
         let name = name.strip_prefix("tftp://").unwrap_or(name);
@@ -132,6 +141,55 @@ pub fn fetch_file(name: &str, save_as: &str) -> Option<usize> {
     };
     FILES.lock().unwrap().push((save_as.to_string(), data.clone()));
     Some(data.len())
+}
+
+#[cfg(feature = "https")]
+fn https_download(url: &str) -> Option<Vec<u8>> {
+    use rustls::pki_types::ServerName;
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    use std::sync::Arc;
+
+    let (hostport, path) = match url.find('/') {
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, "/"),
+    };
+    let (host, port) = match hostport.find(':') {
+        Some(i) => (&hostport[..i], hostport[i + 1..].parse::<u16>().ok()?),
+        None => (hostport, 443u16),
+    };
+
+    // Install ring as the crypto provider (idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(host.to_string()).ok()?;
+    let conn = rustls::ClientConnection::new(Arc::new(config), server_name).ok()?;
+
+    let addr = format!("{}:{}", host, port);
+    let tcp = std::net::TcpStream::connect_timeout(
+        &addr.to_socket_addrs().ok()?.next()?,
+        std::time::Duration::from_secs(10),
+    )
+    .ok()?;
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+
+    let req = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, host
+    );
+    tls.write_all(req.as_bytes()).ok()?;
+    let mut resp = Vec::new();
+    tls.read_to_end(&mut resp).ok()?;
+
+    let sep = b"\r\n\r\n";
+    let idx = resp.windows(4).position(|w| w == sep)?;
+    Some(resp[idx + 4..].to_vec())
 }
 
 /// Minimal HTTP/1.0 GET client. `url` is `host[:port]/path` (no scheme).
@@ -356,7 +414,16 @@ pub fn set_io_callbacks(state: &mut lua::LuaState) {
 /// Host `dofile()` callback: download `name` from the TFTP server into the
 /// interpreter's buffer and return its length (or `None` on failure).
 pub fn load_file(name: &str, buf: &mut [u8]) -> Option<usize> {
-    let data = if let Some(rest) = name.strip_prefix("http://") {
+    let data = if name.starts_with("https://") {
+        #[cfg(feature = "https")]
+        {
+            https_download(&name["https://".len()..])?
+        }
+        #[cfg(not(feature = "https"))]
+        {
+            return None;
+        }
+    } else if let Some(rest) = name.strip_prefix("http://") {
         http_download(rest)?
     } else {
         let name = name.strip_prefix("tftp://").unwrap_or(name);

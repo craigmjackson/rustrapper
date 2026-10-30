@@ -3,6 +3,12 @@ name = "native"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+https = ["dep:rustls", "dep:webpki-roots"]
+
 [dependencies]
 common = { path = "../common" }
 lua = { path = "../lua" }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+webpki-roots = { version = "0.26", optional = true }

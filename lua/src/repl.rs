@@ -1353,7 +1353,8 @@ const HELP_COMMANDS: &[HelpEntry] = &[
                   Downloads 'file' from the TFTP server (DHCP next_server) and\n\
                   returns its byte count, or nil on failure. The optional\n\
                   'dest' names the local file it is saved under (shown by ls).\n\
-                  `file` may be prefixed with tftp:// or http:// (default tftp).\n\
+                  `file` may be prefixed with tftp://, http://, or https:// (default tftp;\n\
+                  http/https on native, https on UEFI).\n\
                   Requires a TFTP server: run 'dhcp' first to set up the\n\
                   network (or it works automatically in PXE scripts).\n",
     },

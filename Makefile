@@ -47,6 +47,17 @@ run-native: native
 lua: native | $(BIN)
 	cp target/release/lua $(BIN)/lua
 
+# ── Native Linux with HTTPS (rustls) ─────────────────────────────────────────
+native-https: $(shell find native common lua -name '*.rs') Cargo.toml | $(BIN)
+	CARGO_TARGET_DIR=target $(CARGO) build --package native --release --features https
+	cp target/release/native $(BIN)/rustrapper_native
+
+lua-https: native-https | $(BIN)
+	cp target/release/lua $(BIN)/lua
+
+run-lua-https: lua-https
+	./$(BIN)/lua $(SCRIPT)
+
 run-lua: lua
 	./$(BIN)/lua $(SCRIPT)
 

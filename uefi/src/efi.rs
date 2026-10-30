@@ -117,6 +117,128 @@ pub static PCI_ROOT_BRIDGE_IO_GUID: EFI_GUID = EFI_GUID {
     data4: [0x9A, 0x38, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D],
 };
 
+pub static HTTP_SERVICE_BINDING_PROTOCOL_GUID: EFI_GUID = EFI_GUID {
+    data1: 0xBDC8E6AF,
+    data2: 0xD9BC,
+    data3: 0x4379,
+    data4: [0xA7, 0x2A, 0xE0, 0xC4, 0xE7, 0x5D, 0xAA, 0x1C],
+};
+
+pub static HTTP_PROTOCOL_GUID: EFI_GUID = EFI_GUID {
+    data1: 0x7A59B29B,
+    data2: 0x910B,
+    data3: 0x4171,
+    data4: [0x82, 0x42, 0x5A, 0x0E, 0xD5, 0xF1, 0x6D, 0xB4],
+};
+
+// ── HTTP protocol types ──
+
+pub type EFI_HTTP_METHOD = u32;
+pub const HTTP_METHOD_GET: EFI_HTTP_METHOD = 0;
+
+pub type EFI_HTTP_VERSION = u32;
+pub const HTTP_VERSION_1_1: EFI_HTTP_VERSION = 1;
+
+#[repr(C)]
+pub struct EFI_IPv4_ADDRESS {
+    pub addr: [u8; 4],
+}
+
+#[repr(C)]
+pub struct EFI_IPv6_ADDRESS {
+    pub addr: [u8; 16],
+}
+
+#[repr(C)]
+pub struct EFI_HTTP_CONFIG_DATA {
+    pub http_version: EFI_HTTP_VERSION,
+    pub time_out: u32,
+    pub local_address_is_ipv6: BOOLEAN,
+    pub access_point: EFI_IPv4_ADDRESS, // simplified: IPv4 only
+}
+
+#[repr(C)]
+pub struct EFI_HTTP_HEADER {
+    pub field_name: *mut u8,  // CHAR8 *
+    pub field_value: *mut u8,  // CHAR8 *
+}
+
+#[repr(C)]
+pub struct EFI_HTTP_REQUEST_DATA {
+    pub method: EFI_HTTP_METHOD,
+    pub url: *mut u16,  // CHAR16 *
+}
+
+#[repr(C)]
+pub struct EFI_HTTP_RESPONSE_DATA {
+    pub status_code: UINTN,
+    pub reason_phrase_size: UINTN,
+    pub reason_phrase: *mut u8,
+    pub headers_size: UINTN,
+    pub headers: *mut EFI_HTTP_HEADER,
+    pub body_length: UINTN,
+    pub body: *mut c_void,
+}
+
+#[repr(C)]
+pub struct EFI_HTTP_MESSAGE {
+    pub revision: u32,
+    pub headers: *mut EFI_HTTP_HEADER,
+    pub header_count: UINTN,
+    pub body_length: UINTN,
+    pub body: *mut c_void,
+}
+
+// Function pointer types for HTTP protocol
+pub type HttpGetModeDataFn = unsafe extern "efiapi" fn(
+    this: *mut c_void,
+    http_mode_data: *mut c_void,
+) -> EFI_STATUS;
+
+pub type HttpConfigureFn = unsafe extern "efiapi" fn(
+    this: *mut c_void,
+    http_config_data: *mut EFI_HTTP_CONFIG_DATA,
+) -> EFI_STATUS;
+
+pub type HttpRequestFn = unsafe extern "efiapi" fn(
+    this: *mut c_void,
+    request_data: *mut EFI_HTTP_REQUEST_DATA,
+    request_message: *mut EFI_HTTP_MESSAGE,
+) -> EFI_STATUS;
+
+pub type HttpResponseFn = unsafe extern "efiapi" fn(
+    this: *mut c_void,
+    timeout: UINTN,
+    response_message: *mut EFI_HTTP_MESSAGE,
+) -> EFI_STATUS;
+
+#[repr(C)]
+pub struct EFI_HTTP_PROTOCOL {
+    pub get_mode_data: *mut c_void,
+    pub configure: HttpConfigureFn,
+    pub request: HttpRequestFn,
+    pub cancel: *mut c_void,
+    pub response: HttpResponseFn,
+    pub poll: *mut c_void,
+}
+
+// Service binding
+pub type ServiceBindingCreateChildFn = unsafe extern "efiapi" fn(
+    this: *mut c_void,
+    child_handle: *mut EFI_HANDLE,
+) -> EFI_STATUS;
+
+pub type ServiceBindingDestroyChildFn = unsafe extern "efiapi" fn(
+    this: *mut c_void,
+    child_handle: EFI_HANDLE,
+) -> EFI_STATUS;
+
+#[repr(C)]
+pub struct EFI_HTTP_SERVICE_BINDING_PROTOCOL {
+    pub create_child: ServiceBindingCreateChildFn,
+    pub destroy_child: ServiceBindingDestroyChildFn,
+}
+
 pub type EFI_EVENT = *mut c_void;
 
 #[repr(C)]

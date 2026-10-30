@@ -4,7 +4,7 @@
 [org 0x7C00]
 [bits 16]
 
-TOTAL_SECTORS equ 400
+TOTAL_SECTORS equ 450
 MAX_CHUNK     equ 127
 
 ; Offset 0x00: "MZ" signature for PE compatibility
