@@ -233,7 +233,7 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `common/src/menu.rs` — Shared menu logic
 
-- `MenuAction` enum: `StorageScan` / `NetworkBoot` / `LuaShell`.
+- `MenuAction` enum: `StorageScan` / `NetworkBoot` / `LuaShell` / `HardDiskBoot`.
 - `show_menu(puts, putc, get_key)` prints `[1]/[2]/[3]` and polls `get_key` until the user presses a valid choice.
 - `puts`/`putc` are function pointers, so the same function can be used with ASCII (UART/BIOS) and UEFI (wrapped to u16 `OutputString`) output.
 
@@ -699,3 +699,71 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 - **Rust nightly**: needed for `i386-bios` target (`-Zjson-target-spec -Zbuild-std=core`)
 - **BIOS**: `nasm` (assembles the MBR and entry stub), `objcopy` (strips the Rust ELF to a flat binary)
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `/usr/share/edk2/aarch64/QEMU_EFI.fd`)
+
+## New Features & Learnings (Boot from Hard Disk)
+
+### `common/src/menu.rs` — Menu now has 4 options
+
+- `MenuAction` enum: added `HardDiskBoot` variant.
+- `show_menu` prints `[4] Boot from hard disk` and handles key `'4'`.
+- All targets updated to match the new variant (UEFI/ARM64/native print "not supported").
+
+### `bios/src/stage2_entry.nasm` — Real-mode trampoline for chain-loading
+
+- Added a 16-bit code segment (selector `0x18`) to the GDT for protected-mode→real-mode switching.
+- Added `real_idt` (base 0, limit 0x3FF) for real-mode interrupt handling.
+- Added `boot_hard_disk` trampoline: switches from 32-bit PM to 16-bit PM to real mode, then:
+  1. Reads sector 0 (MBR) of the disk.
+  2. If it's rustrapper's own MBR (starts with `MZ` = `0x5A4D`), parses the partition table at offset `0x1BE`, finds the active partition (status `0x80`), reads its VBR using CHS from the partition entry, and jumps to `0x7C00`.
+  3. If it's a foreign MBR, checks `0xAA55` signature and jumps to `0x7C00` directly.
+  4. If no valid MBR, prints `N` and halts.
+- The trampoline address is passed to `_start` as a 4th argument (`bootdisk_fn: u32`).
+- `_start` signature updated: `_start(boot_drive, e820_addr, e820_count, bootdisk_fn)`.
+
+### `bios/src/main.rs` — Boot from hard disk handler
+
+- `boot_from_hard_disk()` transmutes `BOOTDISK_FN` to a function pointer and calls it (never returns).
+- Menu dispatch: `MenuAction::HardDiskBoot => { print; boot_from_hard_disk(); }`.
+
+### `native/src/fetch.rs` — Embedded files build parameter
+
+- New `build.rs` reads `RUSTRAPPER_EMBED` (comma-separated `name=path` pairs) and `RUSTRAPPER_EMBED_DIR` (directory of files) env vars at build time.
+- Files are embedded via `include_bytes!` into a generated `embedded.rs` in `OUT_DIR`.
+- `init_embedded()` populates the pseudo-filesystem (`FILES`) at startup.
+- `record_embedded(state)` records embedded files in the Lua state's `ls` list so they show up in `ls()`.
+- Makefile `native`/`lua` targets pass through `RUSTRAPPER_EMBED` / `RUSTRAPPER_EMBED_DIR`.
+
+### Integration tests (`tests/integration/`)
+
+- `conftest.py`: session-scoped PXE server fixture, `spawn()`, `boot_and_select()`, `cleanup()` helpers.
+- `test_bios_smoke.py`: BIOS boot → Lua shell → `print(1 + 2)` → `3`.
+- `test_bios_pxe.py`: BIOS PXE end-to-end (menu `[2]` → DHCP → TFTP → execute `test.lua`).
+- `test_uefi_smoke.py`, `test_uefi_pxe.py`, `test_arm64_smoke.py`: UEFI/ARM64 smoke + PXE tests.
+- Uses `expect_exact` (not regex) for patterns with special chars like `fib(10) = 55`.
+- `requirements-integration.txt` + `.venv/` venv management in Makefile (`test-integration-venv`, `test-integration`).
+- `pxe-sync` target syncs `tftp-root/` into the OpenWrt image via debugfs.
+
+### Makefile changes
+
+- `run-i386-bios` now uses a single disk (`bios.img`) as drive 0x80.
+- `run-i386-bios-install`: installs FreeDOS onto `bios.img` (overwrites MBR).
+- `restore-mbr`: restores rustrapper's MBR while preserving FreeDOS's partition table.
+- `freedos-iso`: downloads/extracts FreeDOS 1.4 LiveCD ISO.
+- `pxe-sync`: syncs tftp-root into OpenWrt image via debugfs.
+- QEMU 11 compatibility: `-netdev socket,id=net0,...` → `-netdev type=socket,id=net0,...` (QEMU 11 requires `type=` prefix).
+
+### Key gotchas discovered
+
+64. **QEMU 11 netdev syntax**: QEMU 11 requires `-netdev type=socket,id=net0,connect=...` instead of `-netdev socket,id=net0,connect=...`. The old short-form `socket` without `type=` is deprecated and errors out.
+
+65. **FreeDOS VBR in rustrapper's real-mode environment**: The "boot from hard disk" feature successfully chain-loads MBRs (verified with test MBR). However, FreeDOS's VBR fails with a read error ("1") when run in rustrapper's PM-originated real-mode environment. The VBR runs (prints loading dots) but its kernel-loading disk read fails. This is likely because rustrapper's real-mode transition doesn't fully preserve the BIOS environment that FreeDOS's VBR depends on (GRUB solves this with careful CPU state preservation). The feature works for simple bootable disk images.
+
+66. **Partition table coexistence with rustrapper MBR**: rustrapper's MBR (`mbr.asm`) uses bytes 0-205 for code, leaving bytes 206-445 as padding (zeros). The partition table (bytes 446-509) can be written there without overlapping MBR code. However, SeaBIOS may refuse to boot a disk with a partition table whose LBA range exceeds the disk size. The `restore-mbr` target preserves the installer's partition table while restoring rustrapper's MBR code (bytes 0-445).
+
+67. **MBR loads 450 sectors**: `TOTAL_SECTORS` in `mbr.asm` was raised from 400 to 450 to accommodate the Lua interpreter's growth (payload is ~411 sectors). The MBR loads in chunks of ≤127 sectors (SeaBIOS rejects reads >127). Buffer at 0x8000 (384 sectors) — total load is 450 sectors (230400 bytes) ending at 0x3E400, below the EBDA.
+
+68. **Integration test patterns must use `expect_exact`**: pexpect's `expect()` treats strings as regex. Patterns like `fib(10) = 55` contain parentheses (regex grouping) and won't match literally. Use `expect_exact()` for literal string matching.
+
+69. **BIOS MBR truncation was the Lua shell root cause**: When `TOTAL_SECTORS` (400) was smaller than the actual payload (411 sectors), the Rust stage2 was truncated during boot, causing `register_builtins` to not fully run, leaving globals like `io`, `string`, `table`, `math` undefined (nil). Bumping to 450 fixed it.
+
+70. **`ls` only lists fetch refs, not pseudo-filesystem files**: Embedded files (from `RUSTRAPPER_EMBED`) are in the pseudo-filesystem (`FILES`) but not in the `ls` list until `record_embedded()` is called to intern their names and record them as fetch refs. Without this, `ls()` doesn't show embedded files even though `io.open()` can read them.

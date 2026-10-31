@@ -41,8 +41,21 @@ fn dhcp_fn() -> Option<fn(source: &str, save_as: &str) -> Option<usize>> {
 }
 
 #[cfg(not(test))]
+static mut BOOTDISK_FN: u32 = 0;
+
+#[cfg(not(test))]
+pub fn boot_from_hard_disk() -> ! {
+    // Chain-load the hard disk MBR (real-mode switch in trampoline).
+    unsafe {
+        let f: extern "C" fn() -> ! = core::mem::transmute(BOOTDISK_FN);
+        f()
+    }
+}
+
+#[cfg(not(test))]
 #[no_mangle]
-pub extern "C" fn _start(_boot_drive: u32, e820_addr: u32, e820_count: u32) -> ! {
+pub extern "C" fn _start(_boot_drive: u32, e820_addr: u32, e820_count: u32, bootdisk_fn: u32) -> ! {
+    unsafe { BOOTDISK_FN = bootdisk_fn; }
     mem::init(e820_addr, e820_count);
     print::init(dual_putc);
     print::puts("\nRustrapper BIOS Stage2 (Rust)\n");
@@ -57,6 +70,10 @@ pub extern "C" fn _start(_boot_drive: u32, e820_addr: u32, e820_count: u32) -> !
             MenuAction::NetworkBoot => {
                 print::puts("\n");
                 net::scan_network();
+            }
+            MenuAction::HardDiskBoot => {
+                print::puts("\nBooting from hard disk...\n");
+                boot_from_hard_disk();
             }
             MenuAction::LuaShell => {
                 let mut state = lua::LuaState::new();

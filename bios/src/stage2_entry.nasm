@@ -96,9 +96,10 @@ pmode_start:
     rep stosb
     serial 'Z'
 
-    ; Call Rust: _start(boot_drive, e820_addr, e820_count) — cdecl, so the
-    ; rightmost argument is pushed first.
+    ; Call Rust: _start(boot_drive, e820_addr, e820_count, bootdisk_fn) —
+    ; cdecl, so the rightmost argument is pushed first.
     cli
+    push dword boot_hard_disk
     push dword [e820_count]
     mov eax, E820_ADDR
     push eax
@@ -106,6 +107,63 @@ pmode_start:
     mov eax, 0x100000
     call eax
     serial 'E'  ; Should never reach here
+
+; ── Boot from hard disk: chainload MBR at 0x7C00 ────────────────
+boot_hard_disk:
+    [bits 32]
+    cli
+    jmp 0x18:boot_hard_disk_16
+    [bits 16]
+boot_hard_disk_16:
+    lidt [real_idt]
+    o32 mov eax, cr0
+    and al, 0xFE
+    o32 mov cr0, eax
+    jmp 0x0000:boot_hard_disk_real
+boot_hard_disk_real:
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+    mov dl, 0x80
+    ; Read MBR of drive 0x80
+    mov ah, 0x02
+    mov al, 1
+    mov ch, 0
+    mov cl, 1
+    mov dh, 0
+    mov bx, 0x7C00
+    int 0x13
+    jc .fail
+    ; If rustrapper's own MBR, find active partition
+    cmp word [0x7C00], 0x5A4D
+    jne .boot_mbr
+    mov si, 0x7C00 + 0x1BE
+    mov cx, 4
+.part_loop:
+    cmp byte [si], 0x80
+    je .found
+    add si, 16
+    loop .part_loop
+    jmp .fail
+.found:
+    ; Use CHS from partition table entry (offset 1-3)
+    mov dh, [si+1]
+    mov cx, [si+2]
+    mov ah, 0x02
+    mov al, 1
+    mov bx, 0x7C00
+    int 0x13
+    jc .fail
+.boot_mbr:
+    cmp word [0x7C00+510], 0xAA55
+    jne .fail
+    sti
+    jmp 0x0000:0x7C00
+.fail:
+    hlt
+    jmp .fail
 
 [bits 16]
 ; ── E820 memory map capture (real mode) ───────────────────────────────
@@ -177,9 +235,14 @@ BSS_ZERO_SIZE     equ 0x5000
 
 gdt:
     dq 0                    ; Null
-    dw 0xFFFF, 0x0000, 0x9A00, 0x00CF  ; Code (base 0, limit 4G, 32-bit)
-    dw 0xFFFF, 0x0000, 0x9200, 0x00CF  ; Data (base 0, limit 4G, writable)
+    dw 0xFFFF, 0x0000, 0x9A00, 0x00CF  ; 0x08 Code (base 0, limit 4G, 32-bit)
+    dw 0xFFFF, 0x0000, 0x9200, 0x00CF  ; 0x10 Data (base 0, limit 4G, writable)
+    dw 0xFFFF, 0x0000, 0x9A00, 0x0000  ; 0x18 Code (base 0, limit 64K, 16-bit)
 gdt_end:
+
+real_idt:
+    dw 0x03FF
+    dd 0x00000000
 
 gdtr:
     dw gdt_end - gdt - 1

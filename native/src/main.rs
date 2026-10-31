@@ -65,6 +65,7 @@ fn menu_get_key() -> Option<u8> {
 
 fn main() {
     term::init();
+    fetch::init_embedded();
     print::puts("\nRustrapper Native (Linux x86_64)\n");
 
     loop {
@@ -77,9 +78,14 @@ fn main() {
                 print::puts("\n");
                 net::network_boot();
             }
+            MenuAction::HardDiskBoot => {
+                print::puts("Hard disk boot not supported on this target.\n");
+            }
             MenuAction::LuaShell => {
+                fetch::init_embedded();
                 let mut state = lua::LuaState::new();
                 state.register_builtins(print::putc);
+                fetch::record_embedded(&mut state);
                 state.set_fetch(None);
                 state.set_dhcp(Some(net::dhcp_fn));
                 state.set_load(Some(fetch::load_file));

@@ -68,6 +68,9 @@ pub extern "C" fn main() -> ! {
                 print::puts("\n");
                 net::scan_network();
             }
+            MenuAction::HardDiskBoot => {
+                // Not supported on bare-metal ARM64 target.
+            }
             MenuAction::LuaShell => {
                 let mut state = lua::LuaState::new();
                 state.register_builtins(common::print::putc);

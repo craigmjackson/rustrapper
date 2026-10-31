@@ -204,6 +204,10 @@ fn boot_loop(image_handle: EFI_HANDLE, system_table: &'static EFI_SYSTEM_TABLE) 
         match show_menu(u16_puts, u16_putc, get_key) {
             MenuAction::StorageScan => scan::scan_storage_devices(image_handle, system_table),
             MenuAction::NetworkBoot => net::scan_network_devices(image_handle, system_table),
+            MenuAction::HardDiskBoot => {
+                // Not supported on UEFI target.
+                u16_puts("Hard disk boot not supported on this target.\n");
+            }
             MenuAction::LuaShell => {
                 let mut state = lua::LuaState::new();
                 state.register_builtins(u16_putc);

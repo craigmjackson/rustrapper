@@ -34,8 +34,8 @@ $(BIN):
 # ── Native Linux (host x86_64) ────────────────────────────────────────────
 # Runs the same menu + Lua interpreter as the firmware targets, with the
 # kernel handling networking. Fast iteration on the Lua interpreter.
-native: $(shell find native common lua -name '*.rs') Cargo.toml | $(BIN)
-	CARGO_TARGET_DIR=target $(CARGO) build --package native --release
+native: $(shell find native common lua -name '*.rs') Cargo.toml native/build.rs | $(BIN)
+	CARGO_TARGET_DIR=target RUSTRAPPER_EMBED="$(RUSTRAPPER_EMBED)" RUSTRAPPER_EMBED_DIR="$(RUSTRAPPER_EMBED_DIR)" $(CARGO) build --package native --release
 	cp target/release/native $(BIN)/rustrapper_native
 
 run-native: native
@@ -155,6 +155,14 @@ $(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
 	dd if=$(BIN)/bios.bin of=$@ conv=notrunc 2>/dev/null
 	dd if=$(BIN)/stage2_entry.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
 
+# ── Hard-disk image (for FreeDOS / storage-scan testing) ─────────────
+# A raw 100 MB disk image attached as a second drive to run-i386-bios so
+# the bootloader's storage scan and (optionally) FreeDOS have a real disk.
+HDD_IMG := $(BIN)/hdd.img
+$(HDD_IMG): | $(BIN)
+	dd if=/dev/zero bs=1M count=100 of=$@ 2>/dev/null
+	@echo "Created blank hard-disk image: $@"
+
 # ── Run targets ──────────────────────────────────────────────────
 # All targets use -nographic (Ctrl-A X to exit). QEMU's e1000 I/O BAR is a
 # stub (see AGENTS.md gotcha), so the Rust stage2's direct e1000 driver uses
@@ -164,10 +172,31 @@ $(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
 run-i386-bios: TARGET := run-i386-bios
 run-i386-bios: $(BIN)/bios.img pxe-start check-deps
 	qemu-system-x86_64 -boot order=c \
-		-drive file=$(BIN)/bios.img,format=raw \
-		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-drive file=$(BIN)/bios.img,format=raw,if=ide,index=0 \
+		-netdev socket=id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:57 \
 		-nographic
+
+# ── FreeDOS installer ────────────────────────────────────────────
+# Boots the FreeDOS 1.4 LiveCD with the hard-disk image attached so the
+# installer can format and install FreeDOS onto it. Run once, then exit.
+# Requires the FreeDOS ISO (run `make freedos-iso` first).
+freedos-iso:
+	@if [ ! -f FD14LIVE.iso ]; then ./setup-freedos.sh; fi
+	@test -f FD14LIVE.iso || (echo "FD14LIVE.iso missing"; exit 1)
+
+run-i386-bios-install: $(BIN)/bios.img freedos-iso check-deps
+	qemu-system-x86_64 -boot order=d \
+		-drive file=$(BIN)/bios.img,format=raw,if=ide,index=0 \
+		-cdrom FD14LIVE.iso \
+		# -nographic
+
+# Restore rustrapper MBR to bios.img after FreeDOS installation
+# (FreeDOS installer overwrites sector 0 with its own MBR)
+restore-mbr: $(BIN)/bios.bin | $(BIN)
+	@python3 -c "d=bytearray(open('$(BIN)/bios.img','rb').read()); m=open('$(BIN)/bios.bin','rb').read(); d[:446]=m[:446]; open('$(BIN)/bios.img','wb').write(d); print('Restored rustrapper MBR (preserved partition table)')"
+	@echo "Done. rustrapper MBR restored to bios.img"
+
 
 # ── UEFI FAT root ────────────────────────────────────────────────
 # FAT drive for UEFI run targets. Contains only the EFI boot files so the

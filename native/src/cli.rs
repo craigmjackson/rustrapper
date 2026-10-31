@@ -27,8 +27,10 @@ fn run_script(path: &str) -> ! {
             std::process::exit(1);
         }
     };
+    fetch::init_embedded();
     print::init(term::raw_putc);
     let mut state = lua::LuaState::new();
+    fetch::record_embedded(&mut state);
     state.set_dhcp(Some(net::dhcp_fn));
     state.set_dhcp_info(Some(fetch::dhcp_info));
     state.set_dhcp_values(Some(fetch::dhcp_values));
@@ -54,8 +56,10 @@ fn run_script(path: &str) -> ! {
 /// first to enable `fetch()` / `dofile()`.
 fn run_repl() -> ! {
     term::init();
+    fetch::init_embedded();
     print::puts("Rustrapper Lua\n");
     let mut state = lua::LuaState::new();
+    fetch::record_embedded(&mut state);
     state.register_builtins(print::putc);
     state.set_fetch(Some(fetch::fetch_file));
     state.set_dhcp(Some(net::dhcp_fn));
