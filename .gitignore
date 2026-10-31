@@ -1,5 +1,6 @@
 target/
 bin/
+.venv/
 build/
 # The native package's Lua CLI source lives in src/bin/ (Cargo convention);
 # keep the top-level build output ignored but track that source directory.

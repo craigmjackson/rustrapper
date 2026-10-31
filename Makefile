@@ -61,6 +61,18 @@ run-lua-https: lua-https
 run-lua: lua
 	./$(BIN)/lua $(SCRIPT)
 
+# ── Integration tests (QEMU boot + PXE end-to-end) ────────────────────────
+# Uses a project-local venv (.venv) so pytest/pexpect are never installed
+# globally.  Makefile is the source of truth for QEMU flags (tests spawn
+# `make run-<target>`).
+requirements-integration.txt: ;
+test-integration-venv:
+	python3 -m venv .venv
+	.venv/bin/pip install --upgrade -r requirements-integration.txt
+
+test-integration: test-integration-venv
+	.venv/bin/pytest tests/integration -v
+
 # ── BIOS MBR (stage-1, 512 bytes, NASM) ──────────────────────────
 # Loads 256 sectors (LBA 1-256, 131072 bytes) to 0x8000 and jumps there.
 # The 512-byte stub at 0x8000 (stage2_entry.nasm) then takes over.
@@ -229,6 +241,7 @@ tftp-root: $(BIN)/rustrapper.efi $(BIN)/rust_payload.bin
 pxe-start: openwrt tftp-root
 	@echo "Starting OpenWrt PXE server..."
 	@make -s pxe-stop 2>/dev/null || true
+	@make -s pxe-sync
 	qemu-system-x86_64 \
 		-drive file=openwrt,format=raw \
 		-netdev socket,id=net0,listen=127.0.0.1:43210 \
@@ -238,6 +251,24 @@ pxe-start: openwrt tftp-root
 	@echo "Waiting for OpenWrt to boot..."
 	@sleep 30
 	@echo "PXE server ready"
+
+# Sync tftp-root/ into the OpenWrt image's /tftpboot via debugfs so the VM
+# serves the freshly built bootloader and test files.
+pxe-sync:
+	@if [ ! -f .openwrt-configured ]; then echo "OpenWrt not configured; run ./setup-openwrt.sh first"; exit 1; fi
+	@PART2_FILE=$$(mktemp); \
+	dd if=openwrt of=$$PART2_FILE bs=512 skip=33792 count=212992 2>/dev/null; \
+	debugfs -w -R "mkdir /tftpboot" $$PART2_FILE 2>/dev/null || true; \
+	for f in tftp-root/*; do \
+		if [ -f "$$f" ]; then \
+			bn=$$(basename $$f); \
+			debugfs -w -R "rm /tftpboot/$$bn" $$PART2_FILE 2>/dev/null || true; \
+			debugfs -w -R "write $$f /tftpboot/$$bn" $$PART2_FILE 2>/dev/null; \
+		fi; \
+	done; \
+	dd if=$$PART2_FILE of=openwrt bs=512 seek=33792 count=212992 conv=notrunc 2>/dev/null; \
+	rm -f $$PART2_FILE; \
+	echo "PXE sync done"
 
 pxe-stop:
 	@if [ -f pxe-server.pid ]; then \
