@@ -3,14 +3,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A hybrid BIOS/UEFI bootloader written entirely in Rust. Scans storage devices
-and network adapters from a boot menu, PXE-boots over TFTP, and includes a
+and network adapters from a boot menu, PXE-boots over TFTP, chain-loads an
+installed OS (FreeDOS verified) from the hard disk, and includes a
 built-in no_std Lua interpreter that can run interactive shells and execute
 `.lua` scripts fetched over the network.
 
 Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applications,
 ARM64 bare-metal binaries, PCI expansion ROMs, and a native Linux x86_64 binary.
 The only non-Rust code is a tiny 16-bit MBR and protected-mode entry stub in
-NASM (~1 KB total). The firmware crates use no external crates; the native
+NASM (~1.6 KB total). The firmware crates use no external crates; the native
 target links only the shared `common` and `lua` crates.
 
 ## Features
@@ -25,6 +26,7 @@ target links only the shared `common` and `lua` crates.
 - **Native Linux** — Same menu + Lua interpreter as a host binary; the kernel handles networking (`make run-native`). `make lua` builds a standalone `bin/lua` shell / script runner that skips the menu
 - **Lua interpreter** — no_std, no heap, fixed static buffers. A `[3] Lua Shell` menu entry and PXE `.lua` scripts run the same interpreter (`dhcp`, `fetch()`, `global`, `local`, tables, functions, loops)
 - **PXE Boot** — DHCP options 66/67, TFTP client (RFC 1350), executes PE/COFF/ELF32/ELF64/Multiboot and `.lua` scripts
+- **OS chain-loading** — `[4] Boot from hard disk` boots an installed OS (FreeDOS 1.4 verified): the entry stub chain-loads the active partition's VBR with a BIOS-IPL-style real-mode handoff. `make freedos-install` installs FreeDOS onto `bin/bios.img` from the host in one step
 
 ## Quick Start
 
@@ -42,6 +44,11 @@ make run-x86_64-uefi              # x86_64 UEFI in QEMU (e1000 NIC, full DHCP, P
 make run-aarch64-bare             # ARM64 bare-metal + AHCI drive
 make run-native                   # Run the native Linux binary (no QEMU)
 make run-lua                      # Standalone Lua shell on the host (no QEMU)
+
+# Boot an OS from the virtual hard disk (FreeDOS):
+make freedos-iso                  # One-time: download the FreeDOS 1.4 LiveCD ISO
+make freedos-install              # Install FreeDOS onto bin/bios.img (host-side, scripted)
+make run-i386-bios                # then choose menu [4] Boot from hard disk
 ```
 
 The firmware `run-*` targets automatically start an OpenWrt VM as the
@@ -60,12 +67,14 @@ Lua demo (`test.lua`), and a test file.
 | `make i386-bios-rom`   | `bin/rustrapper_bios.rom`                      | PCI expansion ROM (BIOS option ROM) |
 | `make native`          | `bin/rustrapper_native`                        | Native Linux x86_64 binary          |
 | `make lua`             | `bin/lua`                                      | Standalone Lua shell / script runner |
+| `make freedos-install` | `bin/bios.img` (+ FreeDOS)                     | Install FreeDOS 1.4 onto the BIOS disk image |
 
 ## Run in QEMU
 
 ```bash
 make run-i386-bios                # Legacy BIOS stage2 (serial, Ctrl-A X to exit)
 make run-i386-bios-rom            # Legacy BIOS with PCI expansion ROM (rust_payload.bin)
+make run-i386-bios-install        # Boot the FreeDOS 1.4 LiveCD to install onto bin/bios.img
 make run-x86_64-uefi              # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP)
 make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM (direct e1000 MMIO)
 make run-aarch64-uefi             # ARM64 UEFI (e1000 NIC via direct PCI scan)
@@ -79,6 +88,38 @@ All firmware run targets use `-nographic` (Ctrl-A X to exit) and need the
 OpenWrt PXE server (started automatically via `pxe-start`). The native target
 runs directly on the host; type `dhcp` in the Lua shell to set up networking.
 
+## Booting an OS (FreeDOS)
+
+Menu choice `[4] Boot from hard disk` chain-loads the active partition's boot
+sector the way a BIOS IPL would (LBA reads via INT 13h AH=42h, real-mode
+handoff with DL = boot drive). FreeDOS 1.4 is the verified guest:
+
+```bash
+make i386-bios                    # builds bin/bios.img (rustrapper MBR + stage2,
+                                  # pre-partitioned: active FAT16 at LBA 2048)
+make freedos-iso                  # one-time: fetch FD14LIVE.iso
+make freedos-install              # format + install KERNEL.SYS/COMMAND.COM (host-side)
+make run-i386-bios                # menu [4] -> FreeDOS kernel -> C:\> shell
+```
+
+The installed image includes a minimal `AUTOEXEC.BAT` that runs `CTTY COM1`,
+so the FreeDOS shell is fully interactive over the `-nographic` serial console.
+
+Two details matter for coexistence with the bootloader (see AGENTS.md gotcha 65):
+
+- The FAT16 partition starts at **LBA 2048**, past the MBR's 450‑sector stage2
+  load area — an install whose filesystem begins at LBA 63 overwrites the
+  bootloader on disk and the next boot triple-faults.
+- `make freedos-install` is scripted (`install-freedos.sh` + the FreeDOS 1.4
+  boot-sector code in `freedos/bootsect.bin`); the interactive alternative
+  (`make run-i386-bios-install`) works too, but **skip the FDISK step** so the
+  pre-made LBA-2048 partition is kept, and run `make restore-mbr` afterwards
+  (it restores rustrapper's MBR code and warns if the partition overlaps the
+  stage2 area).
+
+Rebuilding `bin/bios.img` (e.g. `make i386-bios`) recreates the disk from
+scratch — re-run `make freedos-install` afterwards.
+
 ## Lua Shell
 
 Every target presents a menu:
@@ -88,6 +129,7 @@ Menu:
   [1] List storage devices
   [2] Boot from network
   [3] Lua Shell
+  [4] Boot from hard disk
 Choose:
 ```
 
@@ -150,7 +192,6 @@ Builtins:
 - `math.ceil(x)` / `math.floor(x)` / `math.maxinteger` / `math.mininteger` / `math.random([m [, n]])` / `math.randomseed(x)` / `math.tointeger(x)` / `math.type(x)` — the math library (ceil, floor, max/min integer, random, randomseed, tointeger, type)
 - `io.close([f])` / `io.flush([f])` / `io.input([f])` / `io.lines([name])` / `io.open(name [, mode])` / `io.output([f])` / `io.read(...)` / `io.tmpfile()` / `io.type(obj)` / `io.write(...)` — the io library, operating on the pseudo-filesystem of fetched files (read/write to in-memory files and stdout)
 - **Embedded files (native target)** — bake files into the pseudo-filesystem at build time so `io.open()` / `dofile()` can read them without networking: set `RUSTRAPPER_EMBED="name=path,..."` (comma-separated `name=path` pairs; a bare path uses its basename as the name) or `RUSTRAPPER_EMBED_DIR=/path/to/dir` (embeds every file in that directory) when building, e.g. `RUSTRAPPER_EMBED_DIR=./assets cargo build -p native` or `make native RUSTRAPPER_EMBED_DIR=./assets`. Embedded files appear in `ls` alongside fetched ones.
-- `os.exit([code [, close]])` / `os.remove(filename)` / `os.rename(oldname, newname)` — the os library (exit the interpreter; remove/rename files in the pseudo-filesystem on the native target)
 - `os.exit([code [, close]])` / `os.remove(filename)` / `os.rename(oldname, newname)` — the os library (exit the interpreter; remove/rename files in the pseudo-filesystem on the native target)
 - `setmetatable(table, metatable|nil)` — store/remove a table's metatable and return the table; dispatched metamethods: `__index`, `__newindex`, `__eq`, `__lt`, `__le`, `__concat`, `__add`/`__sub`/`__mul`/`__div`/`__mod`, `__unm`, `__call`, `__tostring`, `__pairs`; a `__metatable` field protects it
 - `rawequal(v1, v2)` — primitive equality, never `__eq`
@@ -249,6 +290,7 @@ directory. This needs no root privileges and no external TFTP server.
 │       ├── pci.rs      # PCI scan via I/O ports 0xCF8/0xCFC
 │       ├── net.rs      # PCI + e1000 scan, DHCP, PXE boot (thin wrapper over common)
 │       ├── mem.rs      # E820 map + TFTP buffer region selection (captured by the stub)
+│       ├── fetch.rs    # Lua `dhcp`/`fetch()`/`dofile()` host callbacks (static slots)
 │       └── loader.rs   # ELF32/Multiboot execution
 ├── uefi/               # Rust UEFI binary (x86_64 + ARM64)
 │   └── src/
@@ -278,6 +320,8 @@ directory. This needs no root privileges and no external TFTP server.
 │       ├── net.rs      # Kernel networking: gateway/IP from /proc + std UDP TFTP client
 │       └── fetch.rs    # Lua `dhcp` + `fetch()` host callbacks (std Mutex)
 ├── romwrap/            # CLI tool: wraps PE/COFF into PCI option ROM
+├── freedos/            # FreeDOS install resources (bootsect.bin: FAT16 VBR code)
+├── install-freedos.sh  # Host-side FreeDOS install into bin/bios.img (make freedos-install)
 ├── tftp-root/          # Files served via the OpenWrt PXE server (auto-generated)
 ├── Makefile            # Build orchestration
 └── AGENTS.md           # Full development reference & gotchas
@@ -294,7 +338,7 @@ cargo test --workspace   # 313 tests across all crates
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
-| `lua`        | 129   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `string.gmatch`, `string.gsub`, `string.len`, `string.lower`, `string.match`, `string.pack`/`unpack`, `string.rep`/`reverse`/`sub`/`upper`, `table.*`, `math.*`, `io.*`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
+| `lua`        | 128   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `string.gmatch`, `string.gsub`, `string.len`, `string.lower`, `string.match`, `string.pack`/`unpack`, `string.rep`/`reverse`/`sub`/`upper`, `table.*`, `math.*`, `io.*`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
 | `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |
@@ -306,4 +350,5 @@ cargo test --workspace   # 313 tests across all crates
 - **Rust** with targets: `x86_64-unknown-uefi`, `aarch64-unknown-uefi`, `aarch64-unknown-none`, `i386-bios` (needs nightly `-Zjson-target-spec` and `-Zbuild-std=core`)
 - **BIOS**: `nasm` and `objcopy` (for assembling the MBR/entry stub and stripping the ELF to a flat binary)
 - **Testing**: `qemu-system-x86_64` (with OVMF), `qemu-system-aarch64` (with `QEMU_EFI.fd`)
+- **FreeDOS install** (`make freedos-install`): `mtools` (`mformat`/`mcopy`) and `bsdtar` (libarchive) to extract files from the LiveCD ISO
 - **Native target**: no extra dependencies (std only); an OpenWrt VM image is fetched by `setup-openwrt.sh` for the `run-*` PXE server

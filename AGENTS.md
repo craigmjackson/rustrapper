@@ -76,6 +76,9 @@ Produces legacy BIOS (MBR+stage2) binaries, x86_64 UEFI and ARM64 EFI applicatio
 │   ├── Cargo.toml
 │   └── src/
 │       └── main.rs         # Wraps PE/COFF → PCI option ROM with PCIR header
+├── freedos/                # FreeDOS install resources
+│   └── bootsect.bin        # FreeDOS 1.4 FAT16 VBR code (used by install-freedos.sh)
+├── install-freedos.sh      # Host-side FreeDOS install into bin/bios.img (make freedos-install)
 ├── native/                 # Native Linux x86_64 binaries (std, no_std deps)
 │   ├── Cargo.toml          # Depends only on common + lua (no external crates)
 │   └── src/
@@ -246,18 +249,19 @@ The following details apply to the common e1000 driver used by all three targets
 
 ### `bios/src/stage2_entry.nasm` — BIOS entry stub for Rust stage2
 
-- Loaded by MBR at physical `0x8000` (part of the 384-sector load, read in ≤127-sector chunks). First 512 bytes are the stub itself; the Rust payload (`incbin`'d) follows at offset 512.
-- `[org 0x8000]` matches the MBR load address, so all symbol references (GDT, `gdtr`, `boot_drive`) are correctly relocated. Stack is set to `0x7C00` (below the stub, above the MBR area).
+- Loaded by MBR at physical `0x8000` (part of the 450-sector load, read in ≤127-sector chunks). The entry stub runs first; the Rust payload (`incbin`'d) follows it and is copied to `0x100000`. The stub is NOT limited to 512 bytes (currently ~1.1 KB) — the MBR loads stub+payload as one blob — but every byte of it must stay below `0x10000` (the real-mode code and the 16-bit PM code segment use 16-bit offsets).
+- `[org 0x8000]` matches the MBR load address, so all symbol references (GDT, `gdtr`, `boot_drive`, `dap`) are correctly relocated. Stack is set to `0x7C00` (below the stub, above the MBR area).
 - **Captures the BIOS E820 memory map while still in real mode** (`e820_capture`: INT 15h/AX=E820/'SMAP', EBX continuation, up to 64 24-byte entries pre-zeroed at `0x500`). INT 15h cannot be called after the protected-mode switch (no IDT), so this must happen here; the address/count are passed to `_start`. The routine is assembled `[bits 16]` even though it sits after the `[bits 32]` PM code.
 - Enables A20 gate (fast method via port `0x92`).
-- Loads a minimal GDT (32-bit code/data segments, flat at 0-4G).
+- Loads a minimal GDT (32-bit code/data segments, flat at 0-4G; selector 0x18 is 16-bit code for the PM→real switch).
 - Enters protected mode via `mov cr0, eax; jmp 0x08:pmode_start`.
-- Copies Rust payload from `0x8200` (stub + 512) → `0x100000` using `rep movsb`.
+- Copies Rust payload from `__payload_start` → `0x100000` using `rep movsb` (the label, not a hard-coded `0x8200`).
 - Zeros 0x5000 bytes of BSS immediately after the payload with `rep stosb`.
 - **Stack must NOT be in BIOS ROM area** (`0xF0000`–`0xFFFFF`). The BIOS ROM is read-only; pushes silently drop, corrupting return addresses, causing triple faults. Stack is at `0x00070000` (low RAM, well below BIOS area).
 - **`cli` before calling Rust**: no IDT is set up in protected mode. A hardware timer interrupt with no IDT causes a triple fault. `cli` disables interrupts for the duration of the Rust code.
-- Pushes `boot_drive`, the E820 map address (a constant), and the E820 count on the stack, then calls `_start` via `call eax` — `_start(boot_drive, e820_addr, e820_count)`.
-- Total size = 512 B stub + Rust payload (currently ~127 KB = 255 sectors total, under the 384-sector load).
+- Pushes `boot_drive`, the E820 map address (a constant), and the E820 count on the stack, then calls `_start` via `call eax` — `_start(boot_drive, e820_addr, e820_count, bootdisk_fn)`.
+- **`boot_hard_disk`** (the `bootdisk_fn` trampoline): 32-bit PM → 16-bit PM (GDT selector 0x18) → real mode, then reads sector 0 of the boot drive via INT 13h AH=42h (LBA, DAP in the stub's data; CHS fallback) at `0x0000:0x7C00`. If the MBR starts with "MZ" (rustrapper's own, not bootable code) it finds the active partition entry and loads its VBR from the entry's LBA start (CHS fallback from the entry bytes). It validates `0xAA55` and hands off like a BIOS IPL: DF clear, IF on, DS/ES/FS/GS/SS = 0, SS:SP = `0x0000:0x7C00`, DL = boot drive, BX = 0 (so INT 10h output lands on video page 0). Before the jump it scrubs the bootloader's scratch memory (`0x500`-`0x7BFF` and `0x8300`-`0x3B2AC`, keeping its own `0x8000`-`0x82FF` code/data) and clears the stale high halves of ESP/EBP — both required for FreeDOS's kernel to boot (gotcha 65b). A failure prints `F` to COM1 and halts.
+- Total size = ~1.1 KB stub + Rust payload (~205 KB) = ~207 KB = 405 sectors, under the 450-sector load.
 
 ### `bios/src/main.rs` — Rust BIOS stage2 entry
 
@@ -629,6 +633,10 @@ make i386-bios-rom               # Build BIOS PCI expansion ROM from rust_payloa
 make native                      # Build native Linux x86_64 binary
 make run-i386-bios                # BIOS stage2 (serial, Ctrl-A X to exit)
 make run-i386-bios-rom            # Legacy BIOS with PCI expansion ROM (rust_payload.bin)
+make run-i386-bios-install        # Interactive FreeDOS install from the LiveCD (skip FDISK!)
+make freedos-iso                  # Download/extract the FreeDOS 1.4 LiveCD ISO
+make freedos-install              # Host-side FreeDOS install into bin/bios.img (LBA 2048)
+make restore-mbr                  # Restore rustrapper MBR after an interactive FreeDOS install
 make run-x86_64-uefi             # x86_64 UEFI via FAT dir (e1000, full DHCP)
 make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
 make run-aarch64-uefi            # ARM64 UEFI from FAT directory
@@ -713,10 +721,11 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 - Added a 16-bit code segment (selector `0x18`) to the GDT for protected-mode→real-mode switching.
 - Added `real_idt` (base 0, limit 0x3FF) for real-mode interrupt handling.
 - Added `boot_hard_disk` trampoline: switches from 32-bit PM to 16-bit PM to real mode, then:
-  1. Reads sector 0 (MBR) of the disk.
-  2. If it's rustrapper's own MBR (starts with `MZ` = `0x5A4D`), parses the partition table at offset `0x1BE`, finds the active partition (status `0x80`), reads its VBR using CHS from the partition entry, and jumps to `0x7C00`.
-  3. If it's a foreign MBR, checks `0xAA55` signature and jumps to `0x7C00` directly.
-  4. If no valid MBR, prints `N` and halts.
+  1. Reads sector 0 (MBR) of the boot drive via INT 13h AH=42h (LBA; CHS fallback) into `0x0000:0x7C00`.
+  2. If it's rustrapper's own MBR (starts with `MZ` = `0x5A4D`), parses the partition table at offset `0x1BE`, finds the active partition (status `0x80`), reads its VBR from the entry's LBA start (CHS fallback), and validates `0xAA55`.
+  3. If it's a foreign MBR, checks the `0xAA55` signature and jumps to `0x7C00` directly.
+  4. If no valid MBR/VBR, prints `F` to COM1 and halts.
+- The handoff mimics a BIOS IPL: DF clear, IF on, DS/ES/FS/GS/SS = 0, SS:SP = `0x0000:0x7C00`, DL = boot drive, BX = 0 (INT 10h output must hit video page 0). Before the jump it scrubs the bootloader's scratch memory (`0x500`-`0x7BFF` and `0x8300`-`0x3B2AC`) and clears the stale high halves of ESP/EBP — both needed for FreeDOS's kernel (gotcha 65b).
 - The trampoline address is passed to `_start` as a 4th argument (`bootdisk_fn: u32`).
 - `_start` signature updated: `_start(boot_drive, e820_addr, e820_count, bootdisk_fn)`.
 
@@ -746,17 +755,23 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 ### Makefile changes
 
 - `run-i386-bios` now uses a single disk (`bios.img`) as drive 0x80.
-- `run-i386-bios-install`: installs FreeDOS onto `bios.img` (overwrites MBR).
-- `restore-mbr`: restores rustrapper's MBR while preserving FreeDOS's partition table.
+- `bin/bios.img` build writes a partition table: one active FAT16 partition at **LBA 2048** (must start past the 450-sector stage2 load area — see gotcha 65).
+- `run-i386-bios-install`: interactive FreeDOS install from the LiveCD onto `bios.img` (overwrites MBR). Since the image is pre-partitioned at LBA 2048, **skip the FDISK/partitioning step** in the installer — only run FORMAT + INSTALL (a partition recreated at sector 63 overlaps the stage2).
+- `freedos-install`: scripted host-side FreeDOS install (`install-freedos.sh`) — `mformat`s the LBA-2048 partition with the FreeDOS 1.4 FAT16 boot-sector code (`freedos/bootsect.bin`, kept via `mformat -B` so the boot code + `KERNEL  SYS` filename survive while the BPB is regenerated with hidden sectors = 2048), then copies `KERNEL.SYS` + `COMMAND.COM` from the LiveCD ISO via `bsdtar`/`mtools`, plus a minimal `CONFIG.SYS`/`AUTOEXEC.BAT`. The AUTOEXEC.BAT runs `CTTY COM1` so FreeDOS's shell is usable over the `-nographic` serial console (the kernel banner itself is VGA-only; QEMU's SeaBIOS mirrors INT 10h output to serial).
+- `restore-mbr`: restores rustrapper's MBR while preserving FreeDOS's partition table; warns if the active partition starts below LBA 451.
 - `freedos-iso`: downloads/extracts FreeDOS 1.4 LiveCD ISO.
 - `pxe-sync`: syncs tftp-root into OpenWrt image via debugfs.
 - QEMU 11 compatibility: `-netdev socket,id=net0,...` → `-netdev type=socket,id=net0,...` (QEMU 11 requires `type=` prefix).
 
 ### Key gotchas discovered
 
-64. **QEMU 11 netdev syntax**: QEMU 11 requires `-netdev type=socket,id=net0,connect=...` instead of `-netdev socket,id=net0,connect=...`. The old short-form `socket` without `type=` is deprecated and errors out.
+64. **QEMU 11 netdev syntax**: QEMU 11 requires `-netdev type=socket,id=net0,connect=...` instead of `-netdev socket,id=net0,connect=...`. The old short-form `socket` without `type=` is deprecated and errors out. Watch for the typo variant `-netdev socket=id=net0` (`=` instead of `,`) too — QEMU parses it as a netdev with no id and fails with `Parameter 'id' is missing`. Fix every occurrence with `type=socket` (grep the Makefile for `netdev socket`).
 
-65. **FreeDOS VBR in rustrapper's real-mode environment**: The "boot from hard disk" feature successfully chain-loads MBRs (verified with test MBR). However, FreeDOS's VBR fails with a read error ("1") when run in rustrapper's PM-originated real-mode environment. The VBR runs (prints loading dots) but its kernel-loading disk read fails. This is likely because rustrapper's real-mode transition doesn't fully preserve the BIOS environment that FreeDOS's VBR depends on (GRUB solves this with careful CPU state preservation). The feature works for simple bootable disk images.
+65. **FreeDOS needs its partition PAST the stage2 load area (LBA 2048)**: rustrapper's MBR loads 450 sectors (LBA 1-450) of stage2 to 0x8000. A FreeDOS install whose FAT16 partition starts at the old CHS default (LBA 63) has its VBR/FAT/root/file data written over the stage2 **on disk**, so the next boot loads a corrupt payload and triple-faults before the menu (symptom: `RM...VAGPCZ` on serial, then reset, in a loop). The `bin/bios.img` Makefile rule now writes a partition table with the active FAT16 partition at **LBA 2048** (1 MiB), and `make freedos-install` formats/installs there host-side. `make restore-mbr` warns if the active partition starts below LBA 451.
+
+65b. **The FreeDOS kernel is sensitive to the CPU state left by 32-bit code**: KERNEL.SYS (a 386/WATCOM build, UPX-compressed) crashes early in its startup when entered with stale high halves in ESP/EBP (bits 16-31 survive every 16-bit `mov sp`/`push`), and also when low memory still contains the stage2 blob. The `boot_hard_disk` trampoline therefore (a) scrubs all bootloader scratch memory (0x500-0x7BFF and 0x8300-0x3B2AC — keeping its own 0x8000-0x82FF code/data) before the handoff, and (b) clears the high halves (`mov esp,0x7C00; xor ebp,ebp`). A control MBR that boots the same VBR from pure real mode boots FreeDOS to a shell; the same MBR with `mov esp,0x47C00`-style high bits set crashes the kernel after its first trace print. The kernel prints `123` tracecodes (INT 10h AH=0Eh) at entry/kernel_start/cont — if boot output stops after `12` or `123`, the kernel died in its INIT-text relocation window.
+
+65c. **FreeDOS VBR internals** (useful when debugging): the FAT16 VBR relocates itself from 0x7C00 to 0x1FE0:0x7C00 (0x27A00), caches the FAT at 0x0060:0, builds a cluster list at 0x1FE0:0x2000 (0x21E00), loads KERNEL.SYS at 0x0060:0x0000 (physical 0x600) sector-by-sector via a bounce buffer at 0x1FE0:0x63A0 (0x261A0), and prints one `.` per read call (INT 10h AH=0Eh). Its read routine tries INT 13h AH=42h (LBA) after an AH=41h EDD check, falling back to CHS computed from the BPB; on any error it prints `Error!` and reboots via INT 19h. `DL` must be the boot drive at entry (the VBR saves it at [bp+0x24]); `BX` should be 0 so INT 10h output hits video page 0.
 
 66. **Partition table coexistence with rustrapper MBR**: rustrapper's MBR (`mbr.asm`) uses bytes 0-205 for code, leaving bytes 206-445 as padding (zeros). The partition table (bytes 446-509) can be written there without overlapping MBR code. However, SeaBIOS may refuse to boot a disk with a partition table whose LBA range exceeds the disk size. The `restore-mbr` target preserves the installer's partition table while restoring rustrapper's MBR code (bytes 0-445).
 

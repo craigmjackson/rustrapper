@@ -1,12 +1,13 @@
 ; Stage 2 entry stub
-; Loaded by MBR at physical 0x8000 (256 sectors max).
+; Loaded by MBR at physical 0x8000 (450 sectors max).
 ; Captures the BIOS E820 memory map (real mode only), enables A20, enters
-; protected mode, copies the embedded Rust payload from the high portion of
-; the loaded blob to 1 MB, and jumps there.
+; protected mode, copies the embedded Rust payload to 1 MB, and jumps there.
 ;
-; The first 512 bytes of this file are the entry stub itself.
-; Everything after the 512-byte mark is the Rust payload, copied
-; verbatim to 0x100000.
+; This entry stub runs first; the Rust payload (`incbin`'d below) follows it
+; and is copied verbatim to 0x100000. The stub is NOT limited to 512 bytes —
+; the MBR loads it + the payload as one blob — but every byte of it must stay
+; below 0x10000 (the real-mode code at the top and the 16-bit PM code segment
+; use 16-bit offsets).
 
 ; Physical location of the captured E820 map (24-byte entries) and the
 ; maximum number of entries. Lives in free low memory: above the BIOS data
@@ -83,8 +84,8 @@ pmode_start:
     ; Stack in low RAM (well below BIOS ROM at 0xF0000)
     mov esp, 0x00070000
 
-    ; Copy Rust payload from 0x8200 → 0x100000
-    mov esi, 0x8200
+    ; Copy Rust payload from the loaded blob → 0x100000
+    mov esi, __payload_start
     mov edi, 0x100000
     mov ecx, RUST_PAYLOAD_BYTES
     rep movsb
@@ -108,7 +109,16 @@ pmode_start:
     call eax
     serial 'E'  ; Should never reach here
 
-; ── Boot from hard disk: chainload MBR at 0x7C00 ────────────────
+; ── Boot from hard disk: chain-load the disk's boot sector ───────
+; Called from Rust (extern "C" fn() -> !). Switches 32-bit PM → 16-bit PM
+; → real mode, loads sector 0 of the boot drive at 0x0000:0x7C00, and jumps
+; to it the way a BIOS IPL would (DL = boot drive, DF clear, IF on):
+;   - rustrapper's own MBR (starts with "MZ") is not bootable code: find the
+;     active partition entry and load its VBR instead (LBA from the entry,
+;     CHS fallback).
+;   - any other MBR: jump to it directly (0xAA55 checked).
+; Reads use INT 13h AH=42h (LBA, geometry-independent); each falls back to
+; CHS (AH=02h) on error.
 boot_hard_disk:
     [bits 32]
     cli
@@ -126,19 +136,26 @@ boot_hard_disk_real:
     mov es, ax
     mov ss, ax
     mov sp, 0x7C00
-    mov dl, 0x80
-    ; Read MBR of drive 0x80
-    mov ah, 0x02
-    mov al, 1
-    mov ch, 0
-    mov cl, 1
-    mov dh, 0
+    cld
+    mov dl, [boot_drive]
+    ; Read the MBR (LBA 0) of the boot drive
+    xor eax, eax
+    mov [dap_lba], eax
+    call read_sector
+    jnc .mbr_read
+    ; LBA read failed: fall back to CHS (C=0, H=0, S=1)
+    mov ax, 0x0201
     mov bx, 0x7C00
+    xor cx, cx
+    inc cx
+    xor dh, dh
+    mov dl, [boot_drive]
     int 0x13
     jc .fail
-    ; If rustrapper's own MBR, find active partition
+.mbr_read:
+    ; If rustrapper's own MBR, find the active partition and load its VBR
     cmp word [0x7C00], 0x5A4D
-    jne .boot_mbr
+    jne .boot_vbr
     mov si, 0x7C00 + 0x1BE
     mov cx, 4
 .part_loop:
@@ -148,22 +165,79 @@ boot_hard_disk_real:
     loop .part_loop
     jmp .fail
 .found:
-    ; Use CHS from partition table entry (offset 1-3)
+    ; LBA start of the partition (entry + 8): works regardless of geometry
+    mov eax, [si+8]
+    mov [dap_lba], eax
+    call read_sector
+    jnc .boot_vbr
+    ; LBA read failed: fall back to the entry's CHS address (entry + 1..3)
     mov dh, [si+1]
     mov cx, [si+2]
     mov ah, 0x02
     mov al, 1
     mov bx, 0x7C00
+    mov dl, [boot_drive]
     int 0x13
     jc .fail
-.boot_mbr:
+.boot_vbr:
     cmp word [0x7C00+510], 0xAA55
     jne .fail
+    ; Scrub every trace of the bootloader before handing off: the E820
+    ; scratch (0x500-0xB00) and the stage2 load area (0x8000-0x3B2AC)
+    ; otherwise leak into the OS's workspace (a BIOS IPL hands over clean
+    ; low memory). Keep 0x8000-0x82FF: this trampoline's code + data.
+    xor ax, ax
+    mov es, ax
+    mov di, 0x0500
+    mov cx, (0x7C00 - 0x0500) / 2
+    rep stosw
+    mov di, 0x8300
+    mov cx, (0x10000 - 0x8300) / 2
+    rep stosw
+    mov ax, 0x1000
+.scrub_hi:
+    mov es, ax
+    xor di, di
+    mov cx, 0x8000 / 2
+    rep stosw
+    add ax, 0x0800
+    cmp ax, 0x3800
+    jb .scrub_hi
+    mov es, ax              ; ES = 0x3800: 0x38000-0x3B2AC
+    xor di, di
+    mov cx, (0x3B2AC - 0x38000) / 2
+    rep stosw
+    ; Hand off like a BIOS IPL: real-mode segments, DF clear, IF on,
+    ; DL = boot drive.
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov sp, 0x7C00
+    cld
     sti
+    mov dl, [boot_drive]
+    ; Clear the stale high halves of ESP/EBP left by the 32-bit Rust code:
+    ; the kernel is a 386 build and 16-bit ops don't touch bits 16-31.
+    mov esp, 0x00007C00
+    xor ebp, ebp
     jmp 0x0000:0x7C00
 .fail:
+    serial 'F'
     hlt
     jmp .fail
+
+; read_sector: read the 1 sector at [dap_lba] to 0x0000:0x7C00 via INT 13h
+; AH=42h (EDD/LBA). DL = drive. Returns CF set on error. Registers preserved.
+read_sector:
+    push si
+    mov si, dap
+    mov ah, 0x42
+    int 0x13
+    pop si
+    ret
 
 [bits 16]
 ; ── E820 memory map capture (real mode) ───────────────────────────────
@@ -228,6 +302,16 @@ boot_drive:  dd 0
 e820_count:  dd 0
 e820_di:     dw 0
 
+; Disk Address Packet for read_sector (INT 13h AH=42h). Static fields:
+; read 1 sector to 0x0000:0x7C00; only the LBA varies.
+dap:
+    db 0x10, 0          ; packet size, reserved
+    dw 1                ; sector count
+    dw 0x7C00           ; buffer offset
+    dw 0x0000           ; buffer segment
+dap_lba:
+    dd 0, 0             ; 64-bit LBA
+
 ; RUST_PAYLOAD_BYTES and BSS_ZERO_SIZE are computed at assembly time.
 ; BSS_ZERO_SIZE covers BSS for descriptor rings, packet buffers, and statics.
 RUST_PAYLOAD_BYTES equ __payload_end - __payload_start
@@ -247,9 +331,6 @@ real_idt:
 gdtr:
     dw gdt_end - gdt - 1
     dd gdt
-
-; Pad to 512 bytes so the Rust payload starts at a known offset (0x8200)
-times 512 - ($ - $$) db 0
 
 ; ── Rust payload embedded here ────────────────────────────────────────
 __payload_start:

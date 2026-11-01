@@ -23,6 +23,7 @@ BARE_ARM64_TARGET := aarch64-unknown-none
         run-x86_64-uefi-rom run-i386-bios-rom \
         i386-bios run-i386-bios check-deps \
         pxe-start pxe-stop tftp-root \
+        freedos-install freedos-iso restore-mbr run-i386-bios-install \
         native run-native lua run-lua
 
 all: x86_64-uefi aarch64-uefi aarch64-bare i386-bios x86_64-uefi-rom i386-bios-rom native lua
@@ -150,10 +151,19 @@ $(BIN)/rustrapper_arm64_bare.elf: $(shell find arm64-bare common lua -name '*.rs
 aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf
 
 # ── BIOS disk image (MBR + Rust stage2 entry + payload) ──────────
+# Includes the partition table: one active FAT16 partition at LBA 2048.
+# It MUST start after the MBR's stage2 load area (sectors 1..TOTAL_SECTORS,
+# see bios/src/mbr.asm): a FreeDOS install whose filesystem begins at the
+# old CHS default (sector 63) overwrites the stage2 payload on disk and the
+# bootloader triple-faults at the next boot (AGENTS.md gotcha: FreeDOS
+# partition overlap). LBA 2048 also leaves room for the stage2 to grow.
 $(BIN)/bios.img: $(BIN)/bios.bin $(BIN)/stage2_entry.bin | $(BIN)
 	dd if=/dev/zero bs=1M count=64 of=$@ 2>/dev/null
 	dd if=$(BIN)/bios.bin of=$@ conv=notrunc 2>/dev/null
 	dd if=$(BIN)/stage2_entry.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
+	printf '\200\000\041\002\006\017\077\201\000\010\000\000\340\367\001\000' \
+		| dd of=$@ bs=1 seek=446 conv=notrunc 2>/dev/null
+	@echo "Partition table: active FAT16 at LBA 2048 (128992 sectors)"
 
 # ── Hard-disk image (for FreeDOS / storage-scan testing) ─────────────
 # A raw 100 MB disk image attached as a second drive to run-i386-bios so
@@ -173,14 +183,19 @@ run-i386-bios: TARGET := run-i386-bios
 run-i386-bios: $(BIN)/bios.img pxe-start check-deps
 	qemu-system-x86_64 -boot order=c \
 		-drive file=$(BIN)/bios.img,format=raw,if=ide,index=0 \
-		-netdev socket=id=net0,connect=127.0.0.1:43210 \
+		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:57 \
 		-nographic
 
 # ── FreeDOS installer ────────────────────────────────────────────
-# Boots the FreeDOS 1.4 LiveCD with the hard-disk image attached so the
-# installer can format and install FreeDOS onto it. Run once, then exit.
-# Requires the FreeDOS ISO (run `make freedos-iso` first).
+# Interactive path: boots the FreeDOS 1.4 LiveCD with the hard-disk image
+# attached so the installer can format and install FreeDOS onto it. Run once,
+# then exit. Requires the FreeDOS ISO (run `make freedos-iso` first).
+# NOTE: bin/bios.img already ships partitioned (active FAT16 at LBA 2048).
+# In the installer, SKIP the FDISK/partitioning step and only run FORMAT +
+# INSTALL — if FDISK recreates the partition at sector 63 it overlaps the
+# stage2 load area and the installed FreeDOS will overwrite the bootloader
+# (`make restore-mbr` warns about this).
 freedos-iso:
 	@if [ ! -f FD14LIVE.iso ]; then ./setup-freedos.sh; fi
 	@test -f FD14LIVE.iso || (echo "FD14LIVE.iso missing"; exit 1)
@@ -191,10 +206,21 @@ run-i386-bios-install: $(BIN)/bios.img freedos-iso check-deps
 		-cdrom FD14LIVE.iso \
 		# -nographic
 
+# ── FreeDOS install (host-side, scripted) ────────────────────────
+# Non-interactive equivalent of run-i386-bios-install: formats the FAT16
+# partition of $(BIN)/bios.img (LBA 2048) and installs FreeDOS 1.4 (boot
+# sector + KERNEL.SYS + COMMAND.COM + CONFIG.SYS/AUTOEXEC.BAT) from the
+# LiveCD ISO. Needs mtools and bsdtar. Afterwards `make run-i386-bios` +
+# menu [4] boots FreeDOS. Rebuilding $(BIN)/bios.img (e.g. via `make
+# i386-bios`) recreates the disk from scratch — run this again afterwards.
+freedos-install: $(BIN)/bios.img freedos-iso
+	./install-freedos.sh $(BIN)/bios.img FD14LIVE.iso
+
 # Restore rustrapper MBR to bios.img after FreeDOS installation
 # (FreeDOS installer overwrites sector 0 with its own MBR)
 restore-mbr: $(BIN)/bios.bin | $(BIN)
 	@python3 -c "d=bytearray(open('$(BIN)/bios.img','rb').read()); m=open('$(BIN)/bios.bin','rb').read(); d[:446]=m[:446]; open('$(BIN)/bios.img','wb').write(d); print('Restored rustrapper MBR (preserved partition table)')"
+	@python3 -c "d=open('$(BIN)/bios.img','rb').read(); es=[d[446+16*i:462+16*i] for i in range(4)]; a=[e for e in es if e[0]==0x80]; s=int.from_bytes(a[0][8:12],'little') if a else 0; print('WARNING: active partition starts at LBA %d and overlaps the stage2 load area (sectors 1..450) - the filesystem will overwrite the bootloader. Reinstall FreeDOS with: make freedos-install' % s) if 0 < s < 451 else None"
 	@echo "Done. rustrapper MBR restored to bios.img"
 
 
@@ -212,7 +238,7 @@ run-x86_64-uefi: TARGET := run-x86_64-uefi
 run-x86_64-uefi: $(BIN)/rustrapper.efi fat-root pxe-start check-deps
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
 		-drive file=fat:rw:fat-root,format=raw \
-		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:58 \
 		-nographic
 
@@ -220,7 +246,7 @@ run-x86_64-uefi-rom: TARGET := run-x86_64-uefi-rom
 run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root pxe-start check-deps
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
 		-drive file=fat:rw:fat-root,format=raw \
-		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0,mac=52:54:00:12:34:59 \
 		-nographic
 
@@ -228,7 +254,7 @@ run-i386-bios-rom: TARGET := run-i386-bios-rom
 run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom pxe-start check-deps
 	qemu-system-x86_64 -boot order=c \
 		-drive file=$(BIN)/bios.img,format=raw \
-		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,romfile=$(BIN)/rustrapper_bios.rom,netdev=net0,mac=52:54:00:12:34:5a \
 		-nographic
 
@@ -237,7 +263,7 @@ run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi fat-root pxe-start check-deps
 	qemu-system-aarch64 -machine virt -cpu max \
 		-bios /usr/share/edk2/aarch64/QEMU_EFI.fd \
 		-drive file=fat:rw:fat-root,format=raw \
-		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:5b \
 		-nographic
 
@@ -250,7 +276,7 @@ run-aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf test.img pxe-start check-deps
 		-drive file=test.img,format=raw,if=none,id=drive0 \
 		-device ahci,id=ahci \
 		-device ide-hd,bus=ahci.0,drive=drive0 \
-		-netdev socket,id=net0,connect=127.0.0.1:43210 \
+		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:5c \
 		-nographic
 
@@ -273,7 +299,7 @@ pxe-start: openwrt tftp-root
 	@make -s pxe-sync
 	qemu-system-x86_64 \
 		-drive file=openwrt,format=raw \
-		-netdev socket,id=net0,listen=127.0.0.1:43210 \
+		-netdev type=socket,id=net0,listen=127.0.0.1:43210 \
 		-device e1000,netdev=net0 \
 		-m 256 -display none -daemonize \
 		-pidfile pxe-server.pid
