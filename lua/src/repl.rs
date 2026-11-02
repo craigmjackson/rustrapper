@@ -226,7 +226,6 @@ pub fn repl_loop(
                             // must be '=' or ',' (not 'function' or 'if' etc.)
                             i < len && (line[i] == b'=' || line[i] == b',')
                         };
-                    let prefix_offset = if is_local_var { 6 } else { 0 }; // "local " length
                     let mut src_idx = 0usize;
                     // skip leading whitespace copy as-is
                     while src_idx < trim_start {

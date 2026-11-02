@@ -454,7 +454,7 @@ mod tests {
         // sname: 64 bytes
         frame[pos..pos + 64].fill(0); pos += 64;
         // file: 128 bytes
-        frame[pos..pos + 128].fill(0); pos += 128;
+        frame[pos..pos + 128].fill(0);
         // Magic cookie (at dhcp_off + 236)
         frame[dhcp_off + 236..dhcp_off + 240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
         // Options (at dhcp_off + 240)
