@@ -638,6 +638,7 @@ make freedos-iso                  # Download/extract the FreeDOS 1.4 LiveCD ISO
 make freedos-install              # Host-side FreeDOS install into bin/bios.img (LBA 2048)
 make restore-mbr                  # Restore rustrapper MBR after an interactive FreeDOS install
 make run-x86_64-uefi             # x86_64 UEFI via FAT dir (e1000, full DHCP)
+make run-x86_64-uefi-debian       # x86_64 UEFI with Debian 13 netinst + separate disk (chainload test)
 make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
 make run-aarch64-uefi            # ARM64 UEFI from FAT directory
 make run-aarch64-bare            # ARM64 bare-metal + AHCI drive

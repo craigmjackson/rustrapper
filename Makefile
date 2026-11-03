@@ -22,6 +22,7 @@ BARE_ARM64_TARGET := aarch64-unknown-none
         run-x86_64-uefi run-aarch64-uefi run-aarch64-bare \
         run-x86_64-uefi-rom run-i386-bios-rom \
         i386-bios run-i386-bios check-deps \
+        debian-netinst-iso run-x86_64-uefi-debian \
         pxe-start pxe-stop tftp-root \
         freedos-install freedos-iso restore-mbr run-i386-bios-install \
         native run-native lua run-lua
@@ -199,6 +200,26 @@ run-i386-bios: $(BIN)/bios.img pxe-start check-deps
 freedos-iso:
 	@if [ ! -f FD14LIVE.iso ]; then ./setup-freedos.sh; fi
 	@test -f FD14LIVE.iso || (echo "FD14LIVE.iso missing"; exit 1)
+# ── Debian 13 netinst (UEFI validation) ─────────────────────────
+debian-netinst-iso:
+	@if [ ! -f debian-13.7.0-amd64-netinst.iso ]; then ./setup-debian.sh; fi
+	@test -f debian-13.7.0-amd64-netinst.iso || (echo "debian-13.7.0-amd64-netinst.iso missing"; exit 1)
+
+run-x86_64-uefi-debian: TARGET := run-x86_64-uefi-debian
+run-x86_64-uefi-debian: $(BIN)/rustrapper.efi fat-root debian-netinst-iso $(BIN)/uefi-disk.img check-deps
+	cp /usr/share/edk2/x64/OVMF_VARS.4m.fd $(BIN)/OVMF_VARS.4m.fd
+	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+		-drive if=pflash,format=raw,file=$(BIN)/OVMF_VARS.4m.fd \
+		-m 2048 \
+		-device virtio-scsi-pci,id=scsi \
+		-drive if=none,file=fat:rw:fat-root,format=raw,id=fatdisk \
+		-device scsi-hd,drive=fatdisk,bootindex=1 \
+		-drive if=none,file=$(BIN)/uefi-disk.img,format=raw,id=uefidisk,file.locking=off \
+		-device scsi-hd,drive=uefidisk,bootindex=2 \
+		-drive if=none,file=debian-13.7.0-amd64-netinst.iso,format=raw,id=cdrom,media=cdrom \
+		-device scsi-cd,drive=cdrom,bootindex=3 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:58
 
 run-i386-bios-install: $(BIN)/bios.img freedos-iso check-deps
 	qemu-system-x86_64 -boot order=d \
@@ -234,21 +255,31 @@ fat-root: $(BIN)/rustrapper.efi $(BIN)/rustrapper_arm64.efi | $(BIN)
 	cp $(BIN)/rustrapper.efi $@/EFI/BOOT/BOOTX64.EFI
 	cp $(BIN)/rustrapper_arm64.efi $@/EFI/BOOT/BOOTAA64.EFI
 
+# Blank disk image for UEFI installation/validation (keeps fat-root pristine)
+$(BIN)/uefi-disk.img: | $(BIN)
+	truncate -s 16G $(BIN)/uefi-disk.img
+
 run-x86_64-uefi: TARGET := run-x86_64-uefi
-run-x86_64-uefi: $(BIN)/rustrapper.efi fat-root pxe-start check-deps
-	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=fat:rw:fat-root,format=raw \
+run-x86_64-uefi: $(BIN)/rustrapper.efi fat-root $(BIN)/uefi-disk.img pxe-start check-deps
+	cp /usr/share/edk2/x64/OVMF_VARS.4m.fd $(BIN)/OVMF_VARS.4m.fd
+	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+		-drive if=pflash,format=raw,file=$(BIN)/OVMF_VARS.4m.fd \
+		-m 512 \
+		-device virtio-scsi-pci,id=scsi \
+		-drive if=none,file=fat:rw:fat-root,format=raw,id=fatdisk \
+		-device scsi-hd,drive=fatdisk,bootindex=1 \
+		-drive if=none,file=$(BIN)/uefi-disk.img,format=raw,id=uefidisk,file.locking=off \
+		-device scsi-hd,drive=uefidisk,bootindex=2 \
 		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
-		-device e1000,netdev=net0,mac=52:54:00:12:34:58 \
-		-nographic
+		-device e1000,netdev=net0,mac=52:54:00:12:34:58
+
 
 run-x86_64-uefi-rom: TARGET := run-x86_64-uefi-rom
 run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root pxe-start check-deps
 	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
 		-drive file=fat:rw:fat-root,format=raw \
 		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
-		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0,mac=52:54:00:12:34:59 \
-		-nographic
+		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0,mac=52:54:00:12:34:59
 
 run-i386-bios-rom: TARGET := run-i386-bios-rom
 run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom pxe-start check-deps

@@ -5,6 +5,7 @@
 extern crate std;
 
 mod efi;
+mod boot;
 #[cfg(not(test))]
 mod scan;
 #[cfg(not(test))]
@@ -205,8 +206,91 @@ fn boot_loop(image_handle: EFI_HANDLE, system_table: &'static EFI_SYSTEM_TABLE) 
             MenuAction::StorageScan => scan::scan_storage_devices(image_handle, system_table),
             MenuAction::NetworkBoot => net::scan_network_devices(image_handle, system_table),
             MenuAction::HardDiskBoot => {
-                // Not supported on UEFI target.
-                u16_puts("Hard disk boot not supported on this target.\n");
+                let (options, count) = unsafe { boot::enumerate_boot_options(system_table) };
+                if count == 0 {
+                    u16_puts("No UEFI boot options found.\n");
+                    continue;
+                }
+                // Show the firmware's boot options.
+                let mut i = 0usize;
+                while i < count {
+                    u16_puts("  [");
+                    // single digit / two digit index
+                    let mut idx_buf = [0u8; 8];
+                    // format i+1
+                    let mut val = i + 1;
+                    let mut rev = [0u8; 8];
+                    let mut rl = 0usize;
+                    if val == 0 {
+                        rev[rl] = b'0';
+                        rl += 1;
+                    } else {
+                        while val > 0 {
+                            rev[rl] = b'0' + (val % 10) as u8;
+                            rl += 1;
+                            val /= 10;
+                        }
+                    }
+                    // reverse into idx_buf
+                    let mut k = 0usize;
+                    while k < rl {
+                        idx_buf[k] = rev[rl - 1 - k];
+                        k += 1;
+                    }
+                    idx_buf[k] = 0;
+                    // print idx_buf as str
+                    let s = core::str::from_utf8(&idx_buf[..k]).unwrap_or("?");
+                    u16_puts(s);
+                    u16_puts("] ");
+                    let mut desc_buf = [0u8; 64];
+                    let dlen = unsafe { boot::description_ascii(&options[i], &mut desc_buf) };
+                    if dlen == 0 {
+                        u16_puts("(unnamed)");
+                    } else {
+                        let ds = core::str::from_utf8(&desc_buf[..dlen]).unwrap_or("?");
+                        u16_puts(ds);
+                    }
+                    u16_puts("\n");
+                    i += 1;
+                }
+                u16_puts("  [0] Cancel\nChoose: ");
+                // read selection
+                let key = loop {
+                    if let Some(k) = get_key() {
+                        break k;
+                    }
+                };
+                u16_putc(key);
+                u16_puts("\n\n");
+                if key == b'0' {
+                    continue;
+                }
+                if key < b'1' || key > b'9' {
+                    u16_puts("Invalid choice.\n");
+                    continue;
+                }
+                let sel = (key - b'1') as usize;
+                if sel >= count {
+                    u16_puts("Invalid choice.\n");
+                    continue;
+                }
+                let opt = &options[sel];
+                if opt.attributes & 1 == 0 {
+                    u16_puts("Selected option is not active.\n");
+                    continue;
+                }
+                if opt.file_path_size == 0 || opt.file_path_ptr.is_null() {
+                    u16_puts("Selected option has no file path.\n");
+                    continue;
+                }
+                let _ = loader::boot_from_device_path(
+                    system_table,
+                    image_handle,
+                    opt.file_path_ptr,
+                    opt.file_path_size,
+                    opt.number,
+                    u16_puts,
+                );
             }
             MenuAction::LuaShell => {
                 let mut state = lua::LuaState::new();

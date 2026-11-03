@@ -26,7 +26,7 @@ target links only the shared `common` and `lua` crates.
 - **Native Linux** — Same menu + Lua interpreter as a host binary; the kernel handles networking (`make run-native`). `make lua` builds a standalone `bin/lua` shell / script runner that skips the menu
 - **Lua interpreter** — no_std, no heap, fixed static buffers. A `[3] Lua Shell` menu entry and PXE `.lua` scripts run the same interpreter (`dhcp`, `fetch()`, `global`, `local`, tables, functions, loops)
 - **PXE Boot** — DHCP options 66/67, TFTP client (RFC 1350), executes PE/COFF/ELF32/ELF64/Multiboot and `.lua` scripts
-- **OS chain-loading** — `[4] Boot from hard disk` boots an installed OS (FreeDOS 1.4 verified): the entry stub chain-loads the active partition's VBR with a BIOS-IPL-style real-mode handoff. `make freedos-install` installs FreeDOS onto `bin/bios.img` from the host in one step
+- **OS chain-loading** — `[4] Boot from hard disk` boots an installed OS: on BIOS, the entry stub chain-loads the active partition's VBR with a BIOS-IPL-style real-mode handoff (FreeDOS 1.4 verified); on UEFI, it enumerates the firmware's boot options and hands off to the selected entry (Debian 13 (trixie) network installer verified). `make freedos-install` installs FreeDOS onto `bin/bios.img` from the host in one step; `make debian-netinst-iso` fetches the Debian netinst ISO for UEFI validation
 
 ## Quick Start
 
@@ -48,6 +48,7 @@ make run-lua                      # Standalone Lua shell on the host (no QEMU)
 # Boot an OS from the virtual hard disk (FreeDOS):
 make freedos-iso                  # One-time: download the FreeDOS 1.4 LiveCD ISO
 make freedos-install              # Install FreeDOS onto bin/bios.img (host-side, scripted)
+make debian-netinst-iso                 # One-time: fetch Debian 13 (trixie) network installer (UEFI validation)
 make run-i386-bios                # then choose menu [4] Boot from hard disk
 ```
 
@@ -67,6 +68,7 @@ Lua demo (`test.lua`), and a test file.
 | `make i386-bios-rom`   | `bin/rustrapper_bios.rom`                      | PCI expansion ROM (BIOS option ROM) |
 | `make native`          | `bin/rustrapper_native`                        | Native Linux x86_64 binary          |
 | `make lua`             | `bin/lua`                                      | Standalone Lua shell / script runner |
+| `make debian-netinst-iso`     | `debian-13.7.0-amd64-netinst.iso`                   | Fetch Debian 13 (trixie) network installer (UEFI validation) |
 | `make freedos-install` | `bin/bios.img` (+ FreeDOS)                     | Install FreeDOS 1.4 onto the BIOS disk image |
 
 ## Run in QEMU
@@ -75,7 +77,8 @@ Lua demo (`test.lua`), and a test file.
 make run-i386-bios                # Legacy BIOS stage2 (serial, Ctrl-A X to exit)
 make run-i386-bios-rom            # Legacy BIOS with PCI expansion ROM (rust_payload.bin)
 make run-i386-bios-install        # Boot the FreeDOS 1.4 LiveCD to install onto bin/bios.img
-make run-x86_64-uefi              # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP)
+make run-x86_64-uefi              # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP; boots rustrapper first)
+make run-x86_64-uefi-debian       # x86_64 UEFI with Debian 13 netinst attached (installs to a separate disk)
 make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM (direct e1000 MMIO)
 make run-aarch64-uefi             # ARM64 UEFI (e1000 NIC via direct PCI scan)
 make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
@@ -84,9 +87,12 @@ make run-lua                      # Standalone Lua shell (runs on the host, no Q
 make run-lua SCRIPT=lua/demo/test.lua   # Run a Lua script on the host
 ```
 
-All firmware run targets use `-nographic` (Ctrl-A X to exit) and need the
-OpenWrt PXE server (started automatically via `pxe-start`). The native target
-runs directly on the host; type `dhcp` in the Lua shell to set up networking.
+All firmware run targets except the x86_64 UEFI ones use `-nographic`
+(Ctrl-A X to exit); the x86_64 UEFI targets open a QEMU window. All need the
+OpenWrt PXE server (started automatically via `pxe-start`), except
+`run-x86_64-uefi-debian`, which uses user-mode networking for the installer.
+The native target runs directly on the host; type `dhcp` in the Lua shell to
+set up networking.
 
 ## Booting an OS (FreeDOS)
 
@@ -119,6 +125,21 @@ Two details matter for coexistence with the bootloader (see AGENTS.md gotcha 65)
 
 Rebuilding `bin/bios.img` (e.g. `make i386-bios`) recreates the disk from
 scratch — re-run `make freedos-install` afterwards.
+
+## Booting an OS on UEFI (Debian netinst)
+
+Menu choice `[4] Boot from hard disk` on the UEFI target enumerates the
+firmware's boot options (from NVRAM `BootOrder`/`Boot####` variables) and
+presents them as a submenu, then hands off to the selected entry:
+
+```bash
+make debian-netinst-iso                  # one-time: fetch debian-13.7.0-amd64-netinst.iso
+make run-x86_64-uefi-debian      # menu [4] -> pick "UEFI QEMU DVD-ROM" -> Debian installer
+```
+
+The handoff uses `LoadImage`/`StartImage` when the option carries a file path,
+and falls back to setting `BootNext` plus a cold reset for device-only entries
+such as the El Torito CD-ROM image, so any firmware-listed boot target works.
 
 ## Lua Shell
 
@@ -332,14 +353,14 @@ directory. This needs no root privileges and no external TFTP server.
 All crates are host‑testable — platform‑specific code is guarded with `#[cfg(not(test))]`.
 
 ```bash
-cargo test --workspace   # 313 tests across all crates
+cargo test --workspace   # 319 tests across all crates
 ```
 
 | Crate        | Tests | What's Tested                                                                                |
 | ------------ | ----- | -------------------------------------------------------------------------------------------- |
 | `common`     | 98    | Hex/decimal formatting, device info, scan loop with mocks, DHCP build/parse (incl. PXE options), ARP build/parse, DNS build/parse, subnet check, TFTP protocol, file format detection |
 | `lua`        | 128   | Lexer, parser, bytecode compiler + VM, integer & float arithmetic and formatting, `next`/`pairs`/`rawequal`/`rawget`/`rawlen`/`rawset`/`select`/`setmetatable`/`tonumber`/`tostring`/`type`/`warn`/`pcall`/`error`/`coroutine.*`, closures/upvalues (`local function`, anonymous functions, shared capture, per-iteration loop capture), metamethod dispatch (`__index`/`__newindex`/`__eq`/`__lt`/`__le`/`__concat`/arithmetic/`__unm`/`__call`/`__tostring`/`__pairs`) + `_VERSION`, multiple values/assignment, `global` keyword, `string.find`, `string.format`, `string.gmatch`, `string.gsub`, `string.len`, `string.lower`, `string.match`, `string.pack`/`unpack`, `string.rep`/`reverse`/`sub`/`upper`, `table.*`, `math.*`, `io.*`, `dhcp` builtin, demo script output, REPL (echo, fetch, help), state-size guard |
-| `uefi`       | 33    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol                     |
+| `uefi`       | 39    | EFI type sizes, GUID values, SNP mode layout, constants, PCI IO protocol, boot-option parsers |
 | `arm64-bare` | 21    | PCI offset encoding, storage subclass naming                                                 |
 | `romwrap`    | 24    | PCIR layout, BIOS/UEFI code types, entry routine, 512-byte alignment, edge cases             |
 | `native`     | 2     | `/proc/net/route` gateway hex decode, TFTP RRQ build                                          |

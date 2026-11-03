@@ -12,6 +12,7 @@ pub const EFI_INVALID_PARAMETER: EFI_STATUS = 2;
 pub const EFI_NOT_FOUND: EFI_STATUS = 14;
 pub const EFI_NOT_STARTED: EFI_STATUS = 19;
 pub const EFI_ALREADY_STARTED: EFI_STATUS = 20;
+pub const EFI_BUFFER_TOO_SMALL: EFI_STATUS = 0x8000000000000005;
 
 pub const EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL: u32 = 0x00000001;
 pub const EFI_OPEN_PROTOCOL_GET_PROTOCOL: u32 = 0x00000002;
@@ -108,6 +109,13 @@ pub static LOADED_IMAGE_GUID: EFI_GUID = EFI_GUID {
     data2: 0x9562,
     data3: 0x11D2,
     data4: [0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B],
+};
+
+pub static GLOBAL_VARIABLE_GUID: EFI_GUID = EFI_GUID {
+    data1: 0x8BE4DF61,
+    data2: 0x93CA,
+    data3: 0x11D2,
+    data4: [0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
 };
 
 pub static PCI_ROOT_BRIDGE_IO_GUID: EFI_GUID = EFI_GUID {
@@ -400,6 +408,28 @@ pub struct EFI_LOADED_IMAGE_PROTOCOL {
     pub image_code_type: u32,
     pub image_data_type: u32,
     pub unload: unsafe extern "efiapi" fn(EFI_HANDLE) -> EFI_STATUS,
+}
+
+#[repr(C)]
+pub struct EFI_RUNTIME_SERVICES {
+    pub hdr: EFI_TABLE_HEADER,
+    pub get_time: *mut c_void,
+    pub set_time: *mut c_void,
+    pub get_wakeup_time: *mut c_void,
+    pub set_wakeup_time: *mut c_void,
+    pub set_virtual_address_map: *mut c_void,
+    pub convert_pointer: *mut c_void,
+    pub get_variable: unsafe extern "efiapi" fn(
+        *const u16,
+        *const EFI_GUID,
+        *mut u32,
+        *mut UINTN,
+        *mut c_void,
+    ) -> EFI_STATUS,
+    pub get_next_variable_name: *mut c_void,
+    pub set_variable: *mut c_void,
+    pub get_next_high_monotonic_count: *mut c_void,
+    pub reset_system: *mut c_void,
 }
 
 #[repr(C)]
