@@ -275,10 +275,33 @@ run-x86_64-uefi: $(BIN)/rustrapper.efi fat-root $(BIN)/uefi-disk.img pxe-start c
 
 
 run-x86_64-uefi-rom: TARGET := run-x86_64-uefi-rom
-run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root pxe-start check-deps
-	qemu-system-x86_64 -bios /usr/share/edk2/x64/OVMF.4m.fd \
-		-drive file=fat:rw:fat-root,format=raw \
+run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root $(BIN)/uefi-disk.img pxe-start check-deps
+	cp /usr/share/edk2/x64/OVMF_VARS.4m.fd $(BIN)/OVMF_VARS.4m.fd
+	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+		-drive if=pflash,format=raw,file=$(BIN)/OVMF_VARS.4m.fd \
+		-m 512 \
+		-device virtio-scsi-pci,id=scsi \
+		-drive if=none,file=fat:rw:fat-root,format=raw,id=fatdisk \
+		-device scsi-hd,drive=fatdisk,bootindex=1 \
+		-drive if=none,file=$(BIN)/uefi-disk.img,format=raw,id=uefidisk,file.locking=off \
+		-device scsi-hd,drive=uefidisk,bootindex=2 \
 		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
+		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0,mac=52:54:00:12:34:59
+
+run-x86_64-uefi-rom-debian: TARGET := run-x86_64-uefi-rom-debian
+run-x86_64-uefi-rom-debian: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root debian-netinst-iso $(BIN)/uefi-disk.img check-deps
+	cp /usr/share/edk2/x64/OVMF_VARS.4m.fd $(BIN)/OVMF_VARS.4m.fd
+	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+		-drive if=pflash,format=raw,file=$(BIN)/OVMF_VARS.4m.fd \
+		-m 2048 \
+		-device virtio-scsi-pci,id=scsi \
+		-drive if=none,file=fat:rw:fat-root,format=raw,id=fatdisk \
+		-device scsi-hd,drive=fatdisk,bootindex=1 \
+		-drive if=none,file=$(BIN)/uefi-disk.img,format=raw,id=uefidisk,file.locking=off \
+		-device scsi-hd,drive=uefidisk,bootindex=2 \
+		-drive if=none,file=debian-13.7.0-amd64-netinst.iso,format=raw,id=cdrom,media=cdrom \
+		-device scsi-cd,drive=cdrom,bootindex=3 \
+		-netdev user,id=net0 \
 		-device e1000,romfile=$(BIN)/rustrapper_efi.rom,netdev=net0,mac=52:54:00:12:34:59
 
 run-i386-bios-rom: TARGET := run-i386-bios-rom
