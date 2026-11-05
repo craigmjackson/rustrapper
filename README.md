@@ -80,7 +80,9 @@ make run-i386-bios-install        # Boot the FreeDOS 1.4 LiveCD to install onto 
 make run-x86_64-uefi              # x86_64 UEFI (e1000 NIC, SNP protocol, full DHCP; boots rustrapper first)
 make run-x86_64-uefi-debian       # x86_64 UEFI with Debian 13 netinst attached (installs to a separate disk)
 make run-x86_64-uefi-rom          # x86_64 UEFI with custom option ROM (direct e1000 MMIO)
-make run-aarch64-uefi             # ARM64 UEFI (e1000 NIC via direct PCI scan)
+make run-x86_64-uefi-rom-debian   # same, with Debian 13 netinst + separate disk attached
+make run-aarch64-uefi             # ARM64 UEFI (e1000 NIC via direct PCI scan; boots rustrapper first)
+make run-aarch64-uefi-debian       # ARM64 UEFI with Debian 13 arm64 netinst + separate disk
 make run-aarch64-bare             # ARM64 bare‑metal with AHCI drive
 make run-native                   # Native Linux binary (runs on the host, no QEMU)
 make run-lua                      # Standalone Lua shell (runs on the host, no QEMU)

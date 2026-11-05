@@ -640,7 +640,9 @@ make restore-mbr                  # Restore rustrapper MBR after an interactive 
 make run-x86_64-uefi             # x86_64 UEFI via FAT dir (e1000, full DHCP)
 make run-x86_64-uefi-debian       # x86_64 UEFI with Debian 13 netinst + separate disk (chainload test)
 make run-x86_64-uefi-rom         # x86_64 UEFI with custom PCI expansion ROM
+make run-x86_64-uefi-rom-debian  # same, with Debian 13 netinst + separate disk attached
 make run-aarch64-uefi            # ARM64 UEFI from FAT directory
+make run-aarch64-uefi-debian      # ARM64 UEFI with Debian 13 arm64 netinst + separate disk
 make run-aarch64-bare            # ARM64 bare-metal + AHCI drive
 make run-native                  # Run the native Linux binary interactively
 make lua                         # Build standalone Lua shell / script runner (bin/lua)

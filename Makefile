@@ -205,6 +205,10 @@ debian-netinst-iso:
 	@if [ ! -f debian-13.7.0-amd64-netinst.iso ]; then ./setup-debian.sh; fi
 	@test -f debian-13.7.0-amd64-netinst.iso || (echo "debian-13.7.0-amd64-netinst.iso missing"; exit 1)
 
+debian-arm64-netinst-iso:
+	@if [ ! -f debian-13.7.0-arm64-netinst.iso ]; then ./setup-debian-arm64.sh; fi
+	@test -f debian-13.7.0-arm64-netinst.iso || (echo "debian-13.7.0-arm64-netinst.iso missing"; exit 1)
+
 run-x86_64-uefi-debian: TARGET := run-x86_64-uefi-debian
 run-x86_64-uefi-debian: $(BIN)/rustrapper.efi fat-root debian-netinst-iso $(BIN)/uefi-disk.img check-deps
 	cp /usr/share/edk2/x64/OVMF_VARS.4m.fd $(BIN)/OVMF_VARS.4m.fd
@@ -258,6 +262,9 @@ fat-root: $(BIN)/rustrapper.efi $(BIN)/rustrapper_arm64.efi | $(BIN)
 # Blank disk image for UEFI installation/validation (keeps fat-root pristine)
 $(BIN)/uefi-disk.img: | $(BIN)
 	truncate -s 16G $(BIN)/uefi-disk.img
+
+$(BIN)/uefi-disk-arm64.img: | $(BIN)
+	truncate -s 16G $(BIN)/uefi-disk-arm64.img
 
 run-x86_64-uefi: TARGET := run-x86_64-uefi
 run-x86_64-uefi: $(BIN)/rustrapper.efi fat-root $(BIN)/uefi-disk.img pxe-start check-deps
@@ -313,16 +320,35 @@ run-i386-bios-rom: $(BIN)/bios.img $(BIN)/rustrapper_bios.rom pxe-start check-de
 		-nographic
 
 run-aarch64-uefi: TARGET := run-aarch64-uefi
-run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi fat-root pxe-start check-deps
-	qemu-system-aarch64 -machine virt -cpu max \
+run-aarch64-uefi: $(BIN)/rustrapper_arm64.efi fat-root $(BIN)/uefi-disk-arm64.img pxe-start check-deps
+	qemu-system-aarch64 -machine virt -cpu max -m 512 \
 		-bios /usr/share/edk2/aarch64/QEMU_EFI.fd \
-		-drive file=fat:rw:fat-root,format=raw \
+		-device virtio-scsi-pci,id=scsi \
+		-drive if=none,file=fat:rw:fat-root,format=raw,id=fatdisk \
+		-device scsi-hd,drive=fatdisk,bootindex=1 \
+		-drive if=none,file=$(BIN)/uefi-disk-arm64.img,format=raw,id=armdisk,file.locking=off \
+		-device scsi-hd,drive=armdisk,bootindex=2 \
 		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:5b \
 		-nographic
 
 test.img:
 	qemu-img create -f raw $@ 64M 2>/dev/null || dd if=/dev/zero bs=1M count=64 of=$@ 2>/dev/null
+
+run-aarch64-uefi-debian: TARGET := run-aarch64-uefi-debian
+run-aarch64-uefi-debian: $(BIN)/rustrapper_arm64.efi fat-root debian-arm64-netinst-iso $(BIN)/uefi-disk-arm64.img pxe-start check-deps
+	qemu-system-aarch64 -machine virt -cpu max -m 2048 \
+		-bios /usr/share/edk2/aarch64/QEMU_EFI.fd \
+		-device virtio-scsi-pci,id=scsi \
+		-drive if=none,file=fat:rw:fat-root,format=raw,id=fatdisk \
+		-device scsi-hd,drive=fatdisk,bootindex=1 \
+		-drive if=none,file=$(BIN)/uefi-disk-arm64.img,format=raw,id=armdisk,file.locking=off \
+		-device scsi-hd,drive=armdisk,bootindex=2 \
+		-drive if=none,file=debian-13.7.0-arm64-netinst.iso,format=raw,id=cdrom,media=cdrom \
+		-device scsi-cd,drive=cdrom,bootindex=3 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:5b \
+		-nographic
 
 run-aarch64-bare: TARGET := run-aarch64-bare
 run-aarch64-bare: $(BIN)/rustrapper_arm64_bare.elf test.img pxe-start check-deps
