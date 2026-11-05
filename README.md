@@ -26,7 +26,7 @@ target links only the shared `common` and `lua` crates.
 - **Native Linux** — Same menu + Lua interpreter as a host binary; the kernel handles networking (`make run-native`). `make lua` builds a standalone `bin/lua` shell / script runner that skips the menu
 - **Lua interpreter** — no_std, no heap, fixed static buffers. A `[3] Lua Shell` menu entry and PXE `.lua` scripts run the same interpreter (`dhcp`, `fetch()`, `global`, `local`, tables, functions, loops)
 - **PXE Boot** — DHCP options 66/67, TFTP client (RFC 1350), executes PE/COFF/ELF32/ELF64/Multiboot and `.lua` scripts
-- **OS chain-loading** — `[4] Boot from hard disk` boots an installed OS: on BIOS, the entry stub chain-loads the active partition's VBR with a BIOS-IPL-style real-mode handoff (FreeDOS 1.4 verified); on UEFI, it enumerates the firmware's boot options and hands off to the selected entry (Debian 13 (trixie) network installer verified). `make freedos-install` installs FreeDOS onto `bin/bios.img` from the host in one step; `make debian-netinst-iso` fetches the Debian netinst ISO for UEFI validation
+- **OS chain-loading** — `[4] Chain to other bootloader` boots an installed OS: on BIOS, the entry stub chain-loads the active partition's VBR with a BIOS-IPL-style real-mode handoff (FreeDOS 1.4 verified); on UEFI, it enumerates the firmware's boot options and hands off to the selected entry (Debian 13 (trixie) network installer verified). `make freedos-install` installs FreeDOS onto `bin/bios.img` from the host in one step; `make debian-netinst-iso` fetches the Debian netinst ISO for UEFI validation
 
 ## Quick Start
 
@@ -49,7 +49,7 @@ make run-lua                      # Standalone Lua shell on the host (no QEMU)
 make freedos-iso                  # One-time: download the FreeDOS 1.4 LiveCD ISO
 make freedos-install              # Install FreeDOS onto bin/bios.img (host-side, scripted)
 make debian-netinst-iso                 # One-time: fetch Debian 13 (trixie) network installer (UEFI validation)
-make run-i386-bios                # then choose menu [4] Boot from hard disk
+make run-i386-bios                # then choose menu [4] Chain to other bootloader
 ```
 
 The firmware `run-*` targets automatically start an OpenWrt VM as the
@@ -98,7 +98,7 @@ set up networking.
 
 ## Booting an OS (FreeDOS)
 
-Menu choice `[4] Boot from hard disk` chain-loads the active partition's boot
+Menu choice `[4] Chain to other bootloader` chain-loads the active partition's boot
 sector the way a BIOS IPL would (LBA reads via INT 13h AH=42h, real-mode
 handoff with DL = boot drive). FreeDOS 1.4 is the verified guest:
 
@@ -130,7 +130,7 @@ scratch — re-run `make freedos-install` afterwards.
 
 ## Booting an OS on UEFI (Debian netinst)
 
-Menu choice `[4] Boot from hard disk` on the UEFI target enumerates the
+Menu choice `[4] Chain to other bootloader` on the UEFI target enumerates the
 firmware's boot options (from NVRAM `BootOrder`/`Boot####` variables) and
 presents them as a submenu, then hands off to the selected entry:
 
@@ -152,7 +152,7 @@ Menu:
   [1] List storage devices
   [2] Boot from network
   [3] Lua Shell
-  [4] Boot from hard disk
+  [4] Chain to other bootloader
 Choose:
 ```
 

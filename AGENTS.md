@@ -716,7 +716,7 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 ### `common/src/menu.rs` — Menu now has 4 options
 
 - `MenuAction` enum: added `HardDiskBoot` variant.
-- `show_menu` prints `[4] Boot from hard disk` and handles key `'4'`.
+- `show_menu` prints `[4] Chain to other bootloader` and handles key `'4'`.
 - All targets updated to match the new variant (UEFI/ARM64/native print "not supported").
 
 ### `bios/src/stage2_entry.nasm` — Real-mode trampoline for chain-loading
@@ -732,7 +732,7 @@ The `print` module separates formatting from I/O: `format_hex`/`format_dec` writ
 - The trampoline address is passed to `_start` as a 4th argument (`bootdisk_fn: u32`).
 - `_start` signature updated: `_start(boot_drive, e820_addr, e820_count, bootdisk_fn)`.
 
-### `bios/src/main.rs` — Boot from hard disk handler
+### `bios/src/main.rs` — Chain to other bootloader handler
 
 - `boot_from_hard_disk()` transmutes `BOOTDISK_FN` to a function pointer and calls it (never returns).
 - Menu dispatch: `MenuAction::HardDiskBoot => { print; boot_from_hard_disk(); }`.

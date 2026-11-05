@@ -15,7 +15,7 @@ pub fn show_menu(
         puts("  [1] List storage devices\n");
         puts("  [2] Boot from network\n");
         puts("  [3] Lua Shell\n");
-        puts("  [4] Boot from hard disk\n");
+        puts("  [4] Chain to other bootloader\n");
         puts("Choose: ");
         let key = loop {
             if let Some(k) = get_key() {
