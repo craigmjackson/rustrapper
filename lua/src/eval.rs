@@ -3679,6 +3679,50 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
             let ok = s.os_rename.map(|f| f(oldname, newname)).unwrap_or(false);
             if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
         }
+        Value::Native(75) => {
+            // cd(path): change current directory in the pseudo-filesystem.
+            if argc != 1 {
+                return Err("cd expects 1 argument".into());
+            }
+            let path = match argbuf[0] {
+                Value::Str(r) => core::str::from_utf8(s.str_bytes(r)).unwrap_or(""),
+                _ => return Err("cd expects a string".into()),
+            };
+            let mut buf = [0u8; 128];
+            let l = path.len().min(buf.len());
+            buf[..l].copy_from_slice(&path.as_bytes()[..l]);
+            let path = core::str::from_utf8(&buf[..l]).unwrap_or("");
+            let ok = if path == ".." {
+                let mut cwbuf = [0u8; 32];
+                let cwlen = s.cwd_len as usize;
+                cwbuf[..cwlen].copy_from_slice(&s.cwd[..cwlen]);
+                let cw = &cwbuf[..cwlen];
+                let parent = if cw == b"/" {
+                    "/"
+                } else {
+                    let mut end = cw.len();
+                    while end > 0 && cw[end-1] != b'/' { end -= 1; }
+                    if end <= 1 { "/" } else { core::str::from_utf8(&cw[..end-1]).unwrap_or("/") }
+                };
+                let b = parent.as_bytes();
+                let n = b.len().min(s.cwd.len());
+                for i in 0..s.cwd.len() { s.cwd[i] = 0; }
+                s.cwd[..n].copy_from_slice(&b[..n]);
+                s.cwd_len = n as u8;
+                true
+            } else if path == "/" || path == "/disks" || path == "disks" {
+                let norm = if path == "disks" { "/disks" } else { path };
+                let b = norm.as_bytes();
+                let n = b.len().min(s.cwd.len());
+                for i in 0..s.cwd.len() { s.cwd[i] = 0; }
+                s.cwd[..n].copy_from_slice(&b[..n]);
+                s.cwd_len = n as u8;
+                true
+            } else {
+                s.cd.map(|f| f(path)).unwrap_or(false)
+            };
+            if ok { ExecResult::Ret(Value::Bool(true)) } else { ExecResult::Ret(Value::Nil) }
+        }
         Value::Native(16) => {
             // error(v [, level]): raise `v` as an error object. `level` is
             // validated but ignored — this interpreter has no source
@@ -3927,13 +3971,43 @@ pub(crate) fn call(s: &mut LuaState, fv: Value, argc: u8) -> Result<ExecResult, 
 /// `ls`: print every file downloaded with `fetch()` this run/session, one per
 /// line as `name (N bytes)`. Prints nothing when no files have been fetched.
 pub(crate) fn ls_run(s: &mut LuaState) -> Result<(), LuaError> {
+    let cwd = &s.cwd[..s.cwd_len as usize];
+    let mut any = false;
+    if cwd != b"/" {
+        emit_str(s, b".. (0 bytes)\n");
+        any = true;
+    }
     for i in 0..s.fetched_n as usize {
-        emit_bytes(s, s.str_bytes(s.fetched_names[i]));
+        let name = s.str_bytes(s.fetched_names[i]);
+        // Compute parent directory and basename.
+        let mut last_slash = None;
+        for (idx, &b) in name.iter().enumerate() {
+            if b == b'/' {
+                last_slash = Some(idx);
+            }
+        }
+        let (parent, base_start) = match last_slash {
+            Some(idx) if idx > 0 => (&name[..idx], idx + 1),
+            Some(_) => (&b"/"[..], 1usize),
+            None => (&b"/"[..], 0usize),
+        };
+        // Normalize root parent.
+        let parent = if parent.is_empty() { &b"/"[..] } else { parent };
+        if parent != cwd {
+            continue;
+        }
+        any = true;
+        let base = &name[base_start..];
+        let shown = if base.is_empty() { name } else { base };
+        emit_bytes(s, shown);
         emit(s, b' ');
         emit(s, b'(');
         let (buf, len) = itoa(s.fetched_lens[i] as i64);
         emit_bytes(s, &buf[..len]);
         emit_str(s, b" bytes)\n");
+    }
+    if !any {
+        // keep output empty (or could print nothing)
     }
     Ok(())
 }

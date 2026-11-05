@@ -280,6 +280,21 @@ run-x86_64-uefi: $(BIN)/rustrapper.efi fat-root $(BIN)/uefi-disk.img pxe-start c
 		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
 		-device e1000,netdev=net0,mac=52:54:00:12:34:58
 
+run-x86_64-uefi-text: TARGET := run-x86_64-uefi-text
+run-x86_64-uefi-text: $(BIN)/rustrapper.efi fat-root $(BIN)/uefi-disk.img pxe-start check-deps
+	cp /usr/share/edk2/x64/OVMF_VARS.4m.fd $(BIN)/OVMF_VARS.4m.fd
+	qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
+		-drive if=pflash,format=raw,file=$(BIN)/OVMF_VARS.4m.fd \
+		-m 512 \
+		-device virtio-scsi-pci,id=scsi \
+		-drive if=none,file=fat:rw:fat-root,format=raw,id=fatdisk \
+		-device scsi-hd,drive=fatdisk,bootindex=1 \
+		-drive if=none,file=$(BIN)/uefi-disk.img,format=raw,id=uefidisk,file.locking=off \
+		-device scsi-hd,drive=uefidisk,bootindex=2 \
+		-netdev type=socket,id=net0,connect=127.0.0.1:43210 \
+		-device e1000,netdev=net0,mac=52:54:00:12:34:58 \
+		-nographic
+
 
 run-x86_64-uefi-rom: TARGET := run-x86_64-uefi-rom
 run-x86_64-uefi-rom: $(BIN)/rustrapper.efi $(BIN)/rustrapper_efi.rom fat-root $(BIN)/uefi-disk.img pxe-start check-deps

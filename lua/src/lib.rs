@@ -783,9 +783,15 @@ pub struct LuaState {
     /// [`DhcpValues`] (mac, ip, subnet, gateway, server, bootfile), which the
     /// interpreter exposes as Lua globals after a successful `dhcp`.
     pub dhcp_values: Option<fn(&mut DhcpValues)>,
+    /// Host callback for the `cd` builtin: change the current directory in the
+    /// pseudo-filesystem. Returns true on success. `None` means `cd` errors.
+    pub cd: Option<fn(&str) -> bool>,
     /// Whether `warn()` emits messages; toggled by the `"@on"`/`"@off"`
     /// control messages. Persists across `run()` calls in the same state.
     pub warn_on: bool,
+    /// Current directory in the pseudo-filesystem (for the shell prompt).
+    pub cwd: [u8; 32],
+    pub cwd_len: u8,
     /// Saved execution contexts: index 0 is the main thread, 1.. are
     /// coroutines.
     pub threads: [Thread; MAX_THREADS],
@@ -942,7 +948,14 @@ impl LuaState {
             load: None,
             dhcp_info: None,
             dhcp_values: None,
+            cd: None,
             warn_on: true,
+            cwd: {
+                let mut a = [0u8; 32];
+                a[0] = b'/';
+                a
+            },
+            cwd_len: 1,
             threads: [Thread::empty(); MAX_THREADS],
             current: 0,
             cos: [CoState {
@@ -1035,6 +1048,14 @@ impl LuaState {
         let _ = self.intern(b"ls");
         let ls_name = self.intern(b"ls").unwrap();
         self.set_global(ls_name, Value::Ls);
+        let _ = self.intern(b"cd");
+        let cd_name = self.intern(b"cd").unwrap();
+        self.set_global(cd_name, Value::Native(75));
+        // Virtual directory entry so `ls` shows /disks even when empty.
+        let _ = self.intern(b"/disks");
+        if let Ok(disks_name) = self.intern(b"/disks") {
+            let _ = self.record_fetch_ref(disks_name, 0);
+        }
         let _ = self.intern(b"next");
         let next_name = self.intern(b"next").unwrap();
         self.set_global(next_name, Value::Native(3));
@@ -1387,6 +1408,9 @@ impl LuaState {
     /// Call `set_load(None)` to disable the `dofile` builtin.
     pub fn set_load(&mut self, load: Option<fn(&str, &mut [u8]) -> Option<usize>>) {
         self.load = load;
+    }
+    pub fn set_cd(&mut self, cd: Option<fn(&str) -> bool>) {
+        self.cd = cd;
     }
 
     pub fn set_io_open(&mut self, f: Option<fn(name: &str, mode: &str) -> Option<u8>>) {

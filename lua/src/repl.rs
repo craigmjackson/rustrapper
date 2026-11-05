@@ -195,12 +195,39 @@ pub fn repl_loop(
 
     let mut exited = false;
     while !exited {
-        puts(if acc_len == 0 { "> " } else { ">> " });
+        // Top-level of the current directory for the prompt.
+        let mut top = [0u8; 32];
+        let mut toplen: usize;
+        let cw = &state.cwd[..state.cwd_len as usize];
+        if cw == b"/" {
+            top[0] = b'/';
+            toplen = 1;
+        } else {
+            let mut start = 0usize;
+            if !cw.is_empty() && cw[0] == b'/' {
+                start = 1;
+            }
+            let mut end = start;
+            while end < cw.len() && cw[end] != b'/' {
+                end += 1;
+            }
+            let n = (end - start).min(top.len());
+            top[..n].copy_from_slice(&cw[start..start + n]);
+            toplen = n;
+            if toplen == 0 {
+                top[0] = b'/';
+                toplen = 1;
+            }
+        }
+        let topstr = core::str::from_utf8(&top[..toplen]).unwrap_or("/");
+        puts(topstr);
+        puts(if acc_len == 0 { " > " } else { " >> " });
         'keys: loop {
             match get_key() {
                 Some(b'\r') | Some(b'\n') => {
                     // Bare Enter on the first, empty line just reprompts.
                     if acc_len == 0 && len == 0 {
+                        putc(b'\n');
                         break 'keys;
                     }
                     putc(b'\n');
@@ -258,14 +285,22 @@ pub fn repl_loop(
                     len = 0;
                     pos = 0;
                     shown = 0;
-                    if is_complete(&acc[..acc_len]) {
+                    let cd_cmd = {
+                        let mut t = &acc[..acc_len];
+                        while !t.is_empty() && (t[t.len()-1] == b'\n' || t[t.len()-1] == b'\r') {
+                            t = &t[..t.len()-1];
+                        }
+                        let t = trim(t);
+                        t == &b"cd"[..] || t.starts_with(&b"cd "[..]) || t.starts_with(&b"cd\t"[..])
+                    };
+                    if cd_cmd || is_complete(&acc[..acc_len]) {
                         let mut clen = acc_len;
                         while clen > 0 && acc[clen - 1] == b'\n' {
                             clen -= 1;
                         }
                         let content = &acc[..clen];
                         if !content.is_empty() {
-                            if !handle_repl_cmd(content, putc, puts) {
+                            if !handle_repl_cmd(content, state, putc, puts) {
                                 match super::vm::run_repl_once(state, content) {
                                     Ok(eval::ExecResult::Normal) => {}
                                     Ok(eval::ExecResult::Break) => {}
@@ -1495,7 +1530,70 @@ fn print_general_help(puts: fn(&str)) {
 
 /// Intercept built-in shell commands (`help`, `clear`) before they reach the
 /// Lua parser. Returns `true` if the line was a shell command (already handled).
-fn handle_repl_cmd(line: &[u8], putc: fn(u8), puts: fn(&str)) -> bool {
+fn handle_repl_cmd(line: &[u8], state: &mut LuaState, putc: fn(u8), puts: fn(&str)) -> bool {
+    let t = trim(line);
+    if t == &b"cd"[..] {
+        let path = "/";
+        let b = path.as_bytes();
+        let n = b.len().min(state.cwd.len());
+        state.cwd[..n].copy_from_slice(&b[..n]);
+        state.cwd_len = n as u8;
+        if let Some(f) = state.cd {
+            let _ = f(path);
+        }
+        return true;
+    }
+    if t.starts_with(&b"cd "[..]) {
+        let pathbytes = trim(&t[3..]);
+        let ps = core::str::from_utf8(pathbytes).unwrap_or("");
+        let ok = ps == "/" || ps == "/disks" || ps == "disks" || ps == "..";
+        if ok {
+            let norm: &str = if ps == ".." {
+                // compute into a temp buffer stored? We'll handle separately below.
+                ""
+            } else if ps == "disks" {
+                "/disks"
+            } else {
+                ps
+            };
+            // For "..", update cwd directly.
+            if ps == ".." {
+                let mut cwbuf = [0u8; 32];
+                let cwlen = state.cwd_len as usize;
+                cwbuf[..cwlen].copy_from_slice(&state.cwd[..cwlen]);
+                let mut end = cwlen;
+                if cwbuf[..cwlen] != *b"/" {
+                    while end > 0 && cwbuf[end-1] != b'/' { end -= 1; }
+                    if end <= 1 {
+                        // root
+                        state.cwd[0] = b'/';
+                        for i in 1..state.cwd.len() { state.cwd[i] = 0; }
+                        state.cwd_len = 1;
+                    } else {
+                        for i in 0..state.cwd.len() { state.cwd[i] = 0; }
+                        state.cwd[..end-1].copy_from_slice(&cwbuf[..end-1]);
+                        state.cwd_len = (end - 1) as u8;
+                    }
+                }
+                if let Some(f) = state.cd {
+                    let cur = core::str::from_utf8(&state.cwd[..state.cwd_len as usize]).unwrap_or("/");
+                    let _ = f(cur);
+                }
+            } else {
+                let b = norm.as_bytes();
+                for i in 0..state.cwd.len() { state.cwd[i] = 0; }
+                let n = b.len().min(state.cwd.len());
+                state.cwd[..n].copy_from_slice(&b[..n]);
+                state.cwd_len = n as u8;
+                if let Some(f) = state.cd {
+                    let _ = f(norm);
+                }
+            }
+        } else {
+            puts("cd: no such directory\n");
+        }
+        return true;
+    }
     if trim(line) == &b"clear"[..] {
         clear_screen(putc);
         return true;
